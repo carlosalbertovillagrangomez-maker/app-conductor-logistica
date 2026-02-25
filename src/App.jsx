@@ -1,13 +1,24 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Truck, LogIn, ShieldCheck, Mail, Lock, Loader2, 
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc } from 'firebase/firestore';
+
+// --- GOOGLE MAPS ---
+import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
+const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
+const containerStyle = { width: '100%', height: '100%' };
+const centerMX = { lat: 19.4326, lng: -99.1332 }; 
+
+// URLs de marcadores estándar de Google
+const ICON_START = "http://maps.google.com/mapfiles/ms/icons/green-dot.png";
+const ICON_WAYPOINT = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png";
+const ICON_END = "http://maps.google.com/mapfiles/ms/icons/red-dot.png";
 
 function App() {
   const [isRegistering, setIsRegistering] = useState(false);
@@ -19,69 +30,109 @@ function App() {
   const [misRutas, setMisRutas] = useState([]);
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Todos');
+  const [mainTab, setMainTab] = useState('Pendientes'); // <--- NUEVO ESTADO PARA PESTAÑAS (En Curso / Finalizados)
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
 
+  // --- GOOGLE MAPS HOOKS Y GPS ---
+  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY });
+  const mapRef = useRef(null);
+  const [userLocation, setUserLocation] = useState(null);
+  const [approachData, setApproachData] = useState({ geometry: [], duration: 0, distance: 0 }); // <--- NUEVO ESTADO PARA RUTA DE APROXIMACIÓN
+
+  const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
+
+  // Ajustar mapa
+  useEffect(() => {
+      if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
+          const bounds = new window.google.maps.LatLngBounds();
+          selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
+          if (userLocation) bounds.extend(userLocation);
+          mapRef.current.fitBounds(bounds);
+      }
+  }, [isLoaded, selectedRoute, userLocation]);
+
+  // GPS en vivo
+  useEffect(() => {
+    let watchId;
+    if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
+      if ("geolocation" in navigator) {
+        watchId = navigator.geolocation.watchPosition(
+          (position) => setUserLocation({ lat: position.coords.latitude, lng: position.coords.longitude }),
+          (error) => console.error("Error obteniendo ubicación:", error),
+          { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
+        );
+      }
+    }
+    return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
+  }, [currentDriver, selectedRoute]);
+
+  // NUEVO: Calcular la ruta real por calles desde el chofer hasta el punto A
+  useEffect(() => {
+    if (selectedRoute?.status === 'En Ruta' && userLocation && selectedRoute?.startCoords && approachData.geometry.length === 0) {
+        const fetchApproach = async () => {
+            try {
+                const coordsString = `${userLocation.lng},${userLocation.lat};${selectedRoute.startCoords.lng},${selectedRoute.startCoords.lat}`;
+                const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`);
+                const data = await res.json();
+                if (data.code === 'Ok' && data.routes.length > 0) {
+                    const r = data.routes[0];
+                    const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
+                    setApproachData({ geometry: geo, duration: Math.round(r.duration / 60), distance: (r.distance / 1000).toFixed(1) });
+                }
+            } catch (e) { console.error("Error calculando aproximación", e); }
+        };
+        fetchApproach();
+    }
+  }, [selectedRoute, userLocation]);
+
+  const centerOnUser = () => {
+      if (mapRef.current && userLocation) {
+          mapRef.current.panTo(userLocation);
+          mapRef.current.setZoom(16);
+      }
+  };
+
+  const cerrarRuta = () => {
+      setSelectedRoute(null);
+      setApproachData({ geometry: [], duration: 0, distance: 0 }); // Limpiamos la ruta calculada
+  };
+
   // --- ESTADOS PARA EL EXPEDIENTE ---
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [name, setName] = useState('');
-  const [phone, setPhone] = useState('');
-  const [address, setAddress] = useState('');
-  const [rfc, setRfc] = useState('');
-  const [bloodType, setBloodType] = useState('');
-  const [emergencyContact, setEmergencyContact] = useState('');
-  const [licenseNumber, setLicenseNumber] = useState('');
-  const [licenseType, setLicenseType] = useState('');
-  const [licenseExp, setLicenseExp] = useState('');
-  const [vehicleModel, setVehicleModel] = useState('');
-  const [vehiclePlate, setVehiclePlate] = useState('');
-  const [vehicleType, setVehicleType] = useState('');
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
+  const [name, setName] = useState(''); const [phone, setPhone] = useState('');
+  const [address, setAddress] = useState(''); const [rfc, setRfc] = useState('');
+  const [bloodType, setBloodType] = useState(''); const [emergencyContact, setEmergencyContact] = useState('');
+  const [licenseNumber, setLicenseNumber] = useState(''); const [licenseType, setLicenseType] = useState('');
+  const [licenseExp, setLicenseExp] = useState(''); const [vehicleModel, setVehicleModel] = useState('');
+  const [vehiclePlate, setVehiclePlate] = useState(''); const [vehicleType, setVehicleType] = useState('');
 
   useEffect(() => {
     const savedDriver = localStorage.getItem('driver_session');
     if (savedDriver) {
       const driverData = JSON.parse(savedDriver);
-      setCurrentDriver(driverData);
-      cargarDatosEnFormulario(driverData);
-      escucharRutas(driverData.id);
+      setCurrentDriver(driverData); cargarDatosEnFormulario(driverData); escucharRutas(driverData.id);
     }
     setIsReady(true);
   }, []);
 
   const cargarDatosEnFormulario = (data) => {
-    setName(data.name || '');
-    setPhone(data.phone || '');
-    setAddress(data.address || '');
-    setRfc(data.rfc || '');
-    setBloodType(data.bloodType || '');
-    setEmergencyContact(data.emergencyContact || '');
-    setLicenseNumber(data.licenseNumber || '');
-    setLicenseType(data.licenseType || '');
-    setLicenseExp(data.licenseExp || '');
-    setVehicleModel(data.vehicleModel || '');
-    setVehiclePlate(data.vehiclePlate || '');
-    setVehicleType(data.vehicleType || '');
-    setEmail(data.email || '');
-    setPassword(data.password || '');
+    setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || '');
+    setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || '');
+    setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || '');
+    setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || '');
+    setEmail(data.email || ''); setPassword(data.password || '');
   };
 
   const escucharRutas = (driverId) => {
-    // Escucha rutas filtrando por driverId
     const q = query(collection(db, "rutas"), where("driverId", "==", driverId));
-    return onSnapshot(q, (snapshot) => {
-      setMisRutas(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    });
+    return onSnapshot(q, (snapshot) => setMisRutas(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }))));
   };
 
-  // --- ACCIONES DE VIAJE ---
   const handleStartTrip = async (routeId) => {
     if (!confirm("¿Deseas iniciar este viaje ahora?")) return;
     try {
-      await updateDoc(doc(db, "rutas", routeId), { 
-        status: 'En Ruta', 
-        startTime: new Date().toISOString() 
-      });
+      await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'En Ruta' }));
     } catch (e) { alert("Error al iniciar"); }
   };
@@ -89,115 +140,200 @@ function App() {
   const handleEndTrip = async (routeId) => {
     if (!confirm("¿Has completado todas las entregas de esta ruta?")) return;
     try {
-      await updateDoc(doc(db, "rutas", routeId), { 
-        status: 'Finalizado', 
-        endTime: new Date().toISOString() 
-      });
+      await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' }));
       alert("¡Ruta finalizada con éxito!");
     } catch (e) { alert("Error al finalizar"); }
   };
 
-  // --- PERFIL, LOGIN Y REGISTRO ---
-  const handleUpdateProfile = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const driverRef = doc(db, "conductores", currentDriver.id);
-      const updatedData = {
-        name: name.trim(), phone: phone.trim(), address: address.trim(),
-        rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(),
-        emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(),
-        licenseType: licenseType.trim(), licenseExp: licenseExp,
-        vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(),
-        vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`,
-        initials: name.substring(0, 2).toUpperCase(),
-      };
-      await updateDoc(driverRef, updatedData);
-      const newState = { ...currentDriver, ...updatedData };
-      setCurrentDriver(newState);
-      localStorage.setItem('driver_session', JSON.stringify(newState));
-      setIsEditingProfile(false);
-      alert("Perfil actualizado");
-    } catch (e) { setError(e.message); } finally { setLoading(false); }
-  };
-
   const handleRegister = async (e) => {
     e.preventDefault();
-    setLoading(true);
+    if (!email || !password || !name || !phone || !vehicleModel || !vehiclePlate || !rfc || !licenseNumber) return setError('Faltan campos obligatorios.');
+    setLoading(true); setError('');
     try {
       const nuevoConductor = {
-        name: name.trim(), email: email.trim().toLowerCase(), password,
-        phone: phone.trim(), address: address.trim(), rfc: rfc.toUpperCase(),
-        bloodType: bloodType.toUpperCase(), emergencyContact, licenseNumber,
-        licenseType, licenseExp, vehicleModel, vehiclePlate: vehiclePlate.toUpperCase(),
-        vehicleType, vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`,
-        status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(),
-        created: new Date().toISOString(), trips: 0, rating: 5
+        name: name.trim(), email: email.trim().toLowerCase(), password, phone: phone.trim(), address: address.trim(),
+        rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(),
+        licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp,
+        vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(),
+        vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(),
+        created: new Date().toISOString(), joined: new Date().toLocaleDateString(), trips: 0, rating: 5, fotoPerfil: '', identificacion: ''
       };
       await addDoc(collection(db, "conductores"), nuevoConductor);
-      alert("Registro enviado a revisión");
+      alert("¡Registro enviado! Tu expediente está en revisión por el despacho.");
       setIsRegistering(false);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
 
+  const handleUpdateProfile = async (e) => {
+    e.preventDefault(); setLoading(true);
+    try {
+      const driverRef = doc(db, "conductores", currentDriver.id);
+      const updatedData = {
+        name: name.trim(), phone: phone.trim(), address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(),
+        emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp,
+        vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(),
+        vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, initials: name.substring(0, 2).toUpperCase(),
+      };
+      await updateDoc(driverRef, updatedData);
+      const newState = { ...currentDriver, ...updatedData };
+      setCurrentDriver(newState); localStorage.setItem('driver_session', JSON.stringify(newState));
+      alert("¡Expediente actualizado!"); setIsEditingProfile(false);
+    } catch (e) { setError(e.message); } finally { setLoading(false); }
+  };
+
   const handleLogin = async (e) => {
-    e.preventDefault();
-    setLoading(true);
+    e.preventDefault(); setLoading(true);
     const q = query(collection(db, "conductores"), where("email", "==", email.trim().toLowerCase()));
     const snap = await getDocs(q);
     if (snap.empty) { setError('Usuario no encontrado'); setLoading(false); return; }
     const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
     if (data.password === password && data.status === 'Aprobado') {
-      setCurrentDriver(data);
-      localStorage.setItem('driver_session', JSON.stringify(data));
-      cargarDatosEnFormulario(data);
-      escucharRutas(data.id);
+      setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data));
+      cargarDatosEnFormulario(data); escucharRutas(data.id);
     } else { setError('Credenciales inválidas o cuenta no aprobada'); }
     setLoading(false);
   };
 
   const openGoogleMaps = (ruta) => {
-    const origin = encodeURIComponent(ruta.start);
-    const destination = encodeURIComponent(ruta.end);
+    const origin = encodeURIComponent(ruta.start); const destination = encodeURIComponent(ruta.end);
     let waypoints = ruta.waypoints?.length > 0 ? '&waypoints=' + ruta.waypoints.map(wp => encodeURIComponent(wp)).join('|') : '';
     window.open(`https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}${waypoints}&travelmode=driving`, '_blank');
   };
 
+  // Helpers de Rutas
+  const getSplitGeometry = (geometry, waypoints, endCoords) => {
+      if (!geometry || geometry.length === 0) return { current: [], future: [] };
+      const nextTarget = (waypoints && waypoints.length > 0) ? waypoints[0] : endCoords;
+      if (!nextTarget || !nextTarget.lat) return { current: geometry, future: [] };
+
+      let minDistance = Infinity; let splitIdx = geometry.length - 1;
+      geometry.forEach((coord, idx) => {
+          const dist = Math.pow(coord.lat - nextTarget.lat, 2) + Math.pow(coord.lng - nextTarget.lng, 2);
+          if (dist < minDistance) { minDistance = dist; splitIdx = idx; }
+      });
+      return { current: geometry.slice(0, splitIdx + 1), future: geometry.slice(splitIdx) };
+  };
+
+  const lineSymbol = { path: 'M 0,-1 0,1', strokeOpacity: 1, scale: 3 };
+
   if (!isReady) return null;
 
   const theme = {
-    bg: darkMode ? 'bg-slate-950' : 'bg-slate-50',
-    text: darkMode ? 'text-white' : 'text-slate-900',
+    bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900',
     card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200',
-    input: darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900',
-    subtext: darkMode ? 'text-slate-500' : 'text-slate-400'
+    input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900',
+    subtext: darkMode ? 'text-slate-500' : 'text-slate-400', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-blue-600 shadow-sm'
   };
 
-  // --- VISTA DETALLE DEL VIAJE (CORREGIDA) ---
-  if (currentDriver && selectedRoute) {
+  // ========================================================
+  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO)
+  // ========================================================
+  if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
+      const routeGeometry = selectedRoute.technicalData?.geometry || [];
+      const getMarkerLabel = (index) => String.fromCharCode(66 + index); // Inicia en 'B'
+      
+      const { current: firstLeg, future: remainingLegs } = getSplitGeometry(routeGeometry, selectedRoute.waypointsData, selectedRoute.endCoords);
+
+      return (
+          <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden`}>
+              <div className={`p-4 flex items-center gap-4 shadow-lg z-20 shrink-0 ${darkMode ? 'bg-slate-900 border-b border-slate-800' : 'bg-white'}`}>
+                  <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'} transition`}><ChevronLeft className="w-5 h-5" /></button>
+                  <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-0.5">
+                          <div className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]"></div>
+                          <h2 className="text-sm font-black tracking-tight text-green-500 uppercase">Navegación Activa</h2>
+                      </div>
+                      <p className={`text-[10px] uppercase font-bold text-slate-400 line-clamp-1`}>{selectedRoute.client} • Hacia el destino</p>
+                  </div>
+              </div>
+
+              <div className="flex-1 relative bg-slate-200 w-full h-full">
+                  {!isLoaded ? (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
+                  ) : (
+                      <>
+                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={14} onLoad={handleMapLoad} options={{ streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}>
+                            
+                            {/* NUEVO: RUTA DE APROXIMACIÓN (Línea punteada azul basada en calles) */}
+                            {approachData.geometry.length > 0 && (
+                                <Polyline path={approachData.geometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0, icons: [{ icon: lineSymbol, offset: '0', repeat: '20px' }] }} />
+                            )}
+
+                            {/* RUTA PRINCIPAL */}
+                            {firstLeg.length > 0 && <Polyline path={firstLeg} options={{ strokeColor: "#22c55e", strokeOpacity: 1, strokeWeight: 6 }} />}
+                            {remainingLegs.length > 0 && <Polyline path={remainingLegs} options={{ strokeColor: "#94a3b8", strokeOpacity: 0.8, strokeWeight: 5 }} />}
+
+                            {/* PINES CLÁSICOS DE GOOGLE */}
+                            {selectedRoute.startCoords && <Marker position={selectedRoute.startCoords} icon={ICON_START} />}
+                            {selectedRoute.waypointsData?.map((wp, idx) => (
+                                <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} icon={ICON_WAYPOINT} />
+                            ))}
+                            {selectedRoute.endCoords && <Marker position={selectedRoute.endCoords} icon={ICON_END} />}
+                            
+                            {/* MARCADOR DE USUARIO EN VIVO */}
+                            {userLocation && (
+                                <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.CIRCLE, scale: 9, fillColor: "#3b82f6", fillOpacity: 1, strokeWeight: 3, strokeColor: "white" }} zIndex={999} />
+                            )}
+                        </GoogleMap>
+
+                        {/* BOTÓN DE CENTRAR A LA IZQUIERDA */}
+                        {userLocation && (
+                            <button onClick={centerOnUser} className="absolute bottom-6 left-4 bg-white p-3 rounded-full shadow-xl border border-slate-200 text-blue-600 hover:bg-blue-50 z-10 active:scale-90 transition-transform">
+                                <LocateFixed className="w-6 h-6" />
+                            </button>
+                        )}
+                      </>
+                  )}
+              </div>
+
+              {/* PANEL INFERIOR CON ETAS */}
+              <div className={`p-6 z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col max-h-[50vh] ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'}`}>
+                  <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-4 shrink-0"></div>
+                  
+                  {/* NUEVO: BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
+                  <div className={`mb-4 overflow-y-auto rounded-xl p-3 border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
+                      <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">Tiempos Estimados de Llegada</p>
+                      
+                      {approachData.duration > 0 && (
+                          <div className={`flex justify-between items-center text-xs mb-2 pb-2 border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                              <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Hacia Origen (A)</span>
+                              <span className="font-black text-blue-600 dark:text-blue-400">{approachData.duration} min</span>
+                          </div>
+                      )}
+                      
+                      {selectedRoute.technicalData?.segments?.map((seg, idx) => (
+                          <div key={idx} className="flex justify-between items-center text-xs mb-1.5">
+                              <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-green-500"></div> Hacia Parada {String.fromCharCode(66 + idx)}</span>
+                              <span className="font-black text-green-600 dark:text-green-400">{seg.duration} min</span>
+                          </div>
+                      ))}
+                  </div>
+
+                  <div className="space-y-3 shrink-0 mt-auto">
+                      <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-500 text-white font-black p-4 rounded-2xl shadow-lg shadow-red-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
+                      <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-blue-50 border-blue-100 text-blue-600 hover:bg-blue-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
+                  </div>
+              </div>
+          </div>
+      );
+  }
+
+  // ========================================================
+  // VISTA 2: DETALLE DEL VIAJE (ANTES O DESPUÉS)
+  // ========================================================
+  if (currentDriver && selectedRoute && selectedRoute.status !== 'En Ruta') {
     return (
       <div className={`min-h-screen flex flex-col font-sans transition-colors ${theme.bg} ${theme.text}`}>
         <div className={`p-5 flex items-center gap-4 sticky top-0 z-10 backdrop-blur-md border-b ${darkMode ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200'}`}>
-          <button onClick={() => setSelectedRoute(null)} className="p-2 rounded-full border border-slate-200 dark:border-slate-700"><ChevronLeft className="w-5 h-5" /></button>
+          <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}><ChevronLeft className="w-5 h-5" /></button>
           <div><h2 className="text-sm font-bold">Detalle de Ruta</h2><p className={`text-[10px] uppercase font-bold text-blue-500`}>{selectedRoute.client}</p></div>
         </div>
-
         <div className="flex-1 p-6 space-y-6 overflow-y-auto pb-40">
           <div className={`p-5 rounded-[2rem] border ${theme.card} flex justify-between items-center`}>
-             <div>
-                <p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Estatus actual</p>
-                <div className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 ${
-                    selectedRoute.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' :
-                    selectedRoute.status === 'En Ruta' ? 'bg-green-100 text-green-700 animate-pulse' : 'bg-blue-100 text-blue-700'
-                }`}>
-                   {selectedRoute.status === 'Finalizado' ? <CheckCircle2 className="w-3 h-3"/> : <Play className="w-3 h-3"/>}
-                   {selectedRoute.status || 'Pendiente'}
-                </div>
-             </div>
+             <div><p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Estatus actual</p><div className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 ${selectedRoute.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : 'bg-blue-100 text-blue-700'}`}>{selectedRoute.status === 'Finalizado' ? <CheckCircle2 className="w-3 h-3"/> : <Play className="w-3 h-3"/>}{selectedRoute.status || 'Pendiente'}</div></div>
              {selectedRoute.technicalData && <div className="text-right"><p className="text-2xl font-black">{selectedRoute.technicalData.totalDistance} <span className="text-xs text-slate-400">km</span></p></div>}
           </div>
-
           <div className={`p-5 rounded-[2rem] border ${theme.card}`}>
              <h3 className="text-sm font-bold mb-6 flex items-center gap-2"><MapPin className="w-4 h-4 text-blue-500"/> Itinerario</h3>
              <div className="relative pl-2 space-y-8">
@@ -208,113 +344,88 @@ function App() {
              </div>
           </div>
         </div>
-
         <div className={`p-5 border-t fixed bottom-0 left-0 right-0 z-30 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} grid gap-3 shadow-2xl`}>
-           {selectedRoute.status === 'Pendiente' || !selectedRoute.status ? (
-             <button onClick={() => handleStartTrip(selectedRoute.id)} className="w-full bg-green-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all"><Play className="w-5 h-5 fill-white"/> INICIAR VIAJE</button>
-           ) : selectedRoute.status === 'En Ruta' ? (
-             <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
-           ) : (
-             <div className="w-full bg-slate-100 text-slate-400 font-black p-4 rounded-2xl flex items-center justify-center gap-2 cursor-not-allowed"><CheckCircle2 className="w-5 h-5"/> SERVICIO COMPLETADO</div>
-           )}
-           <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-black p-4 rounded-2xl border flex items-center justify-center gap-2 ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}><Navigation className="w-5 h-5 text-blue-500"/> ABRIR MAPAS</button>
+           {selectedRoute.status === 'Pendiente' || !selectedRoute.status ? <button onClick={() => handleStartTrip(selectedRoute.id)} className="w-full bg-green-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all"><Play className="w-5 h-5 fill-white"/> INICIAR VIAJE</button> : <div className="w-full bg-slate-100 text-slate-400 font-black p-4 rounded-2xl flex items-center justify-center gap-2 cursor-not-allowed"><CheckCircle2 className="w-5 h-5"/> SERVICIO COMPLETADO</div>}
+           <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-black p-4 rounded-2xl border flex items-center justify-center gap-2 ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200 text-slate-600'}`}><Navigation className="w-5 h-5 text-blue-500"/> ABRIR MAPAS</button>
         </div>
       </div>
     );
   }
 
-  // --- VISTA PERFIL (Sincronizada con imágenes) ---
-  if (currentDriver && isEditingProfile) {
-    return (
-      <div className={`min-h-screen flex flex-col font-sans transition-colors ${theme.bg} ${theme.text}`}>
-        <div className={`p-5 flex items-center gap-4 border-b sticky top-0 z-20 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} backdrop-blur-md`}>
-          <button onClick={() => setIsEditingProfile(false)} className="p-2 rounded-full border border-slate-200 dark:border-slate-700"><ChevronLeft className="w-5 h-5"/></button>
-          <h2 className="text-sm font-bold">Mi Expediente</h2>
-        </div>
-        <form onSubmit={handleUpdateProfile} className="flex-1 p-6 space-y-8 overflow-y-auto pb-32">
-          <div className="space-y-4">
-            <p className="text-[10px] font-black uppercase text-blue-500 tracking-widest"><User className="inline w-3 h-3 mb-1"/> Datos de Identidad</p>
-            <input type="text" placeholder="Nombre completo" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} />
-            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} /><input type="text" placeholder="WhatsApp" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={phone} onChange={e => setPhone(e.target.value)} /></div>
-            <input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={address} onChange={e => setAddress(e.target.value)} />
-          </div>
-          <div className="space-y-4">
-            <p className="text-[10px] font-black uppercase text-orange-500 tracking-widest"><Truck className="inline w-3 h-3 mb-1"/> Unidad</p>
-            <input type="text" placeholder="Modelo de Vehículo" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} />
-            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Placas" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} /><input type="text" placeholder="Tipo" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleType} onChange={e => setVehicleType(e.target.value)} /></div>
-          </div>
-          <div className="space-y-4">
-            <p className="text-[10px] font-black uppercase text-purple-500 tracking-widest"><FileText className="inline w-3 h-3 mb-1"/> Licencia</p>
-            <input type="text" placeholder="Número" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} />
-            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseType} onChange={e => setLicenseType(e.target.value)} /><input type="text" placeholder="Vigencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseExp} onChange={e => setLicenseExp(e.target.value)} /></div>
-          </div>
-          <div className="space-y-4">
-            <p className="text-[10px] font-black uppercase text-red-500 tracking-widest"><ShieldAlert className="inline w-3 h-3 mb-1"/> Salud</p>
-            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Sangre" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={bloodType} onChange={e => setBloodType(e.target.value)} /><input type="text" placeholder="Tel. Emergencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} /></div>
-          </div>
-        </form>
-        <div className="p-5 border-t fixed bottom-0 left-0 right-0 bg-inherit z-30">
-          <button onClick={handleUpdateProfile} disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-3xl shadow-xl flex items-center justify-center gap-2">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : <><Save className="w-5 h-5"/> GUARDAR EXPEDIENTE</>}</button>
-        </div>
-      </div>
-    );
-  }
-
-  // --- VISTA LISTADO ---
-  if (currentDriver) {
-    const rFiltradas = misRutas.filter(x => filterType === 'Todos' || x.serviceType === filterType).sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
+  // ========================================================
+  // VISTA LISTADO PRINCIPAL CON PESTAÑAS (EN CURSO / FINALIZADOS)
+  // ========================================================
+  if (currentDriver && !isEditingProfile) {
+    // NUEVA LÓGICA DE FILTRADO CON PESTAÑAS
+    const rFiltradas = misRutas
+        .filter(x => {
+            if (mainTab === 'Finalizados') return x.status === 'Finalizado';
+            return x.status !== 'Finalizado' && (filterType === 'Todos' || x.serviceType === filterType);
+        })
+        .sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans ${theme.bg} ${theme.text}`}>
         <div className={`p-5 flex justify-between items-center shadow-sm border-b ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div>
-            <div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Perfil</p></div>
-          </button>
-          <div className="flex items-center gap-2">
-            <button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button>
-            <button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button>
-          </div>
+          <button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button>
+          <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
         </div>
-
+        
+        {/* NUEVAS PESTAÑAS: EN CURSO / FINALIZADOS */}
         <div className="px-6 pt-6 pb-2">
-            <div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>
-                {['Todos', 'Prioritario', 'Programado'].map((tipo) => (
-                    <button key={tipo} onClick={() => setFilterType(tipo)} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filterType === tipo ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-400'}`}>{tipo}</button>
-                ))}
+            <div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
+                <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button>
+                <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>Finalizados</button>
             </div>
+
+            {/* Subfiltros solo si está en "En Curso" */}
+            {mainTab === 'Pendientes' && (
+                <div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>
+                    {['Todos', 'Prioritario', 'Programado'].map((tipo) => (<button key={tipo} onClick={() => setFilterType(tipo)} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filterType === tipo ? theme.activeTab : 'text-slate-400'}`}>{tipo}</button>))}
+                </div>
+            )}
         </div>
 
         <div className="flex-1 p-6 space-y-4 overflow-y-auto">
-          {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios asignados</div> : rFiltradas.map(ruta => (
-            <div key={ruta.id} onClick={() => setSelectedRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}>
-              <div className="flex items-center gap-4">
-                <div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>{ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}</div>
-                <div><h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4><p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p></div>
-              </div>
-              <ChevronRight className="w-4 h-4 text-blue-500" />
-            </div>
+          {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados'}</div> : rFiltradas.map(ruta => (
+            <div key={ruta.id} onClick={() => setSelectedRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>{ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}</div><div><h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4><p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p></div></div><ChevronRight className="w-4 h-4 text-blue-500" /></div>
           ))}
         </div>
       </div>
     );
   }
 
-  // --- VISTA REGISTRO ---
-  if (isRegistering) {
+  // --- VISTA REGISTRO Y EDICIÓN ---
+  if (isRegistering || isEditingProfile) {
+    const isEditing = isEditingProfile; const handleSubmit = isEditing ? handleUpdateProfile : handleRegister;
     return (
-      <div className={`min-h-screen p-8 font-sans overflow-y-auto transition-colors ${theme.bg} ${theme.text}`}>
-        <button onClick={() => setIsRegistering(false)} className="mb-6 flex items-center gap-2 text-slate-500 font-bold uppercase text-[10px] tracking-widest"><ChevronLeft className="w-4 h-4"/> Volver</button>
-        <h1 className="text-3xl font-black tracking-tight mb-8">Nuevo Operador</h1>
-        <form onSubmit={handleRegister} className="space-y-6 pb-12">
-          <input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} required />
-          <input type="email" placeholder="Correo electrónico *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={email} onChange={e => setEmail(e.target.value)} required />
-          <input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} required />
-          <input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} required />
-          <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Modelo Vehículo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} required /><input type="text" placeholder="Placas *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} required /></div>
-          <input type="text" placeholder="Licencia *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} required />
+      <div className={`min-h-screen p-8 font-sans overflow-y-auto transition-colors pb-32 ${theme.bg} ${theme.text}`}>
+        <button onClick={() => isEditing ? setIsEditingProfile(false) : setIsRegistering(false)} className="mb-6 flex items-center gap-2 text-slate-500 font-bold uppercase text-[10px] tracking-widest"><ChevronLeft className="w-4 h-4"/> Volver</button>
+        <h1 className="text-3xl font-black tracking-tight mb-2">{isEditing ? 'Mi Expediente' : 'Nuevo Operador'}</h1>
+        <form onSubmit={handleSubmit} className="space-y-8 mt-6">
+          <div className="space-y-4">
+            <p className="text-[10px] font-black uppercase text-blue-500 tracking-widest flex items-center gap-2"><User className="w-3 h-3"/> Identidad</p>
+            <input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} required={!isEditing} />
+            {!isEditing && (<><input type="email" placeholder="Correo electrónico *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={email} onChange={e => setEmail(e.target.value)} required /><input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} required /></>)}
+            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} required={!isEditing} /><input type="text" placeholder="WhatsApp *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={phone} onChange={e => setPhone(e.target.value)} required={!isEditing} /></div>
+            <input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={address} onChange={e => setAddress(e.target.value)} />
+          </div>
+          <div className="space-y-4">
+            <p className="text-[10px] font-black uppercase text-orange-500 tracking-widest flex items-center gap-2"><Truck className="w-3 h-3"/> Vehículo</p>
+            <input type="text" placeholder="Modelo (Ej. Ford) *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} required={!isEditing} />
+            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Placas *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} required={!isEditing} /><input type="text" placeholder="Tipo (Caja, etc)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleType} onChange={e => setVehicleType(e.target.value)} /></div>
+          </div>
+          <div className="space-y-4">
+            <p className="text-[10px] font-black uppercase text-purple-500 tracking-widest flex items-center gap-2"><FileText className="w-3 h-3"/> Licencia</p>
+            <input type="text" placeholder="Número *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} required={!isEditing} />
+            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo (Federal, B)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseType} onChange={e => setLicenseType(e.target.value)} /><input type="text" placeholder="Vigencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseExp} onChange={e => setLicenseExp(e.target.value)} /></div>
+          </div>
+          <div className="space-y-4">
+            <p className="text-[10px] font-black uppercase text-red-500 tracking-widest flex items-center gap-2"><ShieldAlert className="w-3 h-3"/> Salud</p>
+            <div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo Sangre" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={bloodType} onChange={e => setBloodType(e.target.value)} /><input type="text" placeholder="Tel. Emergencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} /></div>
+          </div>
           {error && <p className="text-red-500 text-xs text-center">{error}</p>}
-          <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white p-5 rounded-3xl font-black uppercase text-[10px] shadow-xl">{loading ? <Loader2 className="animate-spin mx-auto w-5 h-5"/> : 'Enviar Registro'}</button>
+          <div className={`p-5 border-t fixed bottom-0 left-0 right-0 z-30 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}><button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : (isEditing ? <><Save className="w-5 h-5"/> GUARDAR CAMBIOS</> : 'Enviar Registro')}</button></div>
         </form>
       </div>
     );
@@ -328,8 +439,8 @@ function App() {
         <input type="email" placeholder="Email" className={`w-full p-5 rounded-[1.8rem] text-sm border ${theme.input}`} value={email} onChange={e => setEmail(e.target.value)} />
         <input type="password" placeholder="Contraseña" className={`w-full p-5 rounded-[1.8rem] text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} />
         {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
-        <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-[1.8rem] shadow-xl">{loading ? <Loader2 className="animate-spin mx-auto w-4 h-4"/> : 'INICIAR SESIÓN'}</button>
-        <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo? <span className="text-blue-600">Regístrate</span></button>
+        <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
+        <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo Operador? <span className="text-blue-600">Regístrate</span></button>
       </form>
     </div>
   );
