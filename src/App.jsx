@@ -30,7 +30,7 @@ function App() {
   const [misRutas, setMisRutas] = useState([]);
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Todos');
-  const [mainTab, setMainTab] = useState('Pendientes'); // <--- NUEVO ESTADO PARA PESTAÑAS (En Curso / Finalizados)
+  const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
 
@@ -38,7 +38,7 @@ function App() {
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY });
   const mapRef = useRef(null);
   const [userLocation, setUserLocation] = useState(null);
-  const [approachData, setApproachData] = useState({ geometry: [], duration: 0, distance: 0 }); // <--- NUEVO ESTADO PARA RUTA DE APROXIMACIÓN
+  const [approachData, setApproachData] = useState({ geometry: [], duration: 0, distance: 0 }); 
 
   const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
 
@@ -52,13 +52,25 @@ function App() {
       }
   }, [isLoaded, selectedRoute, userLocation]);
 
-  // GPS en vivo
+  // GPS en vivo y envío a Firebase
   useEffect(() => {
     let watchId;
     if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       if ("geolocation" in navigator) {
         watchId = navigator.geolocation.watchPosition(
-          (position) => setUserLocation({ lat: position.coords.latitude, lng: position.coords.longitude }),
+          async (position) => {
+            const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
+            setUserLocation(loc);
+            
+            // NUEVO: Enviar ubicación a Firebase para que el despachador lo vea
+            try {
+                await updateDoc(doc(db, "rutas", selectedRoute.id), { 
+                    currentLocation: loc,
+                    lastUpdate: new Date().toISOString()
+                });
+            } catch (e) { console.error("Error subiendo GPS", e); }
+
+          },
           (error) => console.error("Error obteniendo ubicación:", error),
           { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
         );
@@ -67,7 +79,7 @@ function App() {
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
   }, [currentDriver, selectedRoute]);
 
-  // NUEVO: Calcular la ruta real por calles desde el chofer hasta el punto A
+  // Calcular la ruta real por calles desde el chofer hasta el punto A
   useEffect(() => {
     if (selectedRoute?.status === 'En Ruta' && userLocation && selectedRoute?.startCoords && approachData.geometry.length === 0) {
         const fetchApproach = async () => {
@@ -255,7 +267,7 @@ function App() {
                       <>
                         <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={14} onLoad={handleMapLoad} options={{ streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}>
                             
-                            {/* NUEVO: RUTA DE APROXIMACIÓN (Línea punteada azul basada en calles) */}
+                            {/* RUTA DE APROXIMACIÓN (Línea punteada azul basada en calles) */}
                             {approachData.geometry.length > 0 && (
                                 <Polyline path={approachData.geometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0, icons: [{ icon: lineSymbol, offset: '0', repeat: '20px' }] }} />
                             )}
@@ -291,7 +303,7 @@ function App() {
               <div className={`p-6 z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col max-h-[50vh] ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'}`}>
                   <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-4 shrink-0"></div>
                   
-                  {/* NUEVO: BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
+                  {/* BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
                   <div className={`mb-4 overflow-y-auto rounded-xl p-3 border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
                       <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">Tiempos Estimados de Llegada</p>
                       
@@ -356,7 +368,6 @@ function App() {
   // VISTA LISTADO PRINCIPAL CON PESTAÑAS (EN CURSO / FINALIZADOS)
   // ========================================================
   if (currentDriver && !isEditingProfile) {
-    // NUEVA LÓGICA DE FILTRADO CON PESTAÑAS
     const rFiltradas = misRutas
         .filter(x => {
             if (mainTab === 'Finalizados') return x.status === 'Finalizado';
@@ -371,7 +382,7 @@ function App() {
           <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
         </div>
         
-        {/* NUEVAS PESTAÑAS: EN CURSO / FINALIZADOS */}
+        {/* PESTAÑAS: EN CURSO / FINALIZADOS */}
         <div className="px-6 pt-6 pb-2">
             <div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
                 <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button>
