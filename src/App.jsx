@@ -33,6 +33,9 @@ function App() {
   const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
+  
+  // NUEVO: Estado para minimizar el panel inferior en modo GPS
+  const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
   // --- GOOGLE MAPS HOOKS Y GPS ---
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY });
@@ -42,15 +45,15 @@ function App() {
 
   const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
 
-  // Ajustar mapa
+  // Ajustar mapa - SOLAMENTE UNA VEZ AL CARGAR LA RUTA (Evita el rebote)
   useEffect(() => {
       if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
           const bounds = new window.google.maps.LatLngBounds();
           selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
-          if (userLocation) bounds.extend(userLocation);
+          // Eliminamos userLocation de aquí para que no haga zoom out constante
           mapRef.current.fitBounds(bounds);
       }
-  }, [isLoaded, selectedRoute, userLocation]);
+  }, [isLoaded, selectedRoute?.id]); 
 
   // GPS en vivo y envío a Firebase
   useEffect(() => {
@@ -62,7 +65,7 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            // NUEVO: Enviar ubicación a Firebase para que el despachador lo vea
+            // Enviar ubicación a Firebase para que el despachador lo vea
             try {
                 await updateDoc(doc(db, "rutas", selectedRoute.id), { 
                     currentLocation: loc,
@@ -101,13 +104,14 @@ function App() {
   const centerOnUser = () => {
       if (mapRef.current && userLocation) {
           mapRef.current.panTo(userLocation);
-          mapRef.current.setZoom(16);
+          mapRef.current.setZoom(17); // Zoom más cercano para manejar
       }
   };
 
   const cerrarRuta = () => {
       setSelectedRoute(null);
-      setApproachData({ geometry: [], duration: 0, distance: 0 }); // Limpiamos la ruta calculada
+      setApproachData({ geometry: [], duration: 0, distance: 0 }); 
+      setIsPanelExpanded(true); // Reiniciar estado del panel
   };
 
   // --- ESTADOS PARA EL EXPEDIENTE ---
@@ -243,7 +247,7 @@ function App() {
   // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       const routeGeometry = selectedRoute.technicalData?.geometry || [];
-      const getMarkerLabel = (index) => String.fromCharCode(66 + index); // Inicia en 'B'
+      const getMarkerLabel = (index) => String.fromCharCode(66 + index); 
       
       const { current: firstLeg, future: remainingLegs } = getSplitGeometry(routeGeometry, selectedRoute.waypointsData, selectedRoute.endCoords);
 
@@ -289,9 +293,12 @@ function App() {
                             )}
                         </GoogleMap>
 
-                        {/* BOTÓN DE CENTRAR A LA IZQUIERDA */}
+                        {/* BOTÓN DE CENTRAR A LA IZQUIERDA - Flotando por encima del panel */}
                         {userLocation && (
-                            <button onClick={centerOnUser} className="absolute bottom-6 left-4 bg-white p-3 rounded-full shadow-xl border border-slate-200 text-blue-600 hover:bg-blue-50 z-10 active:scale-90 transition-transform">
+                            <button 
+                                onClick={centerOnUser} 
+                                style={{ bottom: isPanelExpanded ? '280px' : '90px' }} // Sube o baja dinámicamente
+                                className="absolute left-4 bg-white p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border border-slate-200 text-blue-600 active:bg-blue-50 z-10 transition-all duration-300">
                                 <LocateFixed className="w-6 h-6" />
                             </button>
                         )}
@@ -299,33 +306,57 @@ function App() {
                   )}
               </div>
 
-              {/* PANEL INFERIOR CON ETAS */}
-              <div className={`p-6 z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col max-h-[50vh] ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'}`}>
-                  <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-4 shrink-0"></div>
+              {/* PANEL INFERIOR MINIMIZABLE */}
+              <div className={`z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col transition-all duration-300 ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'} ${isPanelExpanded ? 'max-h-[60vh] p-6' : 'h-[80px] px-6 py-4 cursor-pointer'}`}>
                   
-                  {/* BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
-                  <div className={`mb-4 overflow-y-auto rounded-xl p-3 border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
-                      <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">Tiempos Estimados de Llegada</p>
-                      
-                      {approachData.duration > 0 && (
-                          <div className={`flex justify-between items-center text-xs mb-2 pb-2 border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
-                              <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Hacia Origen (A)</span>
-                              <span className="font-black text-blue-600 dark:text-blue-400">{approachData.duration} min</span>
-                          </div>
-                      )}
-                      
-                      {selectedRoute.technicalData?.segments?.map((seg, idx) => (
-                          <div key={idx} className="flex justify-between items-center text-xs mb-1.5">
-                              <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-green-500"></div> Hacia Parada {String.fromCharCode(66 + idx)}</span>
-                              <span className="font-black text-green-600 dark:text-green-400">{seg.duration} min</span>
-                          </div>
-                      ))}
+                  {/* Manija de arrastre (Trigger para minimizar/maximizar) */}
+                  <div className="w-full flex justify-center pb-3" onClick={() => setIsPanelExpanded(!isPanelExpanded)}>
+                      <div className="w-12 h-1.5 bg-slate-300 hover:bg-slate-400 rounded-full transition-colors cursor-pointer"></div>
                   </div>
 
-                  <div className="space-y-3 shrink-0 mt-auto">
-                      <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-500 text-white font-black p-4 rounded-2xl shadow-lg shadow-red-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
-                      <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-blue-50 border-blue-100 text-blue-600 hover:bg-blue-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
-                  </div>
+                  {isPanelExpanded ? (
+                      <>
+                        <div className="flex justify-between items-center mb-4 px-2">
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Distancia</p><p className="text-2xl font-black text-slate-800 dark:text-white">{selectedRoute.technicalData?.totalDistance} <span className="text-sm text-slate-400">km</span></p></div>
+                            <div className="w-px h-8 bg-slate-200 dark:bg-slate-800"></div>
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo</p><p className="text-2xl font-black text-green-500">{selectedRoute.technicalData?.totalDuration} <span className="text-sm text-green-300">min</span></p></div>
+                        </div>
+                        
+                        {/* BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
+                        <div className={`mb-4 overflow-y-auto rounded-xl p-3 border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
+                            <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">Tiempos Estimados de Llegada</p>
+                            {approachData.duration > 0 && (
+                                <div className={`flex justify-between items-center text-xs mb-2 pb-2 border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                                    <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Hacia Origen (A)</span>
+                                    <span className="font-black text-blue-600 dark:text-blue-400">{approachData.duration} min</span>
+                                </div>
+                            )}
+                            {selectedRoute.technicalData?.segments?.map((seg, idx) => (
+                                <div key={idx} className="flex justify-between items-center text-xs mb-1.5">
+                                    <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-green-500"></div> Hacia Parada {String.fromCharCode(66 + idx)}</span>
+                                    <span className="font-black text-green-600 dark:text-green-400">{seg.duration} min</span>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="space-y-3 shrink-0 mt-auto pb-4">
+                            <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-500 text-white font-black p-4 rounded-2xl shadow-lg shadow-red-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
+                            <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-blue-50 border-blue-100 text-blue-600 hover:bg-blue-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
+                        </div>
+                      </>
+                  ) : (
+                      // VISTA MINIMIZADA
+                      <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
+                          <div>
+                              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Restante</p>
+                              <p className="text-lg font-black text-slate-800 dark:text-white leading-none">{selectedRoute.technicalData?.totalDistance} <span className="text-sm font-medium text-slate-500">km</span></p>
+                          </div>
+                          <div className="text-right">
+                              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Llegada Aprox</p>
+                              <p className="text-lg font-black text-green-500 leading-none">{selectedRoute.technicalData?.totalDuration} <span className="text-sm font-medium text-green-400">min</span></p>
+                          </div>
+                      </div>
+                  )}
               </div>
           </div>
       );
