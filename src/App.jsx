@@ -4,7 +4,7 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc } from 'firebase/firestore';
@@ -15,7 +15,6 @@ const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0";
 const containerStyle = { width: '100%', height: '100%' };
 const centerMX = { lat: 19.4326, lng: -99.1332 }; 
 
-// URLs de marcadores estándar de Google
 const ICON_START = "http://maps.google.com/mapfiles/ms/icons/green-dot.png";
 const ICON_WAYPOINT = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 const ICON_END = "http://maps.google.com/mapfiles/ms/icons/red-dot.png";
@@ -34,28 +33,37 @@ function App() {
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   
-  // NUEVO: Estado para minimizar el panel inferior en modo GPS
   const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
-  // --- GOOGLE MAPS HOOKS Y GPS ---
+  // --- GOOGLE MAPS HOOKS Y NAVEGACIÓN ---
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY });
   const mapRef = useRef(null);
   const [userLocation, setUserLocation] = useState(null);
-  const [approachData, setApproachData] = useState({ geometry: [], duration: 0, distance: 0 }); 
+  const [isTracking, setIsTracking] = useState(true);
+  
+  // NUEVO: Estado de navegación avanzada
+  const [nextStopIdx, setNextStopIdx] = useState(0); 
+  const [liveRouteData, setLiveRouteData] = useState({ 
+      geometry: [], 
+      totalDuration: 0, 
+      totalDistance: 0, 
+      nextStopDuration: 0, 
+      nextStopDistance: 0 
+  });
 
   const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
 
-  // Ajustar mapa - SOLAMENTE UNA VEZ AL CARGAR LA RUTA (Evita el rebote)
   useEffect(() => {
       if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
-          const bounds = new window.google.maps.LatLngBounds();
-          selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
-          // Eliminamos userLocation de aquí para que no haga zoom out constante
-          mapRef.current.fitBounds(bounds);
+          if (!userLocation) {
+              const bounds = new window.google.maps.LatLngBounds();
+              selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
+              mapRef.current.fitBounds(bounds);
+          }
       }
   }, [isLoaded, selectedRoute?.id]); 
 
-  // GPS en vivo y envío a Firebase
+  // RECÁLCULO DINÁMICO, SEGUIMIENTO Y ETAS
   useEffect(() => {
     let watchId;
     if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
@@ -65,7 +73,11 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            // Enviar ubicación a Firebase para que el despachador lo vea
+            if (isTracking && mapRef.current) {
+                mapRef.current.panTo(loc);
+                mapRef.current.setZoom(18);
+            }
+            
             try {
                 await updateDoc(doc(db, "rutas", selectedRoute.id), { 
                     currentLocation: loc,
@@ -73,45 +85,62 @@ function App() {
                 });
             } catch (e) { console.error("Error subiendo GPS", e); }
 
+            // RECÁLCULO DE RUTA: Desde el Chofer -> Paradas Pendientes -> Destino
+            try {
+                let coordsArray = [`${loc.lng},${loc.lat}`]; 
+                
+                const wps = selectedRoute.waypointsData || [];
+                for (let i = nextStopIdx; i < wps.length; i++) {
+                    coordsArray.push(`${wps[i].lng},${wps[i].lat}`);
+                }
+                
+                if (selectedRoute.endCoords) {
+                    coordsArray.push(`${selectedRoute.endCoords.lng},${selectedRoute.endCoords.lat}`);
+                }
+
+                const coordsString = coordsArray.join(';');
+                const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`);
+                const data = await res.json();
+                
+                if (data.code === 'Ok' && data.routes.length > 0) {
+                    const r = data.routes[0];
+                    const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
+                    
+                    setLiveRouteData({ 
+                        geometry: geo, 
+                        totalDuration: Math.round(r.duration / 60), 
+                        totalDistance: (r.distance / 1000).toFixed(1),
+                        nextStopDuration: Math.round(r.legs[0].duration / 60), // Tiempo a la siguiente parada
+                        nextStopDistance: (r.legs[0].distance / 1000).toFixed(1) // Distancia a la siguiente parada
+                    });
+                }
+            } catch (e) { console.error("Error recalculando ruta", e); }
+
           },
           (error) => console.error("Error obteniendo ubicación:", error),
-          { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
+          { enableHighAccuracy: true, maximumAge: 5000, timeout: 5000 }
         );
       }
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
-  }, [currentDriver, selectedRoute]);
-
-  // Calcular la ruta real por calles desde el chofer hasta el punto A
-  useEffect(() => {
-    if (selectedRoute?.status === 'En Ruta' && userLocation && selectedRoute?.startCoords && approachData.geometry.length === 0) {
-        const fetchApproach = async () => {
-            try {
-                const coordsString = `${userLocation.lng},${userLocation.lat};${selectedRoute.startCoords.lng},${selectedRoute.startCoords.lat}`;
-                const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`);
-                const data = await res.json();
-                if (data.code === 'Ok' && data.routes.length > 0) {
-                    const r = data.routes[0];
-                    const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
-                    setApproachData({ geometry: geo, duration: Math.round(r.duration / 60), distance: (r.distance / 1000).toFixed(1) });
-                }
-            } catch (e) { console.error("Error calculando aproximación", e); }
-        };
-        fetchApproach();
-    }
-  }, [selectedRoute, userLocation]);
+  }, [currentDriver, selectedRoute, isTracking, nextStopIdx]);
 
   const centerOnUser = () => {
+      setIsTracking(true);
       if (mapRef.current && userLocation) {
           mapRef.current.panTo(userLocation);
-          mapRef.current.setZoom(17); // Zoom más cercano para manejar
+          mapRef.current.setZoom(18);
       }
   };
 
+  const handleMapDrag = () => { setIsTracking(false); };
+
   const cerrarRuta = () => {
       setSelectedRoute(null);
-      setApproachData({ geometry: [], duration: 0, distance: 0 }); 
-      setIsPanelExpanded(true); // Reiniciar estado del panel
+      setNextStopIdx(0);
+      setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); 
+      setIsPanelExpanded(true); 
+      setIsTracking(true);
   };
 
   // --- ESTADOS PARA EL EXPEDIENTE ---
@@ -217,22 +246,6 @@ function App() {
     window.open(`https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}${waypoints}&travelmode=driving`, '_blank');
   };
 
-  // Helpers de Rutas
-  const getSplitGeometry = (geometry, waypoints, endCoords) => {
-      if (!geometry || geometry.length === 0) return { current: [], future: [] };
-      const nextTarget = (waypoints && waypoints.length > 0) ? waypoints[0] : endCoords;
-      if (!nextTarget || !nextTarget.lat) return { current: geometry, future: [] };
-
-      let minDistance = Infinity; let splitIdx = geometry.length - 1;
-      geometry.forEach((coord, idx) => {
-          const dist = Math.pow(coord.lat - nextTarget.lat, 2) + Math.pow(coord.lng - nextTarget.lng, 2);
-          if (dist < minDistance) { minDistance = dist; splitIdx = idx; }
-      });
-      return { current: geometry.slice(0, splitIdx + 1), future: geometry.slice(splitIdx) };
-  };
-
-  const lineSymbol = { path: 'M 0,-1 0,1', strokeOpacity: 1, scale: 3 };
-
   if (!isReady) return null;
 
   const theme = {
@@ -243,13 +256,17 @@ function App() {
   };
 
   // ========================================================
-  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO)
+  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO RECALCULADO)
   // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
-      const routeGeometry = selectedRoute.technicalData?.geometry || [];
-      const getMarkerLabel = (index) => String.fromCharCode(66 + index); 
+      const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
+
+      // Variables para el objetivo actual
+      const totalWaypoints = selectedRoute.waypointsData?.length || 0;
+      const isHeadingToDestination = nextStopIdx >= totalWaypoints;
       
-      const { current: firstLeg, future: remainingLegs } = getSplitGeometry(routeGeometry, selectedRoute.waypointsData, selectedRoute.endCoords);
+      let nextStopName = isHeadingToDestination ? 'Destino Final' : `Parada ${String.fromCharCode(66 + nextStopIdx)}`;
+      let nextStopAddress = isHeadingToDestination ? selectedRoute.end : selectedRoute.waypoints[nextStopIdx];
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden`}>
@@ -260,7 +277,7 @@ function App() {
                           <div className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]"></div>
                           <h2 className="text-sm font-black tracking-tight text-green-500 uppercase">Navegación Activa</h2>
                       </div>
-                      <p className={`text-[10px] uppercase font-bold text-slate-400 line-clamp-1`}>{selectedRoute.client} • Hacia el destino</p>
+                      <p className={`text-[10px] uppercase font-bold text-slate-400 line-clamp-1`}>{selectedRoute.client} • {nextStopName}</p>
                   </div>
               </div>
 
@@ -269,37 +286,40 @@ function App() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
-                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={14} onLoad={handleMapLoad} options={{ streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}>
-                            
-                            {/* RUTA DE APROXIMACIÓN (Línea punteada azul basada en calles) */}
-                            {approachData.geometry.length > 0 && (
-                                <Polyline path={approachData.geometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0, icons: [{ icon: lineSymbol, offset: '0', repeat: '20px' }] }} />
-                            )}
+                        <GoogleMap 
+                            mapContainerStyle={containerStyle} 
+                            center={centerMX} 
+                            zoom={14} 
+                            onLoad={handleMapLoad} 
+                            onDragStart={handleMapDrag} 
+                            options={{ streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}
+                        >
+                            {/* RUTA DINÁMICA RECALCULADA */}
+                            {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
 
-                            {/* RUTA PRINCIPAL */}
-                            {firstLeg.length > 0 && <Polyline path={firstLeg} options={{ strokeColor: "#22c55e", strokeOpacity: 1, strokeWeight: 6 }} />}
-                            {remainingLegs.length > 0 && <Polyline path={remainingLegs} options={{ strokeColor: "#94a3b8", strokeOpacity: 0.8, strokeWeight: 5 }} />}
-
-                            {/* PINES CLÁSICOS DE GOOGLE */}
-                            {selectedRoute.startCoords && <Marker position={selectedRoute.startCoords} icon={ICON_START} />}
+                            {/* PINES: Solo se muestran las paradas que AÚN NO se han visitado */}
                             {selectedRoute.waypointsData?.map((wp, idx) => (
-                                <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} icon={ICON_WAYPOINT} />
+                                idx >= nextStopIdx && <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} icon={ICON_WAYPOINT} />
                             ))}
                             {selectedRoute.endCoords && <Marker position={selectedRoute.endCoords} icon={ICON_END} />}
                             
-                            {/* MARCADOR DE USUARIO EN VIVO */}
+                            {/* MARCADOR DE USUARIO EN VIVO TIPO NAVEGACIÓN */}
                             {userLocation && (
-                                <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.CIRCLE, scale: 9, fillColor: "#3b82f6", fillOpacity: 1, strokeWeight: 3, strokeColor: "white" }} zIndex={999} />
+                                <Marker 
+                                    position={userLocation} 
+                                    icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: 0 }} 
+                                    zIndex={999} 
+                                />
                             )}
                         </GoogleMap>
 
-                        {/* BOTÓN DE CENTRAR A LA IZQUIERDA - Flotando por encima del panel */}
+                        {/* BOTÓN DE CENTRAR INTELIGENTE */}
                         {userLocation && (
                             <button 
                                 onClick={centerOnUser} 
-                                style={{ bottom: isPanelExpanded ? '280px' : '90px' }} // Sube o baja dinámicamente
-                                className="absolute left-4 bg-white p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border border-slate-200 text-blue-600 active:bg-blue-50 z-10 transition-all duration-300">
-                                <LocateFixed className="w-6 h-6" />
+                                style={{ bottom: isPanelExpanded ? '340px' : '100px' }} 
+                                className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-blue-600 border-slate-200 active:bg-blue-50'}`}>
+                                {isTracking ? <Navigation2 className="w-6 h-6" /> : <LocateFixed className="w-6 h-6" />}
                             </button>
                         )}
                       </>
@@ -307,9 +327,8 @@ function App() {
               </div>
 
               {/* PANEL INFERIOR MINIMIZABLE */}
-              <div className={`z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col transition-all duration-300 ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'} ${isPanelExpanded ? 'max-h-[60vh] p-6' : 'h-[80px] px-6 py-4 cursor-pointer'}`}>
+              <div className={`z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col transition-all duration-300 ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'} ${isPanelExpanded ? 'max-h-[70vh] p-6' : 'h-[90px] px-6 py-4 cursor-pointer'}`}>
                   
-                  {/* Manija de arrastre (Trigger para minimizar/maximizar) */}
                   <div className="w-full flex justify-center pb-3" onClick={() => setIsPanelExpanded(!isPanelExpanded)}>
                       <div className="w-12 h-1.5 bg-slate-300 hover:bg-slate-400 rounded-full transition-colors cursor-pointer"></div>
                   </div>
@@ -317,43 +336,53 @@ function App() {
                   {isPanelExpanded ? (
                       <>
                         <div className="flex justify-between items-center mb-4 px-2">
-                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Distancia</p><p className="text-2xl font-black text-slate-800 dark:text-white">{selectedRoute.technicalData?.totalDistance} <span className="text-sm text-slate-400">km</span></p></div>
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Restante Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDistance || selectedRoute.technicalData?.totalDistance} <span className="text-sm text-slate-400">km</span></p></div>
                             <div className="w-px h-8 bg-slate-200 dark:bg-slate-800"></div>
-                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo</p><p className="text-2xl font-black text-green-500">{selectedRoute.technicalData?.totalDuration} <span className="text-sm text-green-300">min</span></p></div>
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDuration || selectedRoute.technicalData?.totalDuration} <span className="text-sm text-slate-400">min</span></p></div>
                         </div>
                         
-                        {/* BLOQUE DE TIEMPOS ESTIMADOS (ETAS) */}
-                        <div className={`mb-4 overflow-y-auto rounded-xl p-3 border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
-                            <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-widest">Tiempos Estimados de Llegada</p>
-                            {approachData.duration > 0 && (
-                                <div className={`flex justify-between items-center text-xs mb-2 pb-2 border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
-                                    <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Hacia Origen (A)</span>
-                                    <span className="font-black text-blue-600 dark:text-blue-400">{approachData.duration} min</span>
+                        {/* TARJETA DEL PRÓXIMO OBJETIVO */}
+                        <div className={`mb-6 rounded-xl p-4 border shadow-sm ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
+                            <p className="text-[10px] font-black uppercase text-blue-500 mb-1 tracking-widest">Siguiente Objetivo</p>
+                            <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
+                            
+                            <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
+                                <div className="flex flex-col">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Distancia</span>
+                                    <span className="font-black text-blue-600 text-lg">{liveRouteData.nextStopDistance || '--'} km</span>
                                 </div>
-                            )}
-                            {selectedRoute.technicalData?.segments?.map((seg, idx) => (
-                                <div key={idx} className="flex justify-between items-center text-xs mb-1.5">
-                                    <span className="flex items-center gap-2 font-medium"><div className="w-2 h-2 rounded-full bg-green-500"></div> Hacia Parada {String.fromCharCode(66 + idx)}</span>
-                                    <span className="font-black text-green-600 dark:text-green-400">{seg.duration} min</span>
+                                <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
+                                <div className="flex flex-col text-right">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase">En llegar</span>
+                                    <span className="font-black text-green-500 text-lg">{liveRouteData.nextStopDuration || '--'} min</span>
                                 </div>
-                            ))}
+                            </div>
                         </div>
 
                         <div className="space-y-3 shrink-0 mt-auto pb-4">
+                            {/* BOTÓN PARA MARCAR LLEGADA A PUNTO INTERMEDIO */}
+                            {!isHeadingToDestination && (
+                                <button 
+                                    onClick={() => setNextStopIdx(prev => prev + 1)} 
+                                    className="w-full bg-blue-100 hover:bg-blue-200 text-blue-700 border border-blue-200 font-black p-4 rounded-2xl shadow-sm flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"
+                                >
+                                    <MapPin className="w-5 h-5"/> LLEGUÉ A {nextStopName.toUpperCase()}
+                                </button>
+                            )}
+
                             <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-500 text-white font-black p-4 rounded-2xl shadow-lg shadow-red-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
-                            <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-blue-50 border-blue-100 text-blue-600 hover:bg-blue-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
+                            <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
                         </div>
                       </>
                   ) : (
-                      // VISTA MINIMIZADA
                       <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
                           <div>
-                              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Restante</p>
-                              <p className="text-lg font-black text-slate-800 dark:text-white leading-none">{selectedRoute.technicalData?.totalDistance} <span className="text-sm font-medium text-slate-500">km</span></p>
+                              <p className="text-[10px] font-black uppercase text-blue-500 tracking-widest">{nextStopName}</p>
+                              <p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p>
                           </div>
                           <div className="text-right">
-                              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Llegada Aprox</p>
-                              <p className="text-lg font-black text-green-500 leading-none">{selectedRoute.technicalData?.totalDuration} <span className="text-sm font-medium text-green-400">min</span></p>
+                              <p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p>
+                              <p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p>
                           </div>
                       </div>
                   )}
@@ -413,14 +442,11 @@ function App() {
           <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
         </div>
         
-        {/* PESTAÑAS: EN CURSO / FINALIZADOS */}
         <div className="px-6 pt-6 pb-2">
             <div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
                 <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button>
                 <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>Finalizados</button>
             </div>
-
-            {/* Subfiltros solo si está en "En Curso" */}
             {mainTab === 'Pendientes' && (
                 <div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>
                     {['Todos', 'Prioritario', 'Programado'].map((tipo) => (<button key={tipo} onClick={() => setFilterType(tipo)} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filterType === tipo ? theme.activeTab : 'text-slate-400'}`}>{tipo}</button>))}
