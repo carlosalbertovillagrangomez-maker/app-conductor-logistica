@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { 
   Truck, LogIn, ShieldCheck, Mail, Lock, Loader2, 
   AlertCircle, LogOut, MapPin, User, Phone, 
@@ -32,104 +32,123 @@ function App() {
   const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
-  
   const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
-  // --- GOOGLE MAPS HOOKS Y NAVEGACIÓN ---
+  // --- NAVEGACIÓN Y GPS AVANZADO ---
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY });
   const mapRef = useRef(null);
+  
   const [userLocation, setUserLocation] = useState(null);
   const [isTracking, setIsTracking] = useState(true);
+  const isTrackingRef = useRef(true); // Para no matar el GPS al mover el mapa
+  const latestLocRef = useRef(null);
   
-  // NUEVO: Estado de navegación avanzada
-  const [nextStopIdx, setNextStopIdx] = useState(0); 
+  const [nextStopIdx, setNextStopIdx] = useState(0); // 0 = Origen, 1 = Parada 1...
+  const [routeUpdateTick, setRouteUpdateTick] = useState(0); // Reloj interno para OSRM
   const [liveRouteData, setLiveRouteData] = useState({ 
-      geometry: [], 
-      totalDuration: 0, 
-      totalDistance: 0, 
-      nextStopDuration: 0, 
-      nextStopDistance: 0 
+      geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 
   });
 
   const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
 
-  useEffect(() => {
-      if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
-          if (!userLocation) {
-              const bounds = new window.google.maps.LatLngBounds();
-              selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
-              mapRef.current.fitBounds(bounds);
-          }
-      }
-  }, [isLoaded, selectedRoute?.id]); 
+  // Mantener Refs actualizados
+  useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
+  useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
 
-  // RECÁLCULO DINÁMICO, SEGUIMIENTO Y ETAS
+  // 1. GENERAR LISTA DE TODOS LOS PUNTOS A VISITAR
+  const allTargets = useMemo(() => {
+      if (!selectedRoute) return [];
+      const targets = [];
+      if (selectedRoute.startCoords) {
+          targets.push({ ...selectedRoute.startCoords, label: 'Origen', address: selectedRoute.start, icon: ICON_START });
+      }
+      if (selectedRoute.waypointsData) {
+          selectedRoute.waypointsData.forEach((wp, idx) => {
+              targets.push({ ...wp, label: `Parada ${String.fromCharCode(66 + idx)}`, address: selectedRoute.waypoints[idx], icon: ICON_WAYPOINT });
+          });
+      }
+      if (selectedRoute.endCoords) {
+          targets.push({ ...selectedRoute.endCoords, label: 'Destino Final', address: selectedRoute.end, icon: ICON_END });
+      }
+      return targets;
+  }, [selectedRoute]);
+
+  // 2. ESCUCHAR GPS EN VIVO (Movimiento ultra suave)
   useEffect(() => {
     let watchId;
     if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       if ("geolocation" in navigator) {
         watchId = navigator.geolocation.watchPosition(
-          async (position) => {
+          (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            if (isTracking && mapRef.current) {
+            if (isTrackingRef.current && mapRef.current) {
                 mapRef.current.panTo(loc);
-                mapRef.current.setZoom(18);
             }
-            
-            try {
-                await updateDoc(doc(db, "rutas", selectedRoute.id), { 
-                    currentLocation: loc,
-                    lastUpdate: new Date().toISOString()
-                });
-            } catch (e) { console.error("Error subiendo GPS", e); }
-
-            // RECÁLCULO DE RUTA: Desde el Chofer -> Paradas Pendientes -> Destino
-            try {
-                let coordsArray = [`${loc.lng},${loc.lat}`]; 
-                
-                const wps = selectedRoute.waypointsData || [];
-                for (let i = nextStopIdx; i < wps.length; i++) {
-                    coordsArray.push(`${wps[i].lng},${wps[i].lat}`);
-                }
-                
-                if (selectedRoute.endCoords) {
-                    coordsArray.push(`${selectedRoute.endCoords.lng},${selectedRoute.endCoords.lat}`);
-                }
-
-                const coordsString = coordsArray.join(';');
-                const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`);
-                const data = await res.json();
-                
-                if (data.code === 'Ok' && data.routes.length > 0) {
-                    const r = data.routes[0];
-                    const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
-                    
-                    setLiveRouteData({ 
-                        geometry: geo, 
-                        totalDuration: Math.round(r.duration / 60), 
-                        totalDistance: (r.distance / 1000).toFixed(1),
-                        nextStopDuration: Math.round(r.legs[0].duration / 60), // Tiempo a la siguiente parada
-                        nextStopDistance: (r.legs[0].distance / 1000).toFixed(1) // Distancia a la siguiente parada
-                    });
-                }
-            } catch (e) { console.error("Error recalculando ruta", e); }
-
           },
-          (error) => console.error("Error obteniendo ubicación:", error),
-          { enableHighAccuracy: true, maximumAge: 5000, timeout: 5000 }
+          (error) => console.error("Error GPS:", error),
+          { enableHighAccuracy: true, maximumAge: 1000, timeout: 5000 }
         );
       }
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
-  }, [currentDriver, selectedRoute, isTracking, nextStopIdx]);
+  }, [currentDriver, selectedRoute]);
 
+  // 3. RELOJ INTERNO (Pide nueva ruta a OSRM cada 5 segundos para no saturar)
+  useEffect(() => {
+      if (selectedRoute?.status !== 'En Ruta') return;
+      const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 5000);
+      return () => clearInterval(interval);
+  }, [selectedRoute?.status]);
+
+  // 4. RECÁLCULO DINÁMICO Y SUBIDA A FIREBASE
+  useEffect(() => {
+      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
+      const loc = latestLocRef.current;
+      if (!loc) return;
+
+      const updateLiveRoute = async () => {
+          // A. Subir GPS al despachador
+          try {
+              await updateDoc(doc(db, "rutas", selectedRoute.id), { 
+                  currentLocation: loc, lastUpdate: new Date().toISOString() 
+              });
+          } catch(e) {}
+
+          // B. Recalcular Ruta (Desde Chofer -> Puntos Pendientes)
+          try {
+              let coordsArray = [`${loc.lng},${loc.lat}`]; 
+              for (let i = nextStopIdx; i < allTargets.length; i++) {
+                  coordsArray.push(`${allTargets[i].lng},${allTargets[i].lat}`);
+              }
+
+              const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsArray.join(';')}?overview=full&geometries=geojson`);
+              const data = await res.json();
+              
+              if (data.code === 'Ok' && data.routes.length > 0) {
+                  const r = data.routes[0];
+                  const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
+                  setLiveRouteData({ 
+                      geometry: geo, 
+                      totalDuration: Math.round(r.duration / 60), 
+                      totalDistance: (r.distance / 1000).toFixed(1),
+                      nextStopDuration: r.legs.length > 0 ? Math.round(r.legs[0].duration / 60) : 0,
+                      nextStopDistance: r.legs.length > 0 ? (r.legs[0].distance / 1000).toFixed(1) : 0
+                  });
+              }
+          } catch (e) { console.error("Error recalculando OSRM", e); }
+      };
+
+      updateLiveRoute();
+  }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets]); // Se ejecuta al tick de 5s o al cambiar de parada
+
+  // --- CONTROLES DE UI ---
   const centerOnUser = () => {
       setIsTracking(true);
       if (mapRef.current && userLocation) {
           mapRef.current.panTo(userLocation);
-          mapRef.current.setZoom(18);
+          mapRef.current.setZoom(17);
       }
   };
 
@@ -141,6 +160,12 @@ function App() {
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); 
       setIsPanelExpanded(true); 
       setIsTracking(true);
+  };
+
+  const handleLlegadaPunto = () => {
+      setNextStopIdx(prev => prev + 1);
+      // Forzar un recalculado inmediato sin esperar los 5 segundos
+      setRouteUpdateTick(t => t + 1); 
   };
 
   // --- ESTADOS PARA EL EXPEDIENTE ---
@@ -183,7 +208,7 @@ function App() {
   };
 
   const handleEndTrip = async (routeId) => {
-    if (!confirm("¿Has completado todas las entregas de esta ruta?")) return;
+    if (!confirm("¿Has completado el viaje por completo?")) return;
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' }));
@@ -256,17 +281,15 @@ function App() {
   };
 
   // ========================================================
-  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO RECALCULADO)
+  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO)
   // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
 
-      // Variables para el objetivo actual
-      const totalWaypoints = selectedRoute.waypointsData?.length || 0;
-      const isHeadingToDestination = nextStopIdx >= totalWaypoints;
-      
-      let nextStopName = isHeadingToDestination ? 'Destino Final' : `Parada ${String.fromCharCode(66 + nextStopIdx)}`;
-      let nextStopAddress = isHeadingToDestination ? selectedRoute.end : selectedRoute.waypoints[nextStopIdx];
+      const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
+      const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
+      const nextStopName = currentTarget?.label || 'Destino';
+      const nextStopAddress = currentTarget?.address || '';
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden`}>
@@ -289,21 +312,21 @@ function App() {
                         <GoogleMap 
                             mapContainerStyle={containerStyle} 
                             center={centerMX} 
-                            zoom={14} 
+                            zoom={16} 
                             onLoad={handleMapLoad} 
                             onDragStart={handleMapDrag} 
                             options={{ streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}
                         >
-                            {/* RUTA DINÁMICA RECALCULADA */}
+                            {/* RUTA DINÁMICA */}
                             {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
 
-                            {/* PINES: Solo se muestran las paradas que AÚN NO se han visitado */}
-                            {selectedRoute.waypointsData?.map((wp, idx) => (
-                                idx >= nextStopIdx && <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} icon={ICON_WAYPOINT} />
-                            ))}
-                            {selectedRoute.endCoords && <Marker position={selectedRoute.endCoords} icon={ICON_END} />}
+                            {/* PINES DINÁMICOS: Solo mostramos de la meta actual en adelante */}
+                            {allTargets.map((target, idx) => {
+                                if (idx < nextStopIdx) return null; // Ocultar los que ya visitamos
+                                return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />;
+                            })}
                             
-                            {/* MARCADOR DE USUARIO EN VIVO TIPO NAVEGACIÓN */}
+                            {/* MARCADOR DEL COCHE */}
                             {userLocation && (
                                 <Marker 
                                     position={userLocation} 
@@ -313,7 +336,7 @@ function App() {
                             )}
                         </GoogleMap>
 
-                        {/* BOTÓN DE CENTRAR INTELIGENTE */}
+                        {/* BOTÓN DE CENTRAR */}
                         {userLocation && (
                             <button 
                                 onClick={centerOnUser} 
@@ -335,49 +358,51 @@ function App() {
 
                   {isPanelExpanded ? (
                       <>
-                        <div className="flex justify-between items-center mb-4 px-2">
-                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Restante Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDistance || selectedRoute.technicalData?.totalDistance} <span className="text-sm text-slate-400">km</span></p></div>
-                            <div className="w-px h-8 bg-slate-200 dark:bg-slate-800"></div>
-                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDuration || selectedRoute.technicalData?.totalDuration} <span className="text-sm text-slate-400">min</span></p></div>
-                        </div>
-                        
-                        {/* TARJETA DEL PRÓXIMO OBJETIVO */}
-                        <div className={`mb-6 rounded-xl p-4 border shadow-sm ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
+                        {/* PRÓXIMO OBJETIVO (GRANDE) */}
+                        <div className={`mb-4 rounded-xl p-4 border shadow-sm ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
                             <p className="text-[10px] font-black uppercase text-blue-500 mb-1 tracking-widest">Siguiente Objetivo</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
                             
                             <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
                                 <div className="flex flex-col">
-                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Distancia</span>
-                                    <span className="font-black text-blue-600 text-lg">{liveRouteData.nextStopDistance || '--'} km</span>
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span>
+                                    <span className="font-black text-blue-600 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span>
                                 </div>
                                 <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
                                 <div className="flex flex-col text-right">
-                                    <span className="text-[10px] font-bold text-slate-400 uppercase">En llegar</span>
-                                    <span className="font-black text-green-500 text-lg">{liveRouteData.nextStopDuration || '--'} min</span>
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Llegada en</span>
+                                    <span className="font-black text-green-500 text-xl">{liveRouteData.nextStopDuration || '--'} <span className="text-sm">min</span></span>
                                 </div>
                             </div>
                         </div>
 
                         <div className="space-y-3 shrink-0 mt-auto pb-4">
-                            {/* BOTÓN PARA MARCAR LLEGADA A PUNTO INTERMEDIO */}
+                            {/* BOTÓN CHECK-IN (Solo si no es el destino final) */}
                             {!isHeadingToDestination && (
                                 <button 
-                                    onClick={() => setNextStopIdx(prev => prev + 1)} 
+                                    onClick={handleLlegadaPunto} 
                                     className="w-full bg-blue-100 hover:bg-blue-200 text-blue-700 border border-blue-200 font-black p-4 rounded-2xl shadow-sm flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"
                                 >
                                     <MapPin className="w-5 h-5"/> LLEGUÉ A {nextStopName.toUpperCase()}
                                 </button>
                             )}
 
-                            <button onClick={() => handleEndTrip(selectedRoute.id)} className="w-full bg-red-500 text-white font-black p-4 rounded-2xl shadow-lg shadow-red-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest"><CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO</button>
+                            {/* BOTÓN FINALIZAR (Solo resalta si ya estamos en el destino final) */}
+                            <button 
+                                onClick={() => handleEndTrip(selectedRoute.id)} 
+                                className={`w-full text-white font-black p-4 rounded-2xl shadow-lg flex items-center justify-center gap-2 active:scale-95 transition-all text-sm tracking-widest ${isHeadingToDestination ? 'bg-red-600 hover:bg-red-700 shadow-red-500/40 animate-pulse' : 'bg-red-400 hover:bg-red-500 shadow-red-400/20'}`}
+                            >
+                                <CheckCircle className="w-5 h-5"/> TERMINAR SERVICIO
+                            </button>
+                            
                             <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
                         </div>
                       </>
                   ) : (
+                      // VISTA MINIMIZADA (Para ver el mapa)
                       <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
                           <div>
-                              <p className="text-[10px] font-black uppercase text-blue-500 tracking-widest">{nextStopName}</p>
+                              <p className="text-[10px] font-black uppercase text-blue-500 tracking-widest line-clamp-1">{nextStopName}</p>
                               <p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p>
                           </div>
                           <div className="text-right">
