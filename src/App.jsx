@@ -40,22 +40,65 @@ function App() {
   
   const [userLocation, setUserLocation] = useState(null);
   const [isTracking, setIsTracking] = useState(true);
-  const isTrackingRef = useRef(true); // Para no matar el GPS al mover el mapa
+  const isTrackingRef = useRef(true); 
   const latestLocRef = useRef(null);
   
-  const [nextStopIdx, setNextStopIdx] = useState(0); // 0 = Origen, 1 = Parada 1...
-  const [routeUpdateTick, setRouteUpdateTick] = useState(0); // Reloj interno para OSRM
+  const [nextStopIdx, setNextStopIdx] = useState(0); 
+  const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
   const [liveRouteData, setLiveRouteData] = useState({ 
       geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 
   });
 
+  // WAKE LOCK: Ref para mantener la pantalla encendida
+  const wakeLockRef = useRef(null);
+
   const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
 
-  // Mantener Refs actualizados
   useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
 
-  // 1. GENERAR LISTA DE TODOS LOS PUNTOS A VISITAR
+  // 1. AUTO-RESUME: Recuperar el viaje activo si la app se recarga o cierra
+  useEffect(() => {
+    const savedActiveId = localStorage.getItem('active_trip_id');
+    if (savedActiveId && !selectedRoute && misRutas.length > 0) {
+        const tripToResume = misRutas.find(r => r.id === savedActiveId);
+        if (tripToResume && tripToResume.status === 'En Ruta') {
+            setSelectedRoute(tripToResume);
+            const savedIdx = localStorage.getItem(`trip_idx_${savedActiveId}`);
+            if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10));
+        }
+    }
+  }, [misRutas, selectedRoute]);
+
+  // 2. WAKE LOCK API: Evitar que la pantalla se apague
+  useEffect(() => {
+    const requestWakeLock = async () => {
+        if ('wakeLock' in navigator && selectedRoute?.status === 'En Ruta') {
+            try {
+                wakeLockRef.current = await navigator.wakeLock.request('screen');
+            } catch (err) { console.error("No se pudo bloquear la pantalla:", err); }
+        }
+    };
+
+    const handleVisibilityChange = () => {
+        if (document.visibilityState === 'visible') requestWakeLock();
+    };
+
+    if (selectedRoute?.status === 'En Ruta') {
+        requestWakeLock();
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+        if (wakeLockRef.current) {
+            wakeLockRef.current.release().catch(() => {});
+            wakeLockRef.current = null;
+        }
+    };
+  }, [selectedRoute?.status]);
+
+  // 3. GENERAR LISTA DE TODOS LOS PUNTOS A VISITAR
   const allTargets = useMemo(() => {
       if (!selectedRoute) return [];
       const targets = [];
@@ -73,7 +116,18 @@ function App() {
       return targets;
   }, [selectedRoute]);
 
-  // 2. ESCUCHAR GPS EN VIVO (Movimiento ultra suave)
+  // 4. CENTRADO INICIAL
+  useEffect(() => {
+      if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
+          if (!userLocation) {
+              const bounds = new window.google.maps.LatLngBounds();
+              selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
+              mapRef.current.fitBounds(bounds);
+          }
+      }
+  }, [isLoaded, selectedRoute?.id]); 
+
+  // 5. ESCUCHAR GPS EN VIVO 
   useEffect(() => {
     let watchId;
     if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
@@ -95,28 +149,26 @@ function App() {
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
   }, [currentDriver, selectedRoute]);
 
-  // 3. RELOJ INTERNO (Pide nueva ruta a OSRM cada 5 segundos para no saturar)
+  // 6. RELOJ INTERNO OSRM (5 seg)
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta') return;
       const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 5000);
       return () => clearInterval(interval);
   }, [selectedRoute?.status]);
 
-  // 4. RECÁLCULO DINÁMICO Y SUBIDA A FIREBASE
+  // 7. RECÁLCULO DINÁMICO Y SUBIDA A FIREBASE
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
       const loc = latestLocRef.current;
       if (!loc) return;
 
       const updateLiveRoute = async () => {
-          // A. Subir GPS al despachador
           try {
               await updateDoc(doc(db, "rutas", selectedRoute.id), { 
                   currentLocation: loc, lastUpdate: new Date().toISOString() 
               });
           } catch(e) {}
 
-          // B. Recalcular Ruta (Desde Chofer -> Puntos Pendientes)
           try {
               let coordsArray = [`${loc.lng},${loc.lat}`]; 
               for (let i = nextStopIdx; i < allTargets.length; i++) {
@@ -141,7 +193,7 @@ function App() {
       };
 
       updateLiveRoute();
-  }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets]); // Se ejecuta al tick de 5s o al cambiar de parada
+  }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets]);
 
   // --- CONTROLES DE UI ---
   const centerOnUser = () => {
@@ -155,6 +207,7 @@ function App() {
   const handleMapDrag = () => { setIsTracking(false); };
 
   const cerrarRuta = () => {
+      localStorage.removeItem('active_trip_id'); 
       setSelectedRoute(null);
       setNextStopIdx(0);
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); 
@@ -163,9 +216,21 @@ function App() {
   };
 
   const handleLlegadaPunto = () => {
-      setNextStopIdx(prev => prev + 1);
-      // Forzar un recalculado inmediato sin esperar los 5 segundos
+      const newIdx = nextStopIdx + 1;
+      setNextStopIdx(newIdx);
+      localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); 
       setRouteUpdateTick(t => t + 1); 
+  };
+
+  const handleSelectRoute = (ruta) => {
+      setSelectedRoute(ruta);
+      if (ruta.status === 'En Ruta') {
+          localStorage.setItem('active_trip_id', ruta.id);
+          const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`);
+          if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10));
+      } else {
+          setNextStopIdx(0);
+      }
   };
 
   // --- ESTADOS PARA EL EXPEDIENTE ---
@@ -204,6 +269,10 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'En Ruta' }));
+      
+      localStorage.setItem('active_trip_id', routeId);
+      localStorage.setItem(`trip_idx_${routeId}`, 0);
+      setNextStopIdx(0);
     } catch (e) { alert("Error al iniciar"); }
   };
 
@@ -212,6 +281,9 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' }));
+      
+      localStorage.removeItem('active_trip_id');
+      localStorage.removeItem(`trip_idx_${routeId}`);
       alert("¡Ruta finalizada con éxito!");
     } catch (e) { alert("Error al finalizar"); }
   };
@@ -281,7 +353,7 @@ function App() {
   };
 
   // ========================================================
-  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO)
+  // VISTA 1: NAVEGACIÓN EN VIVO (MAPA AVANZADO RECALCULADO)
   // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
@@ -336,7 +408,7 @@ function App() {
                             )}
                         </GoogleMap>
 
-                        {/* BOTÓN DE CENTRAR */}
+                        {/* BOTÓN DE CENTRAR INTELIGENTE */}
                         {userLocation && (
                             <button 
                                 onClick={centerOnUser} 
@@ -358,8 +430,14 @@ function App() {
 
                   {isPanelExpanded ? (
                       <>
-                        {/* PRÓXIMO OBJETIVO (GRANDE) */}
-                        <div className={`mb-4 rounded-xl p-4 border shadow-sm ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
+                        <div className="flex justify-between items-center mb-4 px-2">
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Restante Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDistance || selectedRoute.technicalData?.totalDistance} <span className="text-sm text-slate-400">km</span></p></div>
+                            <div className="w-px h-8 bg-slate-200 dark:bg-slate-800"></div>
+                            <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDuration || selectedRoute.technicalData?.totalDuration} <span className="text-sm text-slate-400">min</span></p></div>
+                        </div>
+                        
+                        {/* TARJETA DEL PRÓXIMO OBJETIVO */}
+                        <div className={`mb-6 rounded-xl p-4 border shadow-sm ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
                             <p className="text-[10px] font-black uppercase text-blue-500 mb-1 tracking-widest">Siguiente Objetivo</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
                             
@@ -481,7 +559,7 @@ function App() {
 
         <div className="flex-1 p-6 space-y-4 overflow-y-auto">
           {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados'}</div> : rFiltradas.map(ruta => (
-            <div key={ruta.id} onClick={() => setSelectedRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>{ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}</div><div><h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4><p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p></div></div><ChevronRight className="w-4 h-4 text-blue-500" /></div>
+            <div key={ruta.id} onClick={() => handleSelectRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>{ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}</div><div><h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4><p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p></div></div><ChevronRight className="w-4 h-4 text-blue-500" /></div>
           ))}
         </div>
       </div>
