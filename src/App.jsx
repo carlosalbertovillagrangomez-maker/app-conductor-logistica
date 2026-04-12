@@ -4,7 +4,7 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion } from 'firebase/firestore';
@@ -39,6 +39,7 @@ function App() {
   const [isWaiting, setIsWaiting] = useState(false);
   const [chatText, setChatText] = useState('');
   const [evidence, setEvidence] = useState(null);
+  const [incomingOffer, setIncomingOffer] = useState(null);
 
   // --- NAVEGACIÓN Y GPS AVANZADO ---
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
@@ -123,12 +124,13 @@ function App() {
       }
   }, [isLoaded, selectedRoute?.id]); 
 
+  // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
     let watchId;
-    if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
+    if (currentDriver && (currentDriver.isOnline || (selectedRoute && selectedRoute.status === 'En Ruta'))) {
       if ("geolocation" in navigator) {
         watchId = navigator.geolocation.watchPosition(
-          (position) => {
+          async (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             let heading = position.coords.heading;
@@ -140,7 +142,12 @@ function App() {
             if (heading !== null && !isNaN(heading)) { setUserHeading(heading); }
             prevLocRef.current = loc;
 
-            if (isTrackingRef.current && mapRef.current) {
+            // Enviar ubicación al backend si está en línea (incluso sin ruta activa)
+            if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
+                try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
+            }
+
+            if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
                 mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
                 if (heading !== null && !isNaN(heading)) { mapRef.current.setHeading(heading); }
             }
@@ -152,6 +159,50 @@ function App() {
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
   }, [currentDriver, selectedRoute]);
+
+  // ESCUCHAR OFERTAS DE VIAJE
+  useEffect(() => {
+      if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
+
+      const q = query(collection(db, "rutas"), where("ofertaPara", "==", currentDriver.id), where("ofertaEstado", "==", "Pendiente"));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+          if (!snapshot.empty) {
+              const offer = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+              setIncomingOffer(offer);
+              if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]); // Vibrar fuerte
+          } else {
+              setIncomingOffer(null);
+          }
+      });
+      return () => unsubscribe();
+  }, [currentDriver, selectedRoute]);
+
+  // ACEPTAR/RECHAZAR OFERTA
+  const aceptarViaje = async () => {
+      if (!incomingOffer || !currentDriver) return;
+      try {
+          await updateDoc(doc(db, "rutas", incomingOffer.id), {
+              driver: currentDriver.name,
+              driverId: currentDriver.id,
+              ofertaEstado: 'Aceptada'
+          });
+          setIncomingOffer(null);
+          setMainTab('Pendientes');
+      } catch (e) { alert("Error al aceptar viaje"); }
+  };
+
+  const rechazarViaje = async () => {
+      if (!incomingOffer || !currentDriver) return;
+      try {
+          await updateDoc(doc(db, "rutas", incomingOffer.id), {
+              ofertaEstado: 'Rechazada',
+              rechazadoPor: arrayUnion(currentDriver.id),
+              ofertaPara: '' 
+          });
+          setIncomingOffer(null);
+      } catch (e) {}
+  };
+
 
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta') return;
@@ -228,15 +279,35 @@ function App() {
       setIsPanelExpanded(true); setIsTracking(true);
   };
 
-  // --- NUEVO: FUNCIÓN PARA ALTERNAR ESTADO EN LÍNEA ---
+  // --- TOGGLE ONLINE CON PERMISO DE GPS FORZADO Y FALLBACK A XALAPA ---
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
       const newStatus = !currentDriver.isOnline;
+      
       try {
           await updateDoc(doc(db, "conductores", currentDriver.id), { isOnline: newStatus });
           const updatedDriver = { ...currentDriver, isOnline: newStatus };
           setCurrentDriver(updatedDriver);
           localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
+
+          if (newStatus && "geolocation" in navigator) {
+               // Forzamos la petición de GPS al navegador
+               navigator.geolocation.getCurrentPosition(
+                  async (pos) => {
+                      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+                      setUserLocation(loc);
+                      await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
+                  },
+                  async (err) => {
+                      // Si falla el GPS, usamos el Fallback de Xalapa (en lugar de CDMX)
+                      console.warn("Fallo el GPS o el usuario no dio permiso, usando Fallback en Xalapa.");
+                      const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; 
+                      setUserLocation(fallbackLoc);
+                      await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc });
+                  },
+                  { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+               );
+          }
       } catch (e) { console.error("Error cambiando estado:", e); }
   };
 
@@ -589,14 +660,52 @@ function App() {
         .sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
 
     return (
-      <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans ${theme.bg} ${theme.text}`}>
+      <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
+        
+        {/* --- MODAL SUPERPUESTO DE OFERTA DE VIAJE --- */}
+        {incomingOffer && (
+            <div className="absolute inset-0 z-[9999] flex items-center justify-center p-6 bg-slate-900/90 backdrop-blur-md animate-in fade-in zoom-in duration-300">
+                <div className="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl border-4 border-yellow-400 flex flex-col">
+                    <div className="bg-yellow-400 p-6 text-center shrink-0 relative overflow-hidden">
+                        <div className="absolute inset-0 bg-yellow-500/20 animate-pulse"></div>
+                        <div className="relative z-10 flex flex-col items-center">
+                            <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg mb-3">
+                                <Zap className="w-8 h-8 text-yellow-500" />
+                            </div>
+                            <h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">¡NUEVO VIAJE!</h2>
+                            <p className="text-xs font-bold text-yellow-900 mt-1 uppercase tracking-widest">A unos kilómetros de ti</p>
+                        </div>
+                    </div>
+                    <div className="p-6 bg-slate-50 space-y-4">
+                        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Cliente Solicitante</p>
+                            <p className="text-lg font-black text-slate-800">{incomingOffer.client}</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                            <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-blue-500"></div>
+                            <p className="text-[10px] font-black text-blue-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p>
+                            <p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                            <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-red-500"></div>
+                            <p className="text-[10px] font-black text-red-500 uppercase tracking-widest mb-1 pl-2">Llevar a:</p>
+                            <p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.end}</p>
+                        </div>
+                    </div>
+                    <div className="p-6 bg-white border-t border-slate-100 flex gap-3 shrink-0">
+                        <button onClick={rechazarViaje} className="w-1/3 py-4 rounded-2xl bg-red-50 text-red-600 font-bold text-xs uppercase tracking-widest border border-red-200 hover:bg-red-100 transition active:scale-95">Rechazar</button>
+                        <button onClick={aceptarViaje} className="w-2/3 py-4 rounded-2xl bg-green-500 text-white font-black text-sm uppercase tracking-widest shadow-xl shadow-green-500/30 hover:bg-green-600 transition active:scale-95 flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> Aceptar Viaje</button>
+                    </div>
+                </div>
+            </div>
+        )}
+
         <div className={`p-5 flex flex-col gap-4 shadow-sm border-b ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
           <div className="flex justify-between items-center">
               <button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button>
               <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
           </div>
           
-          {/* --- NUEVO: SWITCH DE ESTADO DE CONEXIÓN --- */}
           <div className="flex justify-between items-center bg-slate-100 dark:bg-slate-800 p-2 rounded-2xl border border-slate-200 dark:border-slate-700">
               <div className="flex items-center gap-2 pl-2">
                   {currentDriver.isOnline ? <Power className="w-4 h-4 text-green-500" /> : <PowerOff className="w-4 h-4 text-slate-400" />}
