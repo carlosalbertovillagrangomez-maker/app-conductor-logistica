@@ -4,7 +4,7 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion } from 'firebase/firestore';
@@ -35,7 +35,7 @@ function App() {
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
-  // --- NUEVO: MODO DE ESPERA (CHAT Y EVIDENCIA) ---
+  // --- MODO DE ESPERA ---
   const [isWaiting, setIsWaiting] = useState(false);
   const [chatText, setChatText] = useState('');
   const [evidence, setEvidence] = useState(null);
@@ -70,7 +70,6 @@ function App() {
   useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
 
-  // Auto-scroll del chat cuando hay nuevos mensajes
   useEffect(() => {
       if (chatScrollRef.current) {
           chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
@@ -132,7 +131,6 @@ function App() {
           (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
-            
             let heading = position.coords.heading;
             if (heading === null || isNaN(heading)) {
                 if (prevLocRef.current && window.google?.maps?.geometry) {
@@ -179,7 +177,6 @@ function App() {
                   const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
                   const newTotalDist = (r.distance / 1000).toFixed(1);
                   const newTotalDur = Math.round(r.duration / 60);
-                  
                   const nextDistMeters = r.legs.length > 0 ? r.legs[0].distance : 0;
                   const nextDurMins = r.legs.length > 0 ? Math.round(r.legs[0].duration / 60) : 0;
 
@@ -231,28 +228,27 @@ function App() {
       setIsPanelExpanded(true); setIsTracking(true);
   };
 
-  // ========================================================
-  // FUNCIONES DEL MODO DE ESPERA Y EVIDENCIAS
-  // ========================================================
-  
+  // --- NUEVO: FUNCIÓN PARA ALTERNAR ESTADO EN LÍNEA ---
+  const toggleOnlineStatus = async () => {
+      if (!currentDriver) return;
+      const newStatus = !currentDriver.isOnline;
+      try {
+          await updateDoc(doc(db, "conductores", currentDriver.id), { isOnline: newStatus });
+          const updatedDriver = { ...currentDriver, isOnline: newStatus };
+          setCurrentDriver(updatedDriver);
+          localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
+      } catch (e) { console.error("Error cambiando estado:", e); }
+  };
+
   const marcarLlegada = async () => {
-      setIsWaiting(true);
-      setEvidence(null);
-      setIsApproaching(false);
+      setIsWaiting(true); setEvidence(null); setIsApproaching(false);
       try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){}
   };
 
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
-      const msg = { 
-          sender: 'Conductor', text: chatText.trim(), 
-          time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), 
-          timestamp: new Date().toISOString() 
-      };
-      try {
-          await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) });
-          setChatText('');
-      } catch(e) { console.error("Error al enviar mensaje:", e); }
+      const msg = { sender: 'Conductor', text: chatText.trim(), time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
+      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { console.error(e); }
   };
 
   const handlePhoto = (e) => {
@@ -269,8 +265,7 @@ function App() {
                   canvas.height = img.height * scaleSize;
                   const ctx = canvas.getContext('2d');
                   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                  const dataUrl = canvas.toDataURL('image/jpeg', 0.6); 
-                  setEvidence(dataUrl);
+                  setEvidence(canvas.toDataURL('image/jpeg', 0.6));
               }
               img.src = event.target.result;
           };
@@ -279,44 +274,26 @@ function App() {
   };
 
   const confirmarAbordaje = async (isFinalDestination) => {
-      if(isFinalDestination) {
-          handleEndTrip(selectedRoute.id);
-          setIsWaiting(false);
-      } else {
+      if(isFinalDestination) { handleEndTrip(selectedRoute.id); setIsWaiting(false); } 
+      else {
           const newIdx = nextStopIdx + 1;
-          setNextStopIdx(newIdx);
-          localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); 
-          setIsWaiting(false);
-          setRouteUpdateTick(t => t + 1); 
+          setNextStopIdx(newIdx); localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); 
+          setIsWaiting(false); setRouteUpdateTick(t => t + 1); 
       }
   };
 
   const reportarAusencia = async (isFinalDestination) => {
       if(!evidence) return alert("⚠️ Por favor, toma una foto de evidencia del lugar antes de reportar la ausencia.");
-      
       const target = allTargets[nextStopIdx];
-      const noShowData = {
-          stopIndex: nextStopIdx,
-          passenger: target?.contact || 'Pasajero',
-          address: target?.address || '',
-          photo: evidence, 
-          time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}),
-          timestamp: new Date().toISOString()
-      };
+      const noShowData = { stopIndex: nextStopIdx, passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
 
       try {
-          await updateDoc(doc(db, "rutas", selectedRoute.id), {
-              evidencias: arrayUnion(noShowData),
-              chat: arrayUnion({ sender: 'Sistema', text: `Conductor reportó AUSENCIA en ${target?.label}. Evidencia guardada.`, time: noShowData.time, timestamp: noShowData.timestamp })
-          });
+          await updateDoc(doc(db, "rutas", selectedRoute.id), { evidencias: arrayUnion(noShowData), chat: arrayUnion({ sender: 'Sistema', text: `Conductor reportó AUSENCIA en ${target?.label}. Evidencia guardada.`, time: noShowData.time, timestamp: noShowData.timestamp }) });
           alert("✅ Evidencia guardada correctamente en el sistema.");
           confirmarAbordaje(isFinalDestination); 
-      } catch (e) {
-          alert("Error al subir evidencia. Revisa tu conexión.");
-      }
+      } catch (e) { alert("Error al subir evidencia. Revisa tu conexión."); }
   };
 
-  // --- FUNCIONES DE SESIÓN GENERALES ---
   const handleSelectRoute = (ruta) => {
       setSelectedRoute(ruta); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
       if (ruta.status === 'En Ruta') {
@@ -361,8 +338,7 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'En Ruta' }));
-      localStorage.setItem('active_trip_id', routeId);
-      localStorage.setItem(`trip_idx_${routeId}`, 0);
+      localStorage.setItem('active_trip_id', routeId); localStorage.setItem(`trip_idx_${routeId}`, 0);
       setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
     } catch (e) { alert("Error al iniciar"); }
   };
@@ -372,8 +348,7 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString(), "proximityAlert.active": false });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' }));
-      localStorage.removeItem('active_trip_id');
-      localStorage.removeItem(`trip_idx_${routeId}`);
+      localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
       alert("¡Ruta finalizada con éxito!");
     } catch (e) { alert("Error al finalizar"); }
   };
@@ -389,11 +364,10 @@ function App() {
         licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp,
         vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(),
         vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(),
-        created: new Date().toISOString(), joined: new Date().toLocaleDateString(), trips: 0, rating: 5, fotoPerfil: '', identificacion: ''
+        isOnline: false, created: new Date().toISOString(), joined: new Date().toLocaleDateString(), trips: 0, rating: 5, fotoPerfil: '', identificacion: ''
       };
       await addDoc(collection(db, "conductores"), nuevoConductor);
-      alert("¡Registro enviado! Tu expediente está en revisión por el despacho.");
-      setIsRegistering(false);
+      alert("¡Registro enviado! Tu expediente está en revisión."); setIsRegistering(false);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
 
@@ -442,9 +416,6 @@ function App() {
     subtext: darkMode ? 'text-slate-500' : 'text-slate-400', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-blue-600 shadow-sm'
   };
 
-  // ========================================================
-  // VISTA 1: NAVEGACIÓN EN VIVO 
-  // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
@@ -454,8 +425,6 @@ function App() {
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
-              
-              {/* === PANEL DE ESPERA Y CHAT (SE SOBREPONE CUANDO EL CHOFER LLEGA) === */}
               {isWaiting && (
                   <div className="absolute inset-0 z-50 bg-slate-50 flex flex-col animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-slate-800 text-white p-4 pt-8 pb-4 flex justify-between items-center shadow-md shrink-0">
@@ -468,11 +437,8 @@ function App() {
 
                       <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-100 flex flex-col">
                           <div className="text-center text-[10px] text-slate-400 font-bold mb-4 uppercase">Inicio de Conversación Segura</div>
-                          
                           {(selectedRoute.chat || []).map((msg, i) => {
-                              if (msg.sender === 'Sistema') {
-                                  return <div key={i} className="text-center"><span className="bg-red-100 text-red-700 px-3 py-1 rounded-full text-[10px] font-bold shadow-sm">{msg.text}</span></div>
-                              }
+                              if (msg.sender === 'Sistema') return <div key={i} className="text-center"><span className="bg-red-100 text-red-700 px-3 py-1 rounded-full text-[10px] font-bold shadow-sm">{msg.text}</span></div>
                               const isDriver = msg.sender === 'Conductor';
                               return (
                                   <div key={i} className={`flex w-full ${isDriver ? 'justify-end' : 'justify-start'}`}>
@@ -486,29 +452,19 @@ function App() {
                       </div>
 
                       <div className="bg-white p-3 border-t border-slate-200 flex items-center gap-2 shrink-0">
-                          <input 
-                              type="text" value={chatText} onChange={e=>setChatText(e.target.value)} 
-                              onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()}
-                              placeholder="Envía un mensaje al cliente..." 
-                              className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-blue-500 focus:bg-white transition-colors"
-                          />
+                          <input type="text" value={chatText} onChange={e=>setChatText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()} placeholder="Envía un mensaje al cliente..." className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-blue-500 focus:bg-white transition-colors" />
                           <button onClick={enviarMensaje} className="p-3 bg-blue-600 text-white rounded-full shadow-md hover:bg-blue-700 active:scale-95 transition-transform"><Send className="w-5 h-5 ml-1"/></button>
                       </div>
 
                       <div className="bg-white p-4 border-t border-slate-200 shadow-[0_-10px_20px_rgba(0,0,0,0.05)] shrink-0 space-y-3">
                           <div className="flex gap-2">
-                              <a href={`https://wa.me/52${selectedRoute.clientPhone || '1234567890'}?text=Hola,%20soy%20tu%20conductor%20de%20log%C3%ADstica.%20Ya%20me%20encuentro%20afuera.`} target="_blank" rel="noreferrer" 
-                                 className="flex-1 bg-green-500 hover:bg-green-600 text-white p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition-colors shadow-sm">
-                                  <Phone className="w-5 h-5"/> WHATSAPP
-                              </a>
-                              
+                              <a href={`https://wa.me/52${selectedRoute.clientPhone || '1234567890'}?text=Hola,%20soy%20tu%20conductor%20de%20log%C3%ADstica.%20Ya%20me%20encuentro%20afuera.`} target="_blank" rel="noreferrer" className="flex-1 bg-green-500 hover:bg-green-600 text-white p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition-colors shadow-sm"><Phone className="w-5 h-5"/> WHATSAPP</a>
                               <label className={`flex-1 p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs cursor-pointer transition-colors shadow-sm ${evidence ? 'bg-green-100 text-green-700 border-2 border-green-500' : 'bg-slate-800 text-white hover:bg-slate-900'}`}>
                                   {evidence ? <CheckCircle2 className="w-5 h-5"/> : <Camera className="w-5 h-5"/>} 
                                   {evidence ? 'FOTO LISTA' : 'TOMAR FOTO'}
                                   <input type="file" accept="image/*" capture="environment" hidden onChange={handlePhoto} />
                               </label>
                           </div>
-                          
                           <div className="flex gap-2">
                               <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SE PRESENTÓ</button>
                               <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
@@ -535,18 +491,10 @@ function App() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
-                        <GoogleMap 
-                            mapContainerStyle={containerStyle} center={centerMX} zoom={16} onLoad={handleMapLoad} onDragStart={handleMapDrag} 
-                            options={{ mapId: "DEMO_MAP_ID", streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}
-                        >
+                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={16} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "DEMO_MAP_ID", streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}>
                             {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
-                            {allTargets.map((target, idx) => {
-                                if (idx < nextStopIdx) return null; 
-                                return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />;
-                            })}
-                            {userLocation && (
-                                <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />
-                            )}
+                            {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
+                            {userLocation && <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />}
                         </GoogleMap>
                         {userLocation && (
                             <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-blue-600 border-slate-200 active:bg-blue-50'}`}>
@@ -571,7 +519,6 @@ function App() {
                         <div className={`mb-6 rounded-xl p-4 border shadow-sm ${isApproaching ? 'bg-orange-100 border-orange-300' : darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
                             <p className={`text-[10px] font-black uppercase mb-1 tracking-widest ${isApproaching ? 'text-orange-600 animate-pulse' : 'text-blue-500'}`}>{isApproaching ? 'Llegando al punto...' : 'Siguiente Objetivo'}</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
-                            
                             <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
                                 <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-blue-600 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div>
                                 <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
@@ -589,7 +536,6 @@ function App() {
                                     <CheckCircle className="w-5 h-5"/> LLEGUÉ AL DESTINO (VER OPCIONES)
                                 </button>
                             )}
-                            
                             <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
                         </div>
                       </>
@@ -604,9 +550,6 @@ function App() {
       );
   }
 
-  // ========================================================
-  // VISTA 2: DETALLE DEL VIAJE (ANTES O DESPUÉS)
-  // ========================================================
   if (currentDriver && selectedRoute && selectedRoute.status !== 'En Ruta') {
     return (
       <div className={`min-h-screen flex flex-col font-sans transition-colors ${theme.bg} ${theme.text}`}>
@@ -637,9 +580,6 @@ function App() {
     );
   }
 
-  // ========================================================
-  // VISTA LISTADO PRINCIPAL CON PESTAÑAS (EN CURSO / FINALIZADOS)
-  // ========================================================
   if (currentDriver && !isEditingProfile) {
     const rFiltradas = misRutas
         .filter(x => {
@@ -650,9 +590,25 @@ function App() {
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans ${theme.bg} ${theme.text}`}>
-        <div className={`p-5 flex justify-between items-center shadow-sm border-b ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button>
-          <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
+        <div className={`p-5 flex flex-col gap-4 shadow-sm border-b ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="flex justify-between items-center">
+              <button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button>
+              <div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div>
+          </div>
+          
+          {/* --- NUEVO: SWITCH DE ESTADO DE CONEXIÓN --- */}
+          <div className="flex justify-between items-center bg-slate-100 dark:bg-slate-800 p-2 rounded-2xl border border-slate-200 dark:border-slate-700">
+              <div className="flex items-center gap-2 pl-2">
+                  {currentDriver.isOnline ? <Power className="w-4 h-4 text-green-500" /> : <PowerOff className="w-4 h-4 text-slate-400" />}
+                  <div>
+                      <p className="text-[9px] font-black uppercase text-slate-400">Estado de Operador</p>
+                      <p className={`text-xs font-bold ${currentDriver.isOnline ? 'text-green-600' : 'text-slate-500'}`}>{currentDriver.isOnline ? 'Conectado (Recibiendo Viajes)' : 'Desconectado'}</p>
+                  </div>
+              </div>
+              <button onClick={toggleOnlineStatus} className={`w-14 h-8 rounded-full transition-colors relative shadow-inner ${currentDriver.isOnline ? 'bg-green-500' : 'bg-slate-300'}`}>
+                  <div className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow transition-transform ${currentDriver.isOnline ? 'left-7' : 'left-1'}`}></div>
+              </button>
+          </div>
         </div>
         
         <div className="px-6 pt-6 pb-2">
@@ -676,7 +632,6 @@ function App() {
     );
   }
 
-  // --- VISTA REGISTRO Y EDICIÓN ---
   if (isRegistering || isEditingProfile) {
     const isEditing = isEditingProfile; const handleSubmit = isEditing ? handleUpdateProfile : handleRegister;
     return (
@@ -712,7 +667,6 @@ function App() {
     );
   }
 
-  // --- VISTA LOGIN ---
   return (
     <div className={`min-h-screen flex flex-col items-center justify-between p-8 transition-colors ${theme.bg} ${theme.text}`}>
       <div className="flex flex-col items-center mt-12 w-full max-w-sm"><div className="w-24 h-24 bg-blue-600 rounded-[2.2rem] flex items-center justify-center mb-8 shadow-2xl rotate-6 shadow-blue-500/30"><Truck className="w-12 h-12 text-white" /></div><h1 className="text-4xl font-black tracking-tighter italic">LOGÍSTICA</h1></div>
