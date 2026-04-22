@@ -1,5 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
+import { getMessaging, getToken, onMessage } from "firebase/messaging";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDCWNc2Lqh4Girn2PHU4Xiy9e-O2JCa8Gk",
@@ -12,3 +13,30 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
+
+// Inicializamos Messaging
+export const messaging = typeof window !== 'undefined' ? getMessaging(app) : null;
+
+// Función para pedir permiso y obtener el Token Push del celular
+export const requestForToken = async () => {
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      const currentToken = await getToken(messaging, {
+        // AQUÍ VA TU LLAVE MAESTRA VAPID
+        vapidKey: 'RfcfCzSCQyC5wI1obDI4iGhE9HSjHRGxE_5sy0di42s' 
+      });
+      
+      if (currentToken) {
+        return currentToken;
+      } else {
+        console.log('No se pudo obtener el token.');
+      }
+    } else {
+      console.log('El usuario denegó los permisos de notificación.');
+    }
+  } catch (err) {
+    console.error('Error al pedir token de notificaciones', err);
+  }
+  return null;
+};

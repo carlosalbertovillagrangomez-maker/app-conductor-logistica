@@ -7,6 +7,7 @@ import {
   Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X
 } from 'lucide-react';
 import { db } from './firebase';
+import { requestForToken } from './firebase';
 // --- NUEVO: importamos "increment" ---
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
 
@@ -250,28 +251,46 @@ function App() {
   const handleMapDrag = () => { setIsTracking(false); };
   const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; };
 
+  // --- TOGGLE ONLINE CON PERMISO DE GPS FORZADO, FALLBACK A XALAPA Y PUSH NOTIFICATIONS ---
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
       const newStatus = !currentDriver.isOnline;
+      
       try {
           await updateDoc(doc(db, "conductores", currentDriver.id), { isOnline: newStatus });
           const updatedDriver = { ...currentDriver, isOnline: newStatus };
-          setCurrentDriver(updatedDriver); localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
+          setCurrentDriver(updatedDriver);
+          localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
 
-          if (newStatus && "geolocation" in navigator) {
-               navigator.geolocation.getCurrentPosition(
-                  async (pos) => {
-                      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-                      setUserLocation(loc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
-                  },
-                  async (err) => {
-                      const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; 
-                      setUserLocation(fallbackLoc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc });
-                  },
-                  { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
-               );
+          if (newStatus) {
+               // 1. PEDIR PERMISO DE NOTIFICACIONES PUSH AL CELULAR
+               const fcmToken = await requestForToken();
+               if (fcmToken) {
+                   await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: fcmToken });
+               }
+
+               // 2. FORZAR GPS AL NAVEGADOR
+               if ("geolocation" in navigator) {
+                   navigator.geolocation.getCurrentPosition(
+                      async (pos) => {
+                          const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+                          setUserLocation(loc);
+                          await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
+                      },
+                      async (err) => {
+                          console.warn("Fallo el GPS o el usuario no dio permiso, usando Fallback en Xalapa.");
+                          const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; 
+                          setUserLocation(fallbackLoc);
+                          await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc });
+                      },
+                      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+                   );
+               }
+          } else {
+               // Si se desconecta, borramos el token para que no le suene
+               await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: '' });
           }
-      } catch (e) {}
+      } catch (e) { console.error("Error cambiando estado:", e); }
   };
 
   const marcarLlegada = async () => { setIsWaiting(true); setEvidence(null); setIsApproaching(false); try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} };
