@@ -139,7 +139,30 @@ function App() {
                 if (prevLocRef.current && window.google?.maps?.geometry) { heading = window.google.maps.geometry.spherical.computeHeading(prevLocRef.current, loc); } else { heading = 0; }
             }
             if (heading !== null && !isNaN(heading)) { setUserHeading(heading); }
-            prevLocRef.current = loc;
+            // 2. Filtro estabilizador para la brújula (evita el "giro loco")
+            if (prevLocRef.current && window.google?.maps?.geometry) {
+                const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
+                const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
+                const distForHeading = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
+
+                // Solo calculamos el nuevo giro si el chofer se movió al menos 3 metros reales
+                if (distForHeading > 3) {
+                    let newHeading = position.coords.heading;
+                    // Si el celular no da la brújula nativa o va muy lento, lo calculamos con la ruta
+                    if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
+                        newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
+                    }
+                    if (newHeading !== null && !isNaN(newHeading)) { 
+                        setUserHeading(newHeading); 
+                    }
+                    // Guardamos esta locación estable para el siguiente cálculo
+                    prevLocRef.current = loc; 
+                }
+            } else {
+                let initialHeading = position.coords.heading || 0;
+                setUserHeading(initialHeading);
+                prevLocRef.current = loc;
+            }
 
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
