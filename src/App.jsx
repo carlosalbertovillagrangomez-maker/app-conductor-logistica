@@ -444,7 +444,7 @@ function App() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
-                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "DEMO_MAP_ID", disableDefaultUI: true, gestureHandling: "greedy" }}>
+                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
                             {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
                             {userLocation && <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />}
@@ -525,7 +525,7 @@ function App() {
           {!isLoaded ? (
               <div className="absolute inset-0 flex items-center justify-center bg-slate-100 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/></div>
           ) : (
-              <GoogleMap mapContainerStyle={containerStyle} center={mapCenter} zoom={13} onLoad={handleMapLoad} options={{ disableDefaultUI: true, gestureHandling: "greedy" }}>
+              <GoogleMap mapContainerStyle={containerStyle} center={mapCenter} zoom={13} onLoad={handleMapLoad} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
                   {routeToDisplay.length > 0 && <Polyline path={routeToDisplay} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 5 }} />}
                   {selectedRoute.startCoords && <Marker position={{lat: selectedRoute.startCoords.lat, lng: selectedRoute.startCoords.lng}} label="A" />}
                   {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => ( wp.lat && wp.lng && <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} label={String.fromCharCode(66 + idx)} /> ))}
