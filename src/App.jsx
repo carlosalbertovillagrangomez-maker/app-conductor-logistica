@@ -66,7 +66,10 @@ function App() {
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
 
-  const handleMapLoad = useCallback((map) => { mapRef.current = map; }, []);
+  const handleMapLoad = useCallback((map) => { 
+      mapRef.current = map; 
+      if (isTrackingRef.current) { map.setTilt(60); }
+  }, []);
 
   useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
@@ -142,13 +145,15 @@ function App() {
             if (heading !== null && !isNaN(heading)) { setUserHeading(heading); }
             prevLocRef.current = loc;
 
-            // Enviar ubicación al backend si está en línea (incluso sin ruta activa)
+            // Enviar ubicación al backend si está en línea
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
             }
 
             if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
-                mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
+                mapRef.current.panTo(loc); 
+                mapRef.current.setZoom(19); 
+                mapRef.current.setTilt(60); // Forza el mapa 3D
                 if (heading !== null && !isNaN(heading)) { mapRef.current.setHeading(heading); }
             }
           },
@@ -169,7 +174,7 @@ function App() {
           if (!snapshot.empty) {
               const offer = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
               setIncomingOffer(offer);
-              if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]); // Vibrar fuerte
+              if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]); 
           } else {
               setIncomingOffer(null);
           }
@@ -265,7 +270,9 @@ function App() {
   const centerOnUser = () => {
       setIsTracking(true);
       if (mapRef.current && userLocation) {
-          mapRef.current.panTo(userLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
+          mapRef.current.panTo(userLocation); 
+          mapRef.current.setZoom(19); 
+          mapRef.current.setTilt(60); 
           if (userHeading) mapRef.current.setHeading(userHeading);
       }
   };
@@ -279,7 +286,7 @@ function App() {
       setIsPanelExpanded(true); setIsTracking(true);
   };
 
-  // --- TOGGLE ONLINE CON PERMISO DE GPS FORZADO Y FALLBACK A XALAPA ---
+  // --- TOGGLE ONLINE (FALLBACK A XALAPA) ---
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
       const newStatus = !currentDriver.isOnline;
@@ -291,7 +298,6 @@ function App() {
           localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
 
           if (newStatus && "geolocation" in navigator) {
-               // Forzamos la petición de GPS al navegador
                navigator.geolocation.getCurrentPosition(
                   async (pos) => {
                       const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
@@ -299,8 +305,7 @@ function App() {
                       await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
                   },
                   async (err) => {
-                      // Si falla el GPS, usamos el Fallback de Xalapa (en lugar de CDMX)
-                      console.warn("Fallo el GPS o el usuario no dio permiso, usando Fallback en Xalapa.");
+                      console.warn("Fallo el GPS, usando Fallback en Xalapa.");
                       const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; 
                       setUserLocation(fallbackLoc);
                       await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc });
@@ -308,7 +313,7 @@ function App() {
                   { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
                );
           }
-      } catch (e) { console.error("Error cambiando estado:", e); }
+      } catch (e) {}
   };
 
   const marcarLlegada = async () => {
@@ -319,7 +324,7 @@ function App() {
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
       const msg = { sender: 'Conductor', text: chatText.trim(), time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
-      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { console.error(e); }
+      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) {}
   };
 
   const handlePhoto = (e) => {
@@ -344,7 +349,22 @@ function App() {
       }
   };
 
+  // --- AQUI SE GUARDA LA FOTO AL ABORDAR / LLEGAR ---
   const confirmarAbordaje = async (isFinalDestination) => {
+      if (evidence) {
+          const target = allTargets[nextStopIdx];
+          const llegadaData = {
+              stopIndex: nextStopIdx,
+              label: target?.label || (isFinalDestination ? 'Destino Final' : 'Parada'),
+              passenger: target?.contact || 'Pasajero',
+              address: target?.address || '',
+              photo: evidence,
+              time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}),
+              timestamp: new Date().toISOString()
+          };
+          try { await updateDoc(doc(db, "rutas", selectedRoute.id), { evidenciasLlegada: arrayUnion(llegadaData) }); } catch (e) {}
+      }
+
       if(isFinalDestination) { handleEndTrip(selectedRoute.id); setIsWaiting(false); } 
       else {
           const newIdx = nextStopIdx + 1;
@@ -562,7 +582,20 @@ function App() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
-                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={16} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "DEMO_MAP_ID", streetViewControl: false, mapTypeControl: false, myLocationButton: false, zoomControl: false, fullscreenControl: false }}>
+                        <GoogleMap 
+                            mapContainerStyle={containerStyle} 
+                            center={centerMX} 
+                            zoom={isTracking ? 19 : 16} 
+                            tilt={isTracking ? 60 : 0}
+                            heading={isTracking ? userHeading : 0}
+                            onLoad={handleMapLoad} 
+                            onDragStart={handleMapDrag} 
+                            options={{ 
+                                mapId: "DEMO_MAP_ID", 
+                                disableDefaultUI: true, 
+                                gestureHandling: "greedy" 
+                            }}
+                        >
                             {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
                             {userLocation && <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />}
