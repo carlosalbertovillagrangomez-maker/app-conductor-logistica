@@ -6,9 +6,7 @@ import {
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
   Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X
 } from 'lucide-react';
-import { db } from './firebase';
-import { requestForToken } from './firebase';
-// --- NUEVO: importamos "increment" ---
+import { db, requestForToken } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
 
 // --- GOOGLE MAPS ---
@@ -52,7 +50,7 @@ function App() {
   const isTrackingRef = useRef(true); 
   const latestLocRef = useRef(null);
   const prevLocRef = useRef(null); 
-  const odometerLocRef = useRef(null); // Referencia exclusiva para el odómetro
+  const odometerLocRef = useRef(null); 
   
   const [nextStopIdx, setNextStopIdx] = useState(0); 
   const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
@@ -60,9 +58,7 @@ function App() {
   const [alertedStops, setAlertedStops] = useState([]); 
   const [isApproaching, setIsApproaching] = useState(false); 
 
-  const [liveRouteData, setLiveRouteData] = useState({ 
-      geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 
-  });
+  const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -106,15 +102,15 @@ function App() {
 
   useEffect(() => {
       if (isLoaded && mapRef.current && selectedRoute?.technicalData?.geometry?.length > 0) {
-          if (!userLocation) {
+          if (!userLocation || selectedRoute.status !== 'En Ruta') {
               const bounds = new window.google.maps.LatLngBounds();
               selectedRoute.technicalData.geometry.forEach(coord => bounds.extend(coord));
               mapRef.current.fitBounds(bounds);
           }
       }
-  }, [isLoaded, selectedRoute?.id]); 
+  }, [isLoaded, selectedRoute?.id, selectedRoute?.status]); 
 
-  // --- MOTOR GPS Y ODÓMETRO REAL ---
+  // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
     let watchId;
     if (currentDriver && (currentDriver.isOnline || (selectedRoute && selectedRoute.status === 'En Ruta'))) {
@@ -124,45 +120,31 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            // --- 1. Odómetro: Sumar Kilómetros Reales ---
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                if (!odometerLocRef.current) {
-                    odometerLocRef.current = loc;
-                } else {
+                if (!odometerLocRef.current) { odometerLocRef.current = loc; } 
+                else {
                     const p1 = new window.google.maps.LatLng(odometerLocRef.current.lat, odometerLocRef.current.lng);
                     const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
                     const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-
-                    // Filtro de 15 metros para ignorar ruido del GPS estando parado
                     if (distMeters > 15) {
                         const distKm = distMeters / 1000;
-                        try {
-                            // Sumamos los km directamente a Firebase
-                            await updateDoc(doc(db, "rutas", selectedRoute.id), { 
-                                realDistanceDriven: increment(distKm) 
-                            });
-                        } catch(e) {}
+                        try { await updateDoc(doc(db, "rutas", selectedRoute.id), { realDistanceDriven: increment(distKm) }); } catch(e) {}
                         odometerLocRef.current = loc; 
                     }
                 }
             }
 
-            // --- 2. Heading (Rotación del mapa) ---
             let heading = position.coords.heading;
             if (heading === null || isNaN(heading)) {
-                if (prevLocRef.current && window.google?.maps?.geometry) {
-                    heading = window.google.maps.geometry.spherical.computeHeading(prevLocRef.current, loc);
-                } else { heading = 0; }
+                if (prevLocRef.current && window.google?.maps?.geometry) { heading = window.google.maps.geometry.spherical.computeHeading(prevLocRef.current, loc); } else { heading = 0; }
             }
             if (heading !== null && !isNaN(heading)) { setUserHeading(heading); }
             prevLocRef.current = loc;
 
-            // --- 3. Posición en vivo para el Despachador ---
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
             }
 
-            // --- 4. Mover la cámara del mapa ---
             if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
                 mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
                 if (heading !== null && !isNaN(heading)) { mapRef.current.setHeading(heading); }
@@ -176,6 +158,7 @@ function App() {
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
   }, [currentDriver, selectedRoute]);
 
+  // ESCUCHAR OFERTAS DE VIAJE
   useEffect(() => {
       if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
       const q = query(collection(db, "rutas"), where("ofertaPara", "==", currentDriver.id), where("ofertaEstado", "==", "Pendiente"));
@@ -190,12 +173,8 @@ function App() {
 
   const aceptarViaje = async () => {
       if (!incomingOffer || !currentDriver) return;
-      try {
-          await updateDoc(doc(db, "rutas", incomingOffer.id), { driver: currentDriver.name, driverId: currentDriver.id, ofertaEstado: 'Aceptada' });
-          setIncomingOffer(null); setMainTab('Pendientes');
-      } catch (e) { alert("Error al aceptar viaje"); }
+      try { await updateDoc(doc(db, "rutas", incomingOffer.id), { driver: currentDriver.name, driverId: currentDriver.id, ofertaEstado: 'Aceptada', status: 'Aceptada' }); setIncomingOffer(null); setMainTab('Pendientes'); } catch (e) { alert("Error al aceptar viaje"); }
   };
-
   const rechazarViaje = async () => {
       if (!incomingOffer || !currentDriver) return;
       try { await updateDoc(doc(db, "rutas", incomingOffer.id), { ofertaEstado: 'Rechazada', rechazadoPor: arrayUnion(currentDriver.id), ofertaPara: '' }); setIncomingOffer(null); } catch (e) {}
@@ -207,19 +186,16 @@ function App() {
       return () => clearInterval(interval);
   }, [selectedRoute?.status]);
 
-  // Actualizar ruta restante (sin borrar la distancia original de technicalData)
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
       const loc = latestLocRef.current;
       if (!loc) return;
-
       const updateLiveRoute = async () => {
           try {
               let coordsArray = [`${loc.lng},${loc.lat}`]; 
               for (let i = nextStopIdx; i < allTargets.length; i++) { coordsArray.push(`${allTargets[i].lng},${allTargets[i].lat}`); }
               const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsArray.join(';')}?overview=full&geometries=geojson`);
               const data = await res.json();
-              
               if (data.code === 'Ok' && data.routes.length > 0) {
                   const r = data.routes[0];
                   const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
@@ -235,12 +211,7 @@ function App() {
                       setAlertedStops(prev => [...prev, nextStopIdx]); setIsApproaching(true); 
                       proximityUpdate = { proximityAlert: { active: true, stopIndex: nextStopIdx, passenger: allTargets[nextStopIdx]?.contact || 'Pasajero', etaMins: nextDurMins, timestamp: new Date().toISOString() } };
                   }
-
-                  // No sobreescribimos technicalData.totalDistance para no perder el original
-                  await updateDoc(doc(db, "rutas", selectedRoute.id), { 
-                      currentLocation: loc, lastUpdate: new Date().toISOString(),
-                      "technicalData.geometry": geo, ...proximityUpdate 
-                  });
+                  await updateDoc(doc(db, "rutas", selectedRoute.id), { currentLocation: loc, lastUpdate: new Date().toISOString(), "technicalData.geometry": geo, ...proximityUpdate });
               }
           } catch (e) {}
       };
@@ -251,46 +222,27 @@ function App() {
   const handleMapDrag = () => { setIsTracking(false); };
   const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; };
 
-  // --- TOGGLE ONLINE CON PERMISO DE GPS FORZADO, FALLBACK A XALAPA Y PUSH NOTIFICATIONS ---
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
       const newStatus = !currentDriver.isOnline;
-      
       try {
           await updateDoc(doc(db, "conductores", currentDriver.id), { isOnline: newStatus });
           const updatedDriver = { ...currentDriver, isOnline: newStatus };
-          setCurrentDriver(updatedDriver);
-          localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
+          setCurrentDriver(updatedDriver); localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
 
           if (newStatus) {
-               // 1. PEDIR PERMISO DE NOTIFICACIONES PUSH AL CELULAR
                const fcmToken = await requestForToken();
-               if (fcmToken) {
-                   await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: fcmToken });
-               }
+               if (fcmToken) { await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: fcmToken }); }
 
-               // 2. FORZAR GPS AL NAVEGADOR
                if ("geolocation" in navigator) {
                    navigator.geolocation.getCurrentPosition(
-                      async (pos) => {
-                          const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-                          setUserLocation(loc);
-                          await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
-                      },
-                      async (err) => {
-                          console.warn("Fallo el GPS o el usuario no dio permiso, usando Fallback en Xalapa.");
-                          const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; 
-                          setUserLocation(fallbackLoc);
-                          await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc });
-                      },
+                      async (pos) => { const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude }; setUserLocation(loc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); },
+                      async (err) => { const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; setUserLocation(fallbackLoc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc }); },
                       { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
                    );
                }
-          } else {
-               // Si se desconecta, borramos el token para que no le suene
-               await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: '' });
-          }
-      } catch (e) { console.error("Error cambiando estado:", e); }
+          } else { await updateDoc(doc(db, "conductores", currentDriver.id), { pushToken: '' }); }
+      } catch (e) {}
   };
 
   const marcarLlegada = async () => { setIsWaiting(true); setEvidence(null); setIsApproaching(false); try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} };
@@ -298,7 +250,7 @@ function App() {
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
       const msg = { sender: 'Conductor', text: chatText.trim(), time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
-      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) { console.error(e); }
+      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) {}
   };
 
   const handlePhoto = (e) => {
@@ -308,10 +260,7 @@ function App() {
           reader.onload = (event) => {
               const img = new Image();
               img.onload = () => {
-                  const canvas = document.createElement('canvas');
-                  const scaleSize = 800 / img.width;
-                  canvas.width = 800; canvas.height = img.height * scaleSize;
-                  const ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                  const canvas = document.createElement('canvas'); const scaleSize = 800 / img.width; canvas.width = 800; canvas.height = img.height * scaleSize; const ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                   setEvidence(canvas.toDataURL('image/jpeg', 0.6));
               }
               img.src = event.target.result;
@@ -327,11 +276,7 @@ function App() {
           try { await updateDoc(doc(db, "rutas", selectedRoute.id), { evidenciasLlegada: arrayUnion(llegadaData) }); } catch (e) {}
       }
       if(isFinalDestination) { handleEndTrip(selectedRoute.id); setIsWaiting(false); } 
-      else {
-          const newIdx = nextStopIdx + 1;
-          setNextStopIdx(newIdx); localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); 
-          setIsWaiting(false); setRouteUpdateTick(t => t + 1); 
-      }
+      else { const newIdx = nextStopIdx + 1; setNextStopIdx(newIdx); localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); setIsWaiting(false); setRouteUpdateTick(t => t + 1); }
   };
 
   const reportarAusencia = async (isFinalDestination) => {
@@ -346,11 +291,7 @@ function App() {
 
   const handleSelectRoute = (ruta) => {
       setSelectedRoute(ruta); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
-      if (ruta.status === 'En Ruta') {
-          localStorage.setItem('active_trip_id', ruta.id);
-          const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`);
-          if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10));
-      } else { setNextStopIdx(0); }
+      if (ruta.status === 'En Ruta') { localStorage.setItem('active_trip_id', ruta.id); const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`); if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10)); } else { setNextStopIdx(0); }
   };
 
   const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
@@ -363,19 +304,12 @@ function App() {
 
   useEffect(() => {
     const savedDriver = localStorage.getItem('driver_session');
-    if (savedDriver) {
-      const driverData = JSON.parse(savedDriver);
-      setCurrentDriver(driverData); cargarDatosEnFormulario(driverData); escucharRutas(driverData.id);
-    }
+    if (savedDriver) { const driverData = JSON.parse(savedDriver); setCurrentDriver(driverData); cargarDatosEnFormulario(driverData); escucharRutas(driverData.id); }
     setIsReady(true);
   }, []);
 
   const cargarDatosEnFormulario = (data) => {
-    setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || '');
-    setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || '');
-    setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || '');
-    setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || '');
-    setEmail(data.email || ''); setPassword(data.password || '');
+    setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || ''); setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || ''); setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || ''); setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || ''); setEmail(data.email || ''); setPassword(data.password || '');
   };
 
   const escucharRutas = (driverId) => {
@@ -398,7 +332,7 @@ function App() {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString(), "proximityAlert.active": false });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' })); localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
       alert("¡Ruta finalizada con éxito!"); odometerLocRef.current = null;
-    } catch (e) { alert("Error al finalizar"); }
+    } catch (e) {}
   };
 
   const handleRegister = async (e) => {
@@ -415,9 +349,7 @@ function App() {
     try {
       const updatedData = { name: name.trim(), phone: phone.trim(), address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp, vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, initials: name.substring(0, 2).toUpperCase() };
       await updateDoc(doc(db, "conductores", currentDriver.id), updatedData);
-      const newState = { ...currentDriver, ...updatedData };
-      setCurrentDriver(newState); localStorage.setItem('driver_session', JSON.stringify(newState));
-      alert("¡Expediente actualizado!"); setIsEditingProfile(false);
+      const newState = { ...currentDriver, ...updatedData }; setCurrentDriver(newState); localStorage.setItem('driver_session', JSON.stringify(newState)); alert("¡Expediente actualizado!"); setIsEditingProfile(false);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
 
@@ -431,16 +363,13 @@ function App() {
     setLoading(false);
   };
 
-  const openGoogleMaps = (ruta) => {
-    const origin = encodeURIComponent(ruta.start); const destination = encodeURIComponent(ruta.end);
-    let waypoints = ruta.waypoints?.length > 0 ? '&waypoints=' + ruta.waypoints.map(wp => encodeURIComponent(wp)).join('|') : '';
-    window.open(`https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}${waypoints}&travelmode=driving`, '_blank');
-  };
-
   if (!isReady) return null;
 
   const theme = { bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900', card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200', input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-blue-600 shadow-sm' };
 
+  // ==============================================================
+  // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
+  // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
       const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
@@ -450,6 +379,8 @@ function App() {
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
+              
+              {/* --- PANTALLA CÁMARA (LLEGUÉ AL PUNTO) --- */}
               {isWaiting && (
                   <div className="absolute inset-0 z-50 bg-slate-50 flex flex-col animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-slate-800 text-white p-4 pt-8 pb-4 flex justify-between items-center shadow-md shrink-0">
@@ -479,7 +410,7 @@ function App() {
 
                       <div className="bg-white p-4 border-t border-slate-200 shadow-[0_-10px_20px_rgba(0,0,0,0.05)] shrink-0 space-y-3">
                           <div className="flex gap-2">
-                              <a href={`https://wa.me/52${selectedRoute.clientPhone || '1234567890'}?text=Hola,%20soy%20tu%20conductor%20de%20log%C3%ADstica.%20Ya%20me%20encuentro%20afuera.`} target="_blank" rel="noreferrer" className="flex-1 bg-green-500 hover:bg-green-600 text-white p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition-colors shadow-sm"><Phone className="w-5 h-5"/> WHATSAPP</a>
+                              <a href={`https://wa.me/52${selectedRoute.clientPhone || '1234567890'}?text=Hola,%20soy%20tu%20conductor.%20Ya%20me%20encuentro%20afuera.`} target="_blank" rel="noreferrer" className="flex-1 bg-green-500 hover:bg-green-600 text-white p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition-colors shadow-sm"><Phone className="w-5 h-5"/> WHATSAPP</a>
                               <label className={`flex-1 p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs cursor-pointer transition-colors shadow-sm ${evidence ? 'bg-green-100 text-green-700 border-2 border-green-500' : 'bg-slate-800 text-white hover:bg-slate-900'}`}>
                                   {evidence ? <CheckCircle2 className="w-5 h-5"/> : <Camera className="w-5 h-5"/>} {evidence ? 'FOTO LISTA' : 'TOMAR FOTO'}
                                   <input type="file" accept="image/*" capture="environment" hidden onChange={handlePhoto} />
@@ -495,6 +426,7 @@ function App() {
                   </div>
               )}
 
+              {/* --- HEADER --- */}
               <div className={`p-4 flex items-center gap-4 shadow-lg z-20 shrink-0 ${darkMode ? 'bg-slate-900 border-b border-slate-800' : 'bg-white'} ${isApproaching ? 'border-b-4 border-orange-500 bg-orange-50' : ''}`}>
                   <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'} transition`}><ChevronLeft className="w-5 h-5" /></button>
                   <div className="flex-1">
@@ -506,6 +438,7 @@ function App() {
                   </div>
               </div>
 
+              {/* --- MAPA 3D --- */}
               <div className="flex-1 relative bg-slate-200 w-full h-full">
                   {!isLoaded ? (
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
@@ -516,6 +449,7 @@ function App() {
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
                             {userLocation && <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />}
                         </GoogleMap>
+                        
                         {userLocation && (
                             <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-blue-600 border-slate-200 active:bg-blue-50'}`}>
                                 {isTracking ? <Navigation2 className="w-6 h-6" /> : <LocateFixed className="w-6 h-6" />}
@@ -525,8 +459,12 @@ function App() {
                   )}
               </div>
 
+              {/* --- PANEL DETALLES --- */}
               <div className={`z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col transition-all duration-300 ${darkMode ? 'bg-slate-900 border-t border-slate-800' : 'bg-white border-t border-slate-200'} ${isPanelExpanded ? 'max-h-[70vh] p-6' : 'h-[90px] px-6 py-4 cursor-pointer'}`}>
-                  <div className="w-full flex justify-center pb-3" onClick={() => setIsPanelExpanded(!isPanelExpanded)}><div className="w-12 h-1.5 bg-slate-300 hover:bg-slate-400 rounded-full transition-colors cursor-pointer"></div></div>
+                  <div className="w-full flex justify-center pb-3" onClick={() => setIsPanelExpanded(!isPanelExpanded)}>
+                      <div className="w-12 h-1.5 bg-slate-300 hover:bg-slate-400 rounded-full transition-colors cursor-pointer"></div>
+                  </div>
+
                   {isPanelExpanded ? (
                       <>
                         <div className="flex justify-between items-center mb-4 px-2">
@@ -538,7 +476,9 @@ function App() {
                             <p className={`text-[10px] font-black uppercase mb-1 tracking-widest ${isApproaching ? 'text-orange-600 animate-pulse' : 'text-blue-500'}`}>{isApproaching ? 'Llegando al punto...' : 'Siguiente Objetivo'}</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
                             <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
-                                <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-blue-600 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div><div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div><div className="flex flex-col text-right"><span className="text-[10px] font-bold text-slate-400 uppercase">Llegada en</span><span className="font-black text-green-500 text-xl">{liveRouteData.nextStopDuration || '--'} <span className="text-sm">min</span></span></div>
+                                <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-blue-600 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div>
+                                <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
+                                <div className="flex flex-col text-right"><span className="text-[10px] font-bold text-slate-400 uppercase">Llegada en</span><span className="font-black text-green-500 text-xl">{liveRouteData.nextStopDuration || '--'} <span className="text-sm">min</span></span></div>
                             </div>
                         </div>
                         <div className="space-y-3 shrink-0 mt-auto pb-4">
@@ -547,12 +487,12 @@ function App() {
                             ) : (
                                 <button onClick={marcarLlegada} className="w-full text-white font-black p-4 rounded-2xl shadow-xl shadow-red-500/40 bg-red-600 hover:bg-red-700 flex items-center justify-center gap-2 active:scale-95 transition-all tracking-widest animate-pulse"><CheckCircle className="w-5 h-5"/> LLEGUÉ AL DESTINO (VER OPCIONES)</button>
                             )}
-                            <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-bold p-4 rounded-2xl border flex items-center justify-center gap-2 text-xs tracking-wide transition-all active:scale-95 ${darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-700' : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'}`}><Navigation className="w-4 h-4"/> MAPS EXTERNO</button>
                         </div>
                       </>
                   ) : (
                       <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
-                          <div><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest line-clamp-1">{nextStopName}</p><p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div><div className="text-right"><p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p><p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p></div>
+                          <div><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest line-clamp-1">{nextStopName}</p><p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div>
+                          <div className="text-right"><p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p><p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p></div>
                       </div>
                   )}
               </div>
@@ -560,24 +500,96 @@ function App() {
       );
   }
 
+  // ==============================================================
+  // VISTA 2: VISTA PREVIA (ESTATUS: ACEPTADA O PENDIENTE) -> ¡AQUÍ ESTÁ TU MAPA!
+  // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status !== 'En Ruta') {
+    const routeToDisplay = selectedRoute.technicalData?.geometry || [];
+    let mapCenter = centerMX;
+    if (routeToDisplay.length > 0) mapCenter = routeToDisplay[0];
+
     return (
-      <div className={`min-h-screen flex flex-col font-sans transition-colors ${theme.bg} ${theme.text}`}>
-        <div className={`p-5 flex items-center gap-4 sticky top-0 z-10 backdrop-blur-md border-b ${darkMode ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200'}`}><button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}><ChevronLeft className="w-5 h-5" /></button><div><h2 className="text-sm font-bold">Detalle de Ruta</h2><p className={`text-[10px] uppercase font-bold text-blue-500`}>{selectedRoute.client}</p></div></div>
-        <div className="flex-1 p-6 space-y-6 overflow-y-auto pb-40">
-          <div className={`p-5 rounded-[2rem] border ${theme.card} flex justify-between items-center`}><div><p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Estatus actual</p><div className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 ${selectedRoute.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : 'bg-blue-100 text-blue-700'}`}>{selectedRoute.status === 'Finalizado' ? <CheckCircle2 className="w-3 h-3"/> : <Play className="w-3 h-3"/>}{selectedRoute.status || 'Pendiente'}</div></div>{selectedRoute.technicalData && <div className="text-right"><p className="text-2xl font-black">{selectedRoute.technicalData.totalDistance} <span className="text-xs text-slate-400">km</span></p></div>}</div>
-          <div className={`p-5 rounded-[2rem] border ${theme.card}`}><h3 className="text-sm font-bold mb-6 flex items-center gap-2"><MapPin className="w-4 h-4 text-blue-500"/> Itinerario</h3><div className="relative pl-2 space-y-8"><div className={`absolute left-[15px] top-2 bottom-4 w-0.5 ${darkMode ? 'bg-slate-800' : 'bg-slate-200'}`}></div><div className="relative flex gap-4"><div className="w-3 h-3 rounded-full bg-green-500 z-10 mt-1.5 ring-4 ring-green-500/20"></div><div className="flex-1"><p className="text-[10px] font-black uppercase text-slate-400">Origen</p><p className="text-xs font-medium">{selectedRoute.start}</p>{selectedRoute.technicalData?.segments?.[0] && <div className="mt-2 text-[10px] font-mono text-blue-500">⬇ {selectedRoute.technicalData.segments[0].distance} km • {selectedRoute.technicalData.segments[0].duration} min</div>}</div></div>{selectedRoute.waypoints?.map((wp, i) => (<div key={i} className="relative flex gap-4"><div className="w-3 h-3 rounded-full bg-blue-500 z-10 mt-1.5 ring-4 ring-blue-500/20"></div><div className="flex-1"><p className="text-[10px] font-black uppercase text-slate-400">Parada {i+1}</p><p className="text-xs font-medium">{wp}</p>{selectedRoute.technicalData?.segments?.[i + 1] && <div className="mt-2 text-[10px] font-mono text-blue-500">⬇ {selectedRoute.technicalData.segments[i + 1].distance} km • {selectedRoute.technicalData.segments[i + 1].duration} min</div>}</div></div>))}<div className="relative flex gap-4"><div className="w-3 h-3 rounded-full bg-red-500 z-10 mt-1.5 ring-4 ring-red-500/20"></div><div className="flex-1"><p className="text-[10px] font-black uppercase text-slate-400">Destino</p><p className="text-xs font-medium">{selectedRoute.end}</p></div></div></div></div>
+      <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
+        
+        {/* Header */}
+        <div className={`p-4 flex items-center gap-4 shadow-lg z-20 shrink-0 ${darkMode ? 'bg-slate-900 border-b border-slate-800' : 'bg-white'}`}>
+          <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'} transition`}><ChevronLeft className="w-5 h-5" /></button>
+          <div>
+              <h2 className="text-sm font-bold">Vista Previa de Ruta</h2>
+              <p className={`text-[10px] uppercase font-bold text-blue-500`}>{selectedRoute.client}</p>
+          </div>
         </div>
-        <div className={`p-5 border-t fixed bottom-0 left-0 right-0 z-30 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} grid gap-3 shadow-2xl`}>
-           {selectedRoute.status === 'Pendiente' || !selectedRoute.status ? <button onClick={() => handleStartTrip(selectedRoute.id)} className="w-full bg-green-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all"><Play className="w-5 h-5 fill-white"/> INICIAR VIAJE</button> : <div className="w-full bg-slate-100 text-slate-400 font-black p-4 rounded-2xl flex items-center justify-center gap-2 cursor-not-allowed"><CheckCircle2 className="w-5 h-5"/> SERVICIO COMPLETADO</div>}
-           <button onClick={() => openGoogleMaps(selectedRoute)} className={`w-full font-black p-4 rounded-2xl border flex items-center justify-center gap-2 ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200 text-slate-600'}`}><Navigation className="w-5 h-5 text-blue-500"/> ABRIR MAPAS</button>
+
+        {/* MAPA ESTÁTICO DE VISTA PREVIA */}
+        <div className="flex-1 relative bg-slate-200 w-full h-full">
+          {!isLoaded ? (
+              <div className="absolute inset-0 flex items-center justify-center bg-slate-100 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/></div>
+          ) : (
+              <GoogleMap mapContainerStyle={containerStyle} center={mapCenter} zoom={13} onLoad={handleMapLoad} options={{ disableDefaultUI: true, gestureHandling: "greedy" }}>
+                  {routeToDisplay.length > 0 && <Polyline path={routeToDisplay} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 5 }} />}
+                  {selectedRoute.startCoords && <Marker position={{lat: selectedRoute.startCoords.lat, lng: selectedRoute.startCoords.lng}} label="A" />}
+                  {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => ( wp.lat && wp.lng && <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} label={String.fromCharCode(66 + idx)} /> ))}
+                  {selectedRoute.endCoords && <Marker position={{lat: selectedRoute.endCoords.lat, lng: selectedRoute.endCoords.lng}} label={String.fromCharCode(66 + (selectedRoute.waypointsData?.length || 0))} />}
+              </GoogleMap>
+          )}
+        </div>
+
+        {/* PANEL INFERIOR CON BOTÓN DE INICIAR */}
+        <div className={`z-20 shadow-[0_-10px_40px_rgba(0,0,0,0.1)] rounded-t-[2rem] -mt-6 shrink-0 relative flex flex-col transition-all duration-300 ${darkMode ? 'bg-slate-900' : 'bg-white'} max-h-[60vh] p-6 overflow-y-auto`}>
+            <div className="flex justify-between items-center mb-4">
+                <div>
+                    <p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Estatus</p>
+                    <div className="px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 bg-blue-100 text-blue-700">
+                       <CheckCircle2 className="w-3 h-3"/> {selectedRoute.status}
+                    </div>
+                </div>
+                <div className="text-right">
+                    <p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Distancia</p>
+                    <p className="text-xl font-black">{selectedRoute.technicalData?.totalDistance || '--'} <span className="text-xs text-slate-400">km</span></p>
+                </div>
+            </div>
+
+            <div className="space-y-4 mb-4">
+                <div className="flex items-start gap-3">
+                    <div className="w-3 h-3 rounded-full bg-green-500 mt-1"></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Origen</p><p className="text-xs font-medium">{selectedRoute.start}</p></div>
+                </div>
+                {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => (
+                    <div key={idx} className="flex items-start gap-3">
+                        <div className="w-3 h-3 rounded-full bg-blue-500 mt-1"></div>
+                        <div><p className="text-[10px] font-black uppercase text-slate-400">Parada {String.fromCharCode(66 + idx)}</p><p className="text-xs font-medium">{wp.address}</p></div>
+                    </div>
+                ))}
+                <div className="flex items-start gap-3">
+                    <div className="w-3 h-3 rounded-full bg-red-500 mt-1"></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Destino</p><p className="text-xs font-medium">{selectedRoute.end}</p></div>
+                </div>
+            </div>
+
+            {selectedRoute.status === 'Pendiente' || selectedRoute.status === 'Aceptada' ? (
+                <button onClick={() => handleStartTrip(selectedRoute.id)} className="w-full mt-2 bg-green-600 text-white font-black p-4 rounded-2xl shadow-xl shadow-green-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all">
+                    <Play className="w-5 h-5 fill-white"/> INICIAR VIAJE AHORA
+                </button>
+            ) : (
+                <div className="w-full mt-2 bg-slate-100 text-slate-400 font-black p-4 rounded-2xl flex items-center justify-center gap-2">
+                    <CheckCircle2 className="w-5 h-5"/> VIAJE FINALIZADO
+                </div>
+            )}
         </div>
       </div>
     );
   }
 
+  // ==============================================================
+  // VISTA 3: PANTALLA PRINCIPAL (LISTA DE VIAJES)
+  // ==============================================================
   if (currentDriver && !isEditingProfile) {
-    const rFiltradas = misRutas.filter(x => { if (mainTab === 'Finalizados') return x.status === 'Finalizado'; return x.status !== 'Finalizado' && (filterType === 'Todos' || x.serviceType === filterType); }).sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
+    const rFiltradas = misRutas
+        .filter(x => {
+            if (mainTab === 'Finalizados') return x.status === 'Finalizado';
+            return x.status !== 'Finalizado' && (filterType === 'Todos' || x.serviceType === filterType);
+        })
+        .sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
@@ -633,6 +645,7 @@ function App() {
         <input type="password" placeholder="Contraseña" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={password} onChange={e => setPassword(e.target.value)} />
         {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
         <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
+        <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo Operador? <span className="text-blue-600">Regístrate</span></button>
       </form>
     </div>
   );
