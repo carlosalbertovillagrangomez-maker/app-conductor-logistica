@@ -111,6 +111,7 @@ function App() {
   }, [isLoaded, selectedRoute?.id, selectedRoute?.status]); 
 
   // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
+  // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
     let watchId;
     if (currentDriver && (currentDriver.isOnline || (selectedRoute && selectedRoute.status === 'En Ruta'))) {
@@ -120,6 +121,7 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
+            // 1. Odómetro
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
                 if (!odometerLocRef.current) { odometerLocRef.current = loc; } 
                 else {
@@ -134,11 +136,6 @@ function App() {
                 }
             }
 
-            let heading = position.coords.heading;
-            if (heading === null || isNaN(heading)) {
-                if (prevLocRef.current && window.google?.maps?.geometry) { heading = window.google.maps.geometry.spherical.computeHeading(prevLocRef.current, loc); } else { heading = 0; }
-            }
-            if (heading !== null && !isNaN(heading)) { setUserHeading(heading); }
             // 2. Filtro estabilizador para la brújula (evita el "giro loco")
             if (prevLocRef.current && window.google?.maps?.geometry) {
                 const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
@@ -148,14 +145,12 @@ function App() {
                 // Solo calculamos el nuevo giro si el chofer se movió al menos 3 metros reales
                 if (distForHeading > 3) {
                     let newHeading = position.coords.heading;
-                    // Si el celular no da la brújula nativa o va muy lento, lo calculamos con la ruta
                     if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
                         newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
                     }
                     if (newHeading !== null && !isNaN(newHeading)) { 
                         setUserHeading(newHeading); 
                     }
-                    // Guardamos esta locación estable para el siguiente cálculo
                     prevLocRef.current = loc; 
                 }
             } else {
@@ -164,13 +159,16 @@ function App() {
                 prevLocRef.current = loc;
             }
 
+            // 3. Enviar ubicación a Firebase
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
             }
 
+            // 4. Mover mapa 3D
             if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
                 mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
-                if (heading !== null && !isNaN(heading)) { mapRef.current.setHeading(heading); }
+                // Aquí usamos el userHeading que ya está estabilizado por el paso 2
+                mapRef.current.setHeading(userHeading);
             }
           },
           (error) => console.error("Error GPS:", error),
@@ -179,7 +177,7 @@ function App() {
       }
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
-  }, [currentDriver, selectedRoute]);
+  }, [currentDriver, selectedRoute, userHeading]);
 
   // ESCUCHAR OFERTAS DE VIAJE
   useEffect(() => {
