@@ -20,6 +20,19 @@ const ICON_START = "http://maps.google.com/mapfiles/ms/icons/green-dot.png";
 const ICON_WAYPOINT = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 const ICON_END = "http://maps.google.com/mapfiles/ms/icons/red-dot.png";
 
+// HELPER: Cálculo de distancia para la GEOCERCA
+const getDistanceMeters = (p1, p2) => {
+    if (!p1 || !p2 || !p1.lat || !p2.lat) return 0;
+    const R = 6371e3; // Metros
+    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+    const dLon = (p2.lng - p1.lng) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) *
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+};
+
 function App() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -39,6 +52,11 @@ function App() {
   const [chatText, setChatText] = useState('');
   const [evidence, setEvidence] = useState(null);
   const [incomingOffer, setIncomingOffer] = useState(null);
+
+  // NUEVOS ESTADOS PARA LA GEOCERCA Y BITÁCORA
+  const [showJustification, setShowJustification] = useState(false);
+  const [justificationText, setJustificationText] = useState('');
+  const [distanceOff, setDistanceOff] = useState(0);
 
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const mapRef = useRef(null);
@@ -111,7 +129,6 @@ function App() {
   }, [isLoaded, selectedRoute?.id, selectedRoute?.status]); 
 
   // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
-  // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
     let watchId;
     if (currentDriver && (currentDriver.isOnline || (selectedRoute && selectedRoute.status === 'En Ruta'))) {
@@ -136,13 +153,12 @@ function App() {
                 }
             }
 
-            // 2. Filtro estabilizador para la brújula (evita el "giro loco")
+            // 2. Filtro estabilizador para la brújula
             if (prevLocRef.current && window.google?.maps?.geometry) {
                 const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
                 const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
                 const distForHeading = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
 
-                // Solo calculamos el nuevo giro si el chofer se movió al menos 3 metros reales
                 if (distForHeading > 3) {
                     let newHeading = position.coords.heading;
                     if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
@@ -167,7 +183,6 @@ function App() {
             // 4. Mover mapa 3D
             if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
                 mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
-                // Aquí usamos el userHeading que ya está estabilizado por el paso 2
                 mapRef.current.setHeading(userHeading);
             }
           },
@@ -266,7 +281,47 @@ function App() {
       } catch (e) {}
   };
 
-  const marcarLlegada = async () => { setIsWaiting(true); setEvidence(null); setIsApproaching(false); try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} };
+  // 🛡️ LÓGICA DE GEOCERCA Y LLEGADA
+  const marcarLlegada = async () => { 
+      const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
+      if (userLocation && currentTarget) {
+          const dist = getDistanceMeters(userLocation, currentTarget);
+          if (dist > 200) {
+              setDistanceOff(Math.round(dist));
+              setShowJustification(true);
+              return; 
+          }
+      }
+      proceedToLlegada();
+  };
+
+  const proceedToLlegada = async () => {
+      setIsWaiting(true); setEvidence(null); setIsApproaching(false); 
+      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} 
+  };
+
+  const submitJustification = async () => {
+      if (justificationText.trim().length < 5) return alert("Por favor ingresa un motivo válido detallado.");
+      const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
+      const logEntry = {
+          evento: 'Llegada Fuera de Rango (Geocerca)',
+          motivo: justificationText.trim(),
+          distanciaMts: distanceOff,
+          punto: currentTarget?.label || 'Destino',
+          timestamp: new Date().toISOString(),
+          time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+      };
+
+      try {
+          await updateDoc(doc(db, "rutas", selectedRoute.id), {
+              bitacora: arrayUnion(logEntry),
+              chat: arrayUnion({ sender: 'Sistema', text: `📍 Chofer reportó llegada a ${distanceOff}m del punto. Motivo: ${justificationText.trim()}`, time: logEntry.time, timestamp: logEntry.timestamp })
+          });
+          setShowJustification(false);
+          setJustificationText('');
+          proceedToLlegada();
+      } catch(e) { alert("Error al guardar la justificación."); }
+  };
 
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
@@ -274,6 +329,7 @@ function App() {
       try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) {}
   };
 
+  // 📷 LÓGICA DE SELLO DE AGUA EN FOTOS
   const handlePhoto = (e) => {
       const file = e.target.files[0];
       if(file) {
@@ -281,8 +337,31 @@ function App() {
           reader.onload = (event) => {
               const img = new Image();
               img.onload = () => {
-                  const canvas = document.createElement('canvas'); const scaleSize = 800 / img.width; canvas.width = 800; canvas.height = img.height * scaleSize; const ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                  setEvidence(canvas.toDataURL('image/jpeg', 0.6));
+                  const canvas = document.createElement('canvas'); 
+                  const scaleSize = 800 / img.width; 
+                  canvas.width = 800; 
+                  canvas.height = img.height * scaleSize; 
+                  const ctx = canvas.getContext('2d'); 
+                  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                  // --- SELLO DE AGUA CORPORATIVO ---
+                  const dateStr = new Date().toLocaleDateString();
+                  const timeStr = new Date().toLocaleTimeString();
+                  const latLngStr = userLocation ? `GPS: ${userLocation.lat.toFixed(6)}, ${userLocation.lng.toFixed(6)}` : 'GPS: No disponible';
+
+                  ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+                  ctx.fillRect(0, canvas.height - 70, canvas.width, 70);
+
+                  ctx.font = "bold 18px sans-serif";
+                  ctx.fillStyle = "#ef4444"; 
+                  ctx.fillText(`FECHA: ${dateStr}  HORA: ${timeStr}`, 20, canvas.height - 40);
+                  
+                  ctx.font = "bold 16px sans-serif";
+                  ctx.fillStyle = "#ffffff";
+                  ctx.fillText(latLngStr, 20, canvas.height - 15);
+                  // ---------------------------------
+
+                  setEvidence(canvas.toDataURL('image/jpeg', 0.8));
               }
               img.src = event.target.result;
           };
@@ -381,7 +460,7 @@ function App() {
     if (snap.empty) { setError('Usuario no encontrado'); setLoading(false); return; }
     const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
     if (data.password === password && data.status === 'Aprobado') { setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data)); cargarDatosEnFormulario(data); escucharRutas(data.id); } else { setError('Credenciales inválidas o cuenta no aprobada'); }
-    setLoading(false);
+    loading && setLoading(false);
   };
 
   if (!isReady) return null;
@@ -401,6 +480,32 @@ function App() {
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
               
+              {/* --- MODAL GEOCERCA (FUERA DE RANGO) --- */}
+              {showJustification && (
+                  <div className="fixed inset-0 z-[9999] flex items-center justify-center p-6 bg-slate-900/80 backdrop-blur-md animate-in fade-in zoom-in duration-300">
+                      <div className="bg-white rounded-[2rem] p-6 max-w-sm w-full shadow-2xl border-4 border-red-500 relative">
+                          <div className="flex items-center gap-3 mb-4 text-red-600">
+                              <AlertCircle className="w-8 h-8" />
+                              <h3 className="text-lg font-black uppercase leading-tight">Llegada Fuera de Rango</h3>
+                          </div>
+                          <p className="text-sm font-bold text-slate-600 mb-4">
+                              El GPS indica que estás a <span className="text-red-600 text-lg">{distanceOff}</span> metros del destino.
+                          </p>
+                          <p className="text-xs text-slate-500 mb-2 font-medium">Justifica el cambio de ruta o punto de encuentro para la bitácora corporativa:</p>
+                          <textarea
+                              className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm outline-none focus:border-red-500 min-h-[100px] mb-4 text-slate-700"
+                              placeholder="Ej: Calle cerrada, el cliente pidió caminar 2 cuadras, etc."
+                              value={justificationText}
+                              onChange={(e) => setJustificationText(e.target.value)}
+                          ></textarea>
+                          <div className="flex gap-2">
+                              <button onClick={() => setShowJustification(false)} className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl active:scale-95 transition-transform text-sm">Cancelar</button>
+                              <button onClick={submitJustification} className="flex-1 py-3 bg-red-600 text-white font-black rounded-xl active:scale-95 transition-transform shadow-lg shadow-red-500/30 text-sm">Registrar</button>
+                          </div>
+                      </div>
+                  </div>
+              )}
+
               {/* --- PANTALLA CÁMARA (LLEGUÉ AL PUNTO) --- */}
               {isWaiting && (
                   <div className="absolute inset-0 z-50 bg-slate-50 flex flex-col animate-[fadeIn_0.3s_ease-out]">
@@ -425,7 +530,7 @@ function App() {
                       </div>
 
                       <div className="bg-white p-3 border-t border-slate-200 flex items-center gap-2 shrink-0">
-                          <input type="text" value={chatText} onChange={e=>setChatText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()} placeholder="Envía un mensaje al cliente..." className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-blue-500 focus:bg-white transition-colors" />
+                          <input type="text" value={chatText} onChange={e=>setChatText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()} placeholder="Envía un mensaje al cliente o despacho..." className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-blue-500 focus:bg-white transition-colors text-slate-700" />
                           <button onClick={enviarMensaje} className="p-3 bg-blue-600 text-white rounded-full shadow-md hover:bg-blue-700 active:scale-95 transition-transform"><Send className="w-5 h-5 ml-1"/></button>
                       </div>
 
