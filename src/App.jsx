@@ -26,11 +26,34 @@ const getDistanceMeters = (p1, p2) => {
     const R = 6371e3; // Metros
     const dLat = (p2.lat - p1.lat) * Math.PI / 180;
     const dLon = (p2.lng - p1.lng) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) *
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
+};
+
+// === NUEVOS HELPERS: FORZAR HORA MÉXICO CENTRAL ===
+const getMexicoTime = () => new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' });
+const getMexicoDate = () => new Date().toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' });
+
+// === NUEVO HELPER: SNAP TO ROUTE (Pegar flecha a la línea azul) ===
+const getSnappedLocation = (loc, path) => {
+    if (!loc || !path || path.length < 2) return loc;
+    let minDist = Infinity;
+    let closestLoc = loc;
+    for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i];
+        const b = path[i+1];
+        const l2 = Math.pow(b.lat - a.lat, 2) + Math.pow(b.lng - a.lng, 2);
+        if (l2 === 0) continue;
+        let t = ((loc.lat - a.lat) * (b.lat - a.lat) + (loc.lng - a.lng) * (b.lng - a.lng)) / l2;
+        t = Math.max(0, Math.min(1, t));
+        const proj = { lat: a.lat + t * (b.lat - a.lat), lng: a.lng + t * (b.lng - a.lng) };
+        const distSq = Math.pow(loc.lat - proj.lat, 2) + Math.pow(loc.lng - proj.lng, 2);
+        if (distSq < minDist) { minDist = distSq; closestLoc = proj; }
+    }
+    // Si está a más de ~30 metros reales de la ruta, no forzamos (puede estar en desvío)
+    if (minDist > 0.00000009) return loc; 
+    return closestLoc;
 };
 
 function App() {
@@ -53,7 +76,6 @@ function App() {
   const [evidence, setEvidence] = useState(null);
   const [incomingOffer, setIncomingOffer] = useState(null);
 
-  // NUEVOS ESTADOS PARA LA GEOCERCA Y BITÁCORA
   const [showJustification, setShowJustification] = useState(false);
   const [justificationText, setJustificationText] = useState('');
   const [distanceOff, setDistanceOff] = useState(0);
@@ -77,6 +99,9 @@ function App() {
   const [isApproaching, setIsApproaching] = useState(false); 
 
   const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
+
+  // NUEVO ESTADO: Navegación Paso a Paso (Turn-by-turn)
+  const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -179,12 +204,6 @@ function App() {
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
             }
-
-            // 4. Mover mapa 3D
-            if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta') {
-                mapRef.current.panTo(loc); mapRef.current.setZoom(19); mapRef.current.setTilt(60);
-                mapRef.current.setHeading(userHeading);
-            }
           },
           (error) => console.error("Error GPS:", error),
           { enableHighAccuracy: true, maximumAge: 1000, timeout: 5000 }
@@ -193,6 +212,22 @@ function App() {
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
   }, [currentDriver, selectedRoute, userHeading]);
+
+  // NUEVO: CALCULAR POSICIÓN EXACTA EN LA LÍNEA AZUL
+  const snappedLocation = useMemo(() => {
+      const geo = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute?.technicalData?.geometry;
+      return getSnappedLocation(userLocation, geo);
+  }, [userLocation, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
+
+  // NUEVO: MOVER CÁMARA USANDO LA POSICIÓN CENTRADA
+  useEffect(() => {
+      if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta' && snappedLocation) {
+          mapRef.current.panTo(snappedLocation); 
+          mapRef.current.setZoom(19); 
+          mapRef.current.setTilt(60);
+          mapRef.current.setHeading(userHeading);
+      }
+  }, [snappedLocation, selectedRoute?.status, userHeading]);
 
   // ESCUCHAR OFERTAS DE VIAJE
   useEffect(() => {
@@ -218,45 +253,64 @@ function App() {
 
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta') return;
-      const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 5000);
+      const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 15000);
       return () => clearInterval(interval);
   }, [selectedRoute?.status]);
 
   useEffect(() => {
-      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
+      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0 || !isLoaded) return;
       const loc = latestLocRef.current;
       if (!loc) return;
       const updateLiveRoute = async () => {
           try {
-              let coordsArray = [`${loc.lng},${loc.lat}`]; 
-              for (let i = nextStopIdx; i < allTargets.length; i++) { coordsArray.push(`${allTargets[i].lng},${allTargets[i].lat}`); }
-              const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordsArray.join(';')}?overview=full&geometries=geojson`);
-              const data = await res.json();
-              if (data.code === 'Ok' && data.routes.length > 0) {
-                  const r = data.routes[0];
-                  const geo = r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
-                  const newTotalDist = (r.distance / 1000).toFixed(1);
-                  const newTotalDur = Math.round(r.duration / 60);
-                  const nextDistMeters = r.legs.length > 0 ? r.legs[0].distance : 0;
-                  const nextDurMins = r.legs.length > 0 ? Math.round(r.legs[0].duration / 60) : 0;
-
-                  setLiveRouteData({ geometry: geo, totalDuration: newTotalDur, totalDistance: newTotalDist, nextStopDuration: nextDurMins, nextStopDistance: (nextDistMeters / 1000).toFixed(1) });
-
-                  let proximityUpdate = {};
-                  if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
-                      setAlertedStops(prev => [...prev, nextStopIdx]); setIsApproaching(true); 
-                      proximityUpdate = { proximityAlert: { active: true, stopIndex: nextStopIdx, passenger: allTargets[nextStopIdx]?.contact || 'Pasajero', etaMins: nextDurMins, timestamp: new Date().toISOString() } };
-                  }
-                  await updateDoc(doc(db, "rutas", selectedRoute.id), { currentLocation: loc, lastUpdate: new Date().toISOString(), "technicalData.geometry": geo, ...proximityUpdate });
+              const directionsService = new window.google.maps.DirectionsService();
+              const origin = { lat: loc.lat, lng: loc.lng };
+              const destination = { lat: allTargets[allTargets.length - 1].lat, lng: allTargets[allTargets.length - 1].lng };
+              const waypts = [];
+              for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
+                  waypts.push({ location: { lat: allTargets[i].lat, lng: allTargets[i].lng }, stopover: true });
               }
+
+              directionsService.route({
+                  origin: origin,
+                  destination: destination,
+                  waypoints: waypts,
+                  travelMode: window.google.maps.TravelMode.DRIVING
+              }, async (result, status) => {
+                  if (status === window.google.maps.DirectionsStatus.OK) {
+                      const r = result.routes[0];
+                      const geo = r.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
+                      let totalDistMeters = 0; let totalDurSecs = 0;
+                      r.legs.forEach(leg => { totalDistMeters += leg.distance.value; totalDurSecs += leg.duration.value; });
+                      const newTotalDist = (totalDistMeters / 1000).toFixed(1);
+                      const newTotalDur = Math.round(totalDurSecs / 60);
+                      const nextDistMeters = r.legs.length > 0 ? r.legs[0].distance.value : 0;
+                      const nextDurMins = r.legs.length > 0 ? Math.round(r.legs[0].duration.value / 60) : 0;
+
+                      // NUEVO: Extraer instrucción Waze-style
+                      if (r.legs.length > 0 && r.legs[0].steps && r.legs[0].steps.length > 0) {
+                          const currentStep = r.legs[0].steps[0];
+                          setNextManeuver({ instruction: currentStep.instructions, distance: currentStep.distance.text });
+                      }
+
+                      setLiveRouteData({ geometry: geo, totalDuration: newTotalDur, totalDistance: newTotalDist, nextStopDuration: nextDurMins, nextStopDistance: (nextDistMeters / 1000).toFixed(1) });
+
+                      let proximityUpdate = {};
+                      if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
+                          setAlertedStops(prev => [...prev, nextStopIdx]); setIsApproaching(true); 
+                          proximityUpdate = { proximityAlert: { active: true, stopIndex: nextStopIdx, passenger: allTargets[nextStopIdx]?.contact || 'Pasajero', etaMins: nextDurMins, timestamp: new Date().toISOString() } };
+                      }
+                      await updateDoc(doc(db, "rutas", selectedRoute.id), { currentLocation: loc, lastUpdate: new Date().toISOString(), "technicalData.geometry": geo, ...proximityUpdate });
+                  }
+              });
           } catch (e) {}
       };
       updateLiveRoute();
-  }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets]);
+  }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets, isLoaded]);
 
-  const centerOnUser = () => { setIsTracking(true); if (mapRef.current && userLocation) { mapRef.current.panTo(userLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60); if (userHeading) mapRef.current.setHeading(userHeading); } };
+  const centerOnUser = () => { setIsTracking(true); if (mapRef.current && snappedLocation) { mapRef.current.panTo(snappedLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60); if (userHeading) mapRef.current.setHeading(userHeading); } };
   const handleMapDrag = () => { setIsTracking(false); };
-  const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; };
+  const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setNextManeuver({ instruction: '', distance: '' }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; };
 
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
@@ -281,7 +335,6 @@ function App() {
       } catch (e) {}
   };
 
-  // 🛡️ LÓGICA DE GEOCERCA Y LLEGADA
   const marcarLlegada = async () => { 
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       if (userLocation && currentTarget) {
@@ -309,7 +362,7 @@ function App() {
           distanciaMts: distanceOff,
           punto: currentTarget?.label || 'Destino',
           timestamp: new Date().toISOString(),
-          time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+          time: getMexicoTime()
       };
 
       try {
@@ -325,11 +378,10 @@ function App() {
 
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
-      const msg = { sender: 'Conductor', text: chatText.trim(), time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
+      const msg = { sender: 'Conductor', text: chatText.trim(), time: getMexicoTime(), timestamp: new Date().toISOString() };
       try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) {}
   };
 
-  // 📷 LÓGICA DE SELLO DE AGUA EN FOTOS
   const handlePhoto = (e) => {
       const file = e.target.files[0];
       if(file) {
@@ -344,9 +396,8 @@ function App() {
                   const ctx = canvas.getContext('2d'); 
                   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-                  // --- SELLO DE AGUA CORPORATIVO ---
-                  const dateStr = new Date().toLocaleDateString();
-                  const timeStr = new Date().toLocaleTimeString();
+                  const dateStr = getMexicoDate();
+                  const timeStr = getMexicoTime();
                   const latLngStr = userLocation ? `GPS: ${userLocation.lat.toFixed(6)}, ${userLocation.lng.toFixed(6)}` : 'GPS: No disponible';
 
                   ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
@@ -359,7 +410,6 @@ function App() {
                   ctx.font = "bold 16px sans-serif";
                   ctx.fillStyle = "#ffffff";
                   ctx.fillText(latLngStr, 20, canvas.height - 15);
-                  // ---------------------------------
 
                   setEvidence(canvas.toDataURL('image/jpeg', 0.8));
               }
@@ -372,7 +422,7 @@ function App() {
   const confirmarAbordaje = async (isFinalDestination) => {
       if (evidence) {
           const target = allTargets[nextStopIdx];
-          const llegadaData = { stopIndex: nextStopIdx, label: target?.label || (isFinalDestination ? 'Destino Final' : 'Parada'), passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
+          const llegadaData = { stopIndex: nextStopIdx, label: target?.label || (isFinalDestination ? 'Destino Final' : 'Parada'), passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: getMexicoTime(), timestamp: new Date().toISOString() };
           try { await updateDoc(doc(db, "rutas", selectedRoute.id), { evidenciasLlegada: arrayUnion(llegadaData) }); } catch (e) {}
       }
       if(isFinalDestination) { handleEndTrip(selectedRoute.id); setIsWaiting(false); } 
@@ -382,7 +432,7 @@ function App() {
   const reportarAusencia = async (isFinalDestination) => {
       if(!evidence) return alert("⚠️ Por favor, toma una foto de evidencia del lugar antes de reportar la ausencia.");
       const target = allTargets[nextStopIdx];
-      const noShowData = { stopIndex: nextStopIdx, passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), timestamp: new Date().toISOString() };
+      const noShowData = { stopIndex: nextStopIdx, passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: getMexicoTime(), timestamp: new Date().toISOString() };
       try {
           await updateDoc(doc(db, "rutas", selectedRoute.id), { evidencias: arrayUnion(noShowData), chat: arrayUnion({ sender: 'Sistema', text: `Conductor reportó AUSENCIA en ${target?.label}. Evidencia guardada.`, time: noShowData.time, timestamp: noShowData.timestamp }) });
           alert("✅ Evidencia guardada correctamente en el sistema."); confirmarAbordaje(isFinalDestination); 
@@ -394,7 +444,7 @@ function App() {
       if (ruta.status === 'En Ruta') { localStorage.setItem('active_trip_id', ruta.id); const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`); if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10)); } else { setNextStopIdx(0); }
   };
 
-  const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
+  const [password, setPassword] = useState('');
   const [name, setName] = useState(''); const [phone, setPhone] = useState('');
   const [address, setAddress] = useState(''); const [rfc, setRfc] = useState('');
   const [bloodType, setBloodType] = useState(''); const [emergencyContact, setEmergencyContact] = useState('');
@@ -409,7 +459,7 @@ function App() {
   }, []);
 
   const cargarDatosEnFormulario = (data) => {
-    setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || ''); setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || ''); setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || ''); setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || ''); setEmail(data.email || ''); setPassword(data.password || '');
+    setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || ''); setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || ''); setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || ''); setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || ''); setPassword(data.password || '');
   };
 
   const escucharRutas = (driverId) => {
@@ -420,7 +470,7 @@ function App() {
   const handleStartTrip = async (routeId) => {
     if (!confirm("¿Deseas iniciar este viaje ahora?")) return;
     try {
-      await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: new Date().toISOString() });
+      await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: getMexicoTime(), createdDate: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'En Ruta' })); localStorage.setItem('active_trip_id', routeId); localStorage.setItem(`trip_idx_${routeId}`, 0);
       setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
     } catch (e) { alert("Error al iniciar"); }
@@ -429,7 +479,7 @@ function App() {
   const handleEndTrip = async (routeId) => {
     if (!confirm("¿Has completado el viaje por completo?")) return;
     try {
-      await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: new Date().toISOString(), "proximityAlert.active": false });
+      await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: getMexicoTime(), finalDate: getMexicoDate(), "proximityAlert.active": false });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' })); localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
       alert("¡Ruta finalizada con éxito!"); odometerLocRef.current = null;
     } catch (e) {}
@@ -438,7 +488,11 @@ function App() {
   const handleRegister = async (e) => {
     e.preventDefault(); setLoading(true); setError('');
     try {
-      const nuevoConductor = { name: name.trim(), email: email.trim().toLowerCase(), password, phone: phone.trim(), address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp, vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(), isOnline: false, created: new Date().toISOString(), joined: new Date().toLocaleDateString(), trips: 0, rating: 5, fotoPerfil: '', identificacion: '' };
+      const q = query(collection(db, "conductores"), where("phone", "==", phone.trim()));
+      const snap = await getDocs(q);
+      if (!snap.empty) throw new Error('Este número de teléfono ya está registrado.');
+
+      const nuevoConductor = { name: name.trim(), phone: phone.trim(), password, address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp, vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(), isOnline: false, created: new Date().toISOString(), joined: getMexicoDate(), trips: 0, rating: 5, fotoPerfil: '', identificacion: '' };
       await addDoc(collection(db, "conductores"), nuevoConductor);
       alert("¡Registro enviado! Tu expediente está en revisión."); setIsRegistering(false);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
@@ -455,12 +509,12 @@ function App() {
 
   const handleLogin = async (e) => {
     e.preventDefault(); setLoading(true);
-    const q = query(collection(db, "conductores"), where("email", "==", email.trim().toLowerCase()));
+    const q = query(collection(db, "conductores"), where("phone", "==", phone.trim()));
     const snap = await getDocs(q);
-    if (snap.empty) { setError('Usuario no encontrado'); setLoading(false); return; }
+    if (snap.empty) { setError('Número de teléfono no registrado'); setLoading(false); return; }
     const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
-    if (data.password === password && data.status === 'Aprobado') { setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data)); cargarDatosEnFormulario(data); escucharRutas(data.id); } else { setError('Credenciales inválidas o cuenta no aprobada'); }
-    loading && setLoading(false);
+    if (data.password === password && data.status === 'Aprobado') { setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data)); cargarDatosEnFormulario(data); escucharRutas(data.id); } else { setError('Contraseña inválida o cuenta no aprobada'); }
+    setLoading(false);
   };
 
   if (!isReady) return null;
@@ -471,7 +525,6 @@ function App() {
   // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
   // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
-      const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       const nextStopName = currentTarget?.label || 'Destino';
@@ -564,19 +617,48 @@ function App() {
                   </div>
               </div>
 
-              {/* --- MAPA 3D --- */}
+              {/* --- NUEVO: PANEL DE INSTRUCCIONES WAZE (TURN BY TURN) --- */}
+              {nextManeuver.instruction && (
+                  <div className="absolute top-[85px] left-4 right-4 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 shadow-2xl z-30 border border-slate-700 flex items-center gap-4 animate-[fadeIn_0.3s_ease-out]">
+                      <div className="bg-blue-600 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
+                          <Navigation className="w-6 h-6 text-white" />
+                      </div>
+                      <div className="flex-1 text-white">
+                          <p className="text-xl font-black">{nextManeuver.distance}</p>
+                          <p className="text-sm font-medium text-slate-300 leading-tight" dangerouslySetInnerHTML={{ __html: nextManeuver.instruction }}></p>
+                      </div>
+                  </div>
+              )}
+
+              {/* --- MAPA 3D CON SNAP TO ROUTE --- */}
               <div className="flex-1 relative bg-slate-200 w-full h-full">
                   {!isLoaded ? (
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
                         <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
-                            {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
+                            {liveRouteData.geometry.length > 0 && <Polyline path={liveRouteData.geometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
-                            {userLocation && <Marker position={userLocation} icon={{ path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: "#22c55e", fillOpacity: 1, strokeWeight: 2, strokeColor: "white", rotation: userHeading }} zIndex={999} />}
+                            {/* AQUÍ USAMOS EL SNAP EN VEZ DEL USERLOCATION DIRECTO */}
+                            {snappedLocation && (
+                                <Marker 
+                                    position={snappedLocation} 
+                                    icon={{ 
+                                        path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, 
+                                        scale: 6, 
+                                        fillColor: "#22c55e", 
+                                        fillOpacity: 1, 
+                                        strokeWeight: 2, 
+                                        strokeColor: "white", 
+                                        rotation: userHeading,
+                                        anchor: new window.google.maps.Point(0, 2.5) 
+                                    }} 
+                                    zIndex={999} 
+                                />
+                            )}
                         </GoogleMap>
                         
-                        {userLocation && (
+                        {snappedLocation && (
                             <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-blue-600 border-slate-200 active:bg-blue-50'}`}>
                                 {isTracking ? <Navigation2 className="w-6 h-6" /> : <LocateFixed className="w-6 h-6" />}
                             </button>
@@ -627,7 +709,7 @@ function App() {
   }
 
   // ==============================================================
-  // VISTA 2: VISTA PREVIA (ESTATUS: ACEPTADA O PENDIENTE) -> ¡AQUÍ ESTÁ TU MAPA!
+  // VISTA 2: VISTA PREVIA (ESTATUS: ACEPTADA O PENDIENTE)
   // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status !== 'En Ruta') {
     const routeToDisplay = selectedRoute.technicalData?.geometry || [];
@@ -707,7 +789,7 @@ function App() {
   }
 
   // ==============================================================
-  // VISTA 3: PANTALLA PRINCIPAL (LISTA DE VIAJES)
+  // VISTA 3: PANTALLA PRINCIPAL (ALGORITMO ORDEN DE VIAJES NUEVO)
   // ==============================================================
   if (currentDriver && !isEditingProfile) {
     const rFiltradas = misRutas
@@ -715,7 +797,17 @@ function App() {
             if (mainTab === 'Finalizados') return x.status === 'Finalizado';
             return x.status !== 'Finalizado' && (filterType === 'Todos' || x.serviceType === filterType);
         })
-        .sort((a,b) => new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`) - new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`));
+        .sort((a,b) => {
+            // --- NUEVO ORDEN DE PRIORIDAD ---
+            // 1. Siempre mostrar primero el viaje que esté en proceso
+            if (a.status === 'En Ruta' && b.status !== 'En Ruta') return -1;
+            if (b.status === 'En Ruta' && a.status !== 'En Ruta') return 1;
+            
+            // 2. Ordenar el resto de manera cronológica
+            const dateA = new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`);
+            const dateB = new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`);
+            return dateA - dateB;
+        });
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
@@ -752,7 +844,7 @@ function App() {
         <button onClick={() => isEditing ? setIsEditingProfile(false) : setIsRegistering(false)} className="mb-6 flex items-center gap-2 text-slate-500 font-bold uppercase text-[10px] tracking-widest"><ChevronLeft className="w-4 h-4"/> Volver</button>
         <h1 className="text-3xl font-black tracking-tight mb-2">{isEditing ? 'Mi Expediente' : 'Nuevo Operador'}</h1>
         <form onSubmit={handleSubmit} className="space-y-8 mt-6">
-          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest flex items-center gap-2"><User className="w-3 h-3"/> Identidad</p><input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} required={!isEditing} />{!isEditing && (<><input type="email" placeholder="Correo electrónico *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={email} onChange={e => setEmail(e.target.value)} required /><input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} required /></>)}<div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} required={!isEditing} /><input type="text" placeholder="WhatsApp *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={phone} onChange={e => setPhone(e.target.value)} required={!isEditing} /></div><input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={address} onChange={e => setAddress(e.target.value)} /></div>
+          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest flex items-center gap-2"><User className="w-3 h-3"/> Identidad</p><input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} required={!isEditing} />{!isEditing && (<><input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} required /></>)}<div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} required={!isEditing} /><input type="tel" placeholder="WhatsApp / Teléfono *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={phone} onChange={e => setPhone(e.target.value)} required={!isEditing} /></div><input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={address} onChange={e => setAddress(e.target.value)} /></div>
           <div className="space-y-4"><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest flex items-center gap-2"><Truck className="w-3 h-3"/> Vehículo</p><input type="text" placeholder="Modelo (Ej. Ford) *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Placas *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} required={!isEditing} /><input type="text" placeholder="Tipo (Caja, etc)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleType} onChange={e => setVehicleType(e.target.value)} /></div></div>
           <div className="space-y-4"><p className="text-[10px] font-black uppercase text-purple-500 tracking-widest flex items-center gap-2"><FileText className="w-3 h-3"/> Licencia</p><input type="text" placeholder="Número *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo (Federal, B)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseType} onChange={e => setLicenseType(e.target.value)} /><input type="text" placeholder="Vigencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseExp} onChange={e => setLicenseExp(e.target.value)} /></div></div>
           <div className="space-y-4"><p className="text-[10px] font-black uppercase text-red-500 tracking-widest flex items-center gap-2"><ShieldAlert className="w-3 h-3"/> Salud</p><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo Sangre" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={bloodType} onChange={e => setBloodType(e.target.value)} /><input type="text" placeholder="Tel. Emergencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} /></div></div>
@@ -763,11 +855,12 @@ function App() {
     );
   }
 
+  // --- VISTA DE LOGIN ACTUALIZADA A TELÉFONO ---
   return (
     <div className={`min-h-screen flex flex-col items-center justify-between p-8 transition-colors bg-slate-50 text-slate-900`}>
       <div className="flex flex-col items-center mt-12 w-full max-w-sm"><div className="w-24 h-24 bg-blue-600 rounded-[2.2rem] flex items-center justify-center mb-8 shadow-2xl rotate-6 shadow-blue-500/30"><Truck className="w-12 h-12 text-white" /></div><h1 className="text-4xl font-black tracking-tighter italic">LOGÍSTICA</h1></div>
       <form onSubmit={handleLogin} className="w-full max-w-sm space-y-4">
-        <input type="email" placeholder="Email" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={email} onChange={e => setEmail(e.target.value)} />
+        <input type="tel" placeholder="WhatsApp / Teléfono" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={phone} onChange={e => setPhone(e.target.value)} />
         <input type="password" placeholder="Contraseña" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={password} onChange={e => setPassword(e.target.value)} />
         {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
         <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
