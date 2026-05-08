@@ -163,17 +163,26 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            // 1. Odómetro
+            // 1. Odómetro y Ruta Real (NUEVO: Solo audita después del primer abordaje)
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                if (!odometerLocRef.current) { odometerLocRef.current = loc; } 
-                else {
-                    const p1 = new window.google.maps.LatLng(odometerLocRef.current.lat, odometerLocRef.current.lng);
-                    const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
-                    const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-                    if (distMeters > 15) {
-                        const distKm = distMeters / 1000;
-                        try { await updateDoc(doc(db, "rutas", selectedRoute.id), { realDistanceDriven: increment(distKm) }); } catch(e) {}
+                if (nextStopIdx > 0) { // Solo cuenta si ya recogió al pasajero
+                    if (!odometerLocRef.current) { 
                         odometerLocRef.current = loc; 
+                    } else {
+                        const p1 = new window.google.maps.LatLng(odometerLocRef.current.lat, odometerLocRef.current.lng);
+                        const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
+                        const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
+                        
+                        if (distMeters > 20) {
+                            const distKm = distMeters / 1000;
+                            try { 
+                                await updateDoc(doc(db, "rutas", selectedRoute.id), { 
+                                    realDistanceDriven: increment(distKm),
+                                    rutaReal: arrayUnion(loc)
+                                }); 
+                            } catch(e) {}
+                            odometerLocRef.current = loc; 
+                        }
                     }
                 }
             }
