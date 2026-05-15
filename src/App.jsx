@@ -51,7 +51,6 @@ const getSnappedLocation = (loc, path) => {
         const distSq = Math.pow(loc.lat - proj.lat, 2) + Math.pow(loc.lng - proj.lng, 2);
         if (distSq < minDist) { minDist = distSq; closestLoc = proj; }
     }
-    // Si está a más de ~30 metros reales de la ruta, no forzamos (puede estar en desvío)
     if (minDist > 0.00000009) return loc; 
     return closestLoc;
 };
@@ -65,7 +64,8 @@ function App() {
   
   const [misRutas, setMisRutas] = useState([]);
   const [darkMode, setDarkMode] = useState(false);
-  const [filterType, setFilterType] = useState('Todos');
+  // CAMBIO: Por defecto le mostramos solo su PRÓXIMO viaje para no estresarlo
+  const [filterType, setFilterType] = useState('Próximo');
   const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
@@ -100,7 +100,6 @@ function App() {
 
   const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
 
-  // NUEVO ESTADO: Navegación Paso a Paso (Turn-by-turn)
   const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
 
   const wakeLockRef = useRef(null);
@@ -163,9 +162,9 @@ function App() {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             setUserLocation(loc);
             
-            // 1. Odómetro y Ruta Real (NUEVO: Solo audita después del primer abordaje)
+            // 1. Odómetro y Ruta Real (Solo audita después del primer abordaje)
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                if (nextStopIdx > 0) { // Solo cuenta si ya recogió al pasajero
+                if (nextStopIdx > 0) { 
                     if (!odometerLocRef.current) { 
                         odometerLocRef.current = loc; 
                     } else {
@@ -220,15 +219,13 @@ function App() {
       }
     }
     return () => { if (watchId) navigator.geolocation.clearWatch(watchId); };
-  }, [currentDriver, selectedRoute, userHeading]);
+  }, [currentDriver, selectedRoute, userHeading, nextStopIdx]);
 
-  // NUEVO: CALCULAR POSICIÓN EXACTA EN LA LÍNEA AZUL
   const snappedLocation = useMemo(() => {
       const geo = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute?.technicalData?.geometry;
       return getSnappedLocation(userLocation, geo);
   }, [userLocation, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
 
-  // NUEVO: MOVER CÁMARA USANDO LA POSICIÓN CENTRADA
   useEffect(() => {
       if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta' && snappedLocation) {
           mapRef.current.panTo(snappedLocation); 
@@ -238,7 +235,6 @@ function App() {
       }
   }, [snappedLocation, selectedRoute?.status, userHeading]);
 
-  // ESCUCHAR OFERTAS DE VIAJE
   useEffect(() => {
       if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
       const q = query(collection(db, "rutas"), where("ofertaPara", "==", currentDriver.id), where("ofertaEstado", "==", "Pendiente"));
@@ -296,7 +292,6 @@ function App() {
                       const nextDistMeters = r.legs.length > 0 ? r.legs[0].distance.value : 0;
                       const nextDurMins = r.legs.length > 0 ? Math.round(r.legs[0].duration.value / 60) : 0;
 
-                      // NUEVO: Extraer instrucción Waze-style
                       if (r.legs.length > 0 && r.legs[0].steps && r.legs[0].steps.length > 0) {
                           const currentStep = r.legs[0].steps[0];
                           setNextManeuver({ instruction: currentStep.instructions, distance: currentStep.distance.text });
@@ -371,7 +366,7 @@ function App() {
           distanciaMts: distanceOff,
           punto: currentTarget?.label || 'Destino',
           timestamp: new Date().toISOString(),
-          time: getMexicoTime()
+          time: getMexicoTime() 
       };
 
       try {
@@ -405,8 +400,8 @@ function App() {
                   const ctx = canvas.getContext('2d'); 
                   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-                  const dateStr = getMexicoDate();
-                  const timeStr = getMexicoTime();
+                  const dateStr = getMexicoDate(); 
+                  const timeStr = getMexicoTime(); 
                   const latLngStr = userLocation ? `GPS: ${userLocation.lat.toFixed(6)}, ${userLocation.lng.toFixed(6)}` : 'GPS: No disponible';
 
                   ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
@@ -501,7 +496,7 @@ function App() {
       const snap = await getDocs(q);
       if (!snap.empty) throw new Error('Este número de teléfono ya está registrado.');
 
-      const nuevoConductor = { name: name.trim(), phone: phone.trim(), password, address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp, vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(), isOnline: false, created: new Date().toISOString(), joined: getMexicoDate(), trips: 0, rating: 5, fotoPerfil: '', identificacion: '' };
+      const nuevoConductor = { name: name.trim(), password, phone: phone.trim(), address: address.trim(), rfc: rfc.trim().toUpperCase(), bloodType: bloodType.trim().toUpperCase(), emergencyContact: emergencyContact.trim(), licenseNumber: licenseNumber.trim(), licenseType: licenseType.trim(), licenseExp: licenseExp, vehicleModel: vehicleModel.trim(), vehiclePlate: vehiclePlate.trim().toUpperCase(), vehicleType: vehicleType.trim(), vehicle: `${vehicleModel} (${vehiclePlate.toUpperCase()})`, status: 'Pendiente', initials: name.substring(0, 2).toUpperCase(), isOnline: false, created: new Date().toISOString(), joined: getMexicoDate(), trips: 0, rating: 5, fotoPerfil: '', identificacion: '' };
       await addDoc(collection(db, "conductores"), nuevoConductor);
       alert("¡Registro enviado! Tu expediente está en revisión."); setIsRegistering(false);
     } catch (e) { setError(e.message); } finally { setLoading(false); }
@@ -520,7 +515,7 @@ function App() {
     e.preventDefault(); setLoading(true);
     const q = query(collection(db, "conductores"), where("phone", "==", phone.trim()));
     const snap = await getDocs(q);
-    if (snap.empty) { setError('Número de teléfono no registrado'); setLoading(false); return; }
+    if (snap.empty) { setError('Número de teléfono no encontrado'); setLoading(false); return; }
     const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
     if (data.password === password && data.status === 'Aprobado') { setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data)); cargarDatosEnFormulario(data); escucharRutas(data.id); } else { setError('Contraseña inválida o cuenta no aprobada'); }
     setLoading(false);
@@ -534,6 +529,7 @@ function App() {
   // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
   // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
+      const currentGeometry = liveRouteData.geometry.length > 0 ? liveRouteData.geometry : selectedRoute.technicalData?.geometry;
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       const nextStopName = currentTarget?.label || 'Destino';
@@ -626,7 +622,7 @@ function App() {
                   </div>
               </div>
 
-              {/* --- NUEVO: PANEL DE INSTRUCCIONES WAZE (TURN BY TURN) --- */}
+              {/* --- INSTRUCCIONES WAZE (TURN BY TURN) --- */}
               {nextManeuver.instruction && (
                   <div className="absolute top-[85px] left-4 right-4 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 shadow-2xl z-30 border border-slate-700 flex items-center gap-4 animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-blue-600 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
@@ -639,16 +635,15 @@ function App() {
                   </div>
               )}
 
-              {/* --- MAPA 3D CON SNAP TO ROUTE --- */}
+              {/* --- MAPA 3D --- */}
               <div className="flex-1 relative bg-slate-200 w-full h-full">
                   {!isLoaded ? (
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
                         <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
-                            {liveRouteData.geometry.length > 0 && <Polyline path={liveRouteData.geometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
+                            {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
-                            {/* AQUÍ USAMOS EL SNAP EN VEZ DEL USERLOCATION DIRECTO */}
                             {snappedLocation && (
                                 <Marker 
                                     position={snappedLocation} 
@@ -798,25 +793,35 @@ function App() {
   }
 
   // ==============================================================
-  // VISTA 3: PANTALLA PRINCIPAL (ALGORITMO ORDEN DE VIAJES NUEVO)
+  // VISTA 3: PANTALLA PRINCIPAL (ALGORITMO FILTROS MEJORADOS)
   // ==============================================================
   if (currentDriver && !isEditingProfile) {
-    const rFiltradas = misRutas
+    const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }); // YYYY-MM-DD
+    
+    let rFiltradas = misRutas
         .filter(x => {
             if (mainTab === 'Finalizados') return x.status === 'Finalizado';
-            return x.status !== 'Finalizado' && (filterType === 'Todos' || x.serviceType === filterType);
+            if (x.status === 'Finalizado') return false;
+            
+            // --- NUEVOS FILTROS LÓGICOS ---
+            if (filterType === 'Hoy') {
+                return x.scheduledDate === todayStr || x.serviceType === 'Prioritario';
+            }
+            return true; // 'Todos' y 'Próximo' pasan este primer filtro
         })
         .sort((a,b) => {
-            // --- NUEVO ORDEN DE PRIORIDAD ---
-            // 1. Siempre mostrar primero el viaje que esté en proceso
             if (a.status === 'En Ruta' && b.status !== 'En Ruta') return -1;
             if (b.status === 'En Ruta' && a.status !== 'En Ruta') return 1;
             
-            // 2. Ordenar el resto de manera cronológica
             const dateA = new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`);
             const dateB = new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`);
             return dateA - dateB;
         });
+
+    // Si seleccionó "Próximo", solo le mostramos LA PRIMERA carta de la lista ordenada
+    if (filterType === 'Próximo' && mainTab === 'Pendientes') {
+        rFiltradas = rFiltradas.slice(0, 1);
+    }
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
@@ -840,8 +845,38 @@ function App() {
               <button onClick={toggleOnlineStatus} className={`w-14 h-8 rounded-full transition-colors relative shadow-inner ${currentDriver.isOnline ? 'bg-green-500' : 'bg-slate-300'}`}><div className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow transition-transform ${currentDriver.isOnline ? 'left-7' : 'left-1'}`}></div></button>
           </div>
         </div>
-        <div className="px-6 pt-6 pb-2"><div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2"><button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button><button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>Finalizados</button></div>{mainTab === 'Pendientes' && (<div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>{['Todos', 'Prioritario', 'Programado'].map((tipo) => (<button key={tipo} onClick={() => setFilterType(tipo)} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filterType === tipo ? theme.activeTab : 'text-slate-400'}`}>{tipo}</button>))}</div>)}</div>
-        <div className="flex-1 p-6 space-y-4 overflow-y-auto">{rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados'}</div> : rFiltradas.map(ruta => (<div key={ruta.id} onClick={() => handleSelectRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}><div className="flex items-center gap-4"><div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>{ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}</div><div><h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4><p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p></div></div><ChevronRight className="w-4 h-4 text-blue-500" /></div>))}</div>
+        <div className="px-6 pt-6 pb-2">
+            <div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
+                <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button>
+                <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>Finalizados</button>
+            </div>
+            
+            {/* CAMBIO: Nuevos Botones de Filtro Intuitivos */}
+            {mainTab === 'Pendientes' && (
+                <div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>
+                    {['Próximo', 'Hoy', 'Todos'].map((tipo) => (
+                        <button key={tipo} onClick={() => setFilterType(tipo)} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filterType === tipo ? theme.activeTab : 'text-slate-400'}`}>{tipo}</button>
+                    ))}
+                </div>
+            )}
+        </div>
+
+        <div className="flex-1 p-6 space-y-4 overflow-y-auto">
+            {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados para este filtro'}</div> : rFiltradas.map(ruta => (
+                <div key={ruta.id} onClick={() => handleSelectRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}>
+                    <div className="flex items-center gap-4">
+                        <div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>
+                            {ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}
+                        </div>
+                        <div>
+                            <h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4>
+                            <p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p>
+                        </div>
+                    </div>
+                    <ChevronRight className="w-4 h-4 text-blue-500" />
+                </div>
+            ))}
+        </div>
       </div>
     );
   }
