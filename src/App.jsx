@@ -4,7 +4,7 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX
 } from 'lucide-react';
 import { db, requestForToken } from './firebase';
 import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
@@ -64,7 +64,6 @@ function App() {
   
   const [misRutas, setMisRutas] = useState([]);
   const [darkMode, setDarkMode] = useState(false);
-  // CAMBIO: Por defecto le mostramos solo su PRÓXIMO viaje para no estresarlo
   const [filterType, setFilterType] = useState('Próximo');
   const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
@@ -100,7 +99,10 @@ function App() {
 
   const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
 
+  // === ESTADOS PARA EL ASISTENTE DE NAVEGACIÓN Y VOZ ===
   const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const lastSpokenRef = useRef('');
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -113,6 +115,26 @@ function App() {
   useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting]);
+
+  // === LÓGICA DEL NARRADOR (TEXT-TO-SPEECH) ===
+  useEffect(() => {
+      if (voiceEnabled && nextManeuver.instruction) {
+          // Limpiamos las etiquetas de negritas <b> que manda Google para que la voz suene natural
+          const cleanText = nextManeuver.instruction.replace(/<[^>]*>?/gm, '');
+          const textToSpeak = `${nextManeuver.distance}. ${cleanText}`;
+
+          // Solo hablamos si es una instrucción nueva
+          if (lastSpokenRef.current !== textToSpeak) {
+              window.speechSynthesis.cancel(); // Detiene cualquier voz anterior
+              const utterance = new SpeechSynthesisUtterance(textToSpeak);
+              utterance.lang = 'es-MX'; // Acento México
+              utterance.rate = 0.95; // Velocidad ligeramente pausada
+              
+              window.speechSynthesis.speak(utterance);
+              lastSpokenRef.current = textToSpeak;
+          }
+      }
+  }, [nextManeuver, voiceEnabled]);
 
   useEffect(() => {
     const savedActiveId = localStorage.getItem('active_trip_id');
@@ -314,7 +336,7 @@ function App() {
 
   const centerOnUser = () => { setIsTracking(true); if (mapRef.current && snappedLocation) { mapRef.current.panTo(snappedLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60); if (userHeading) mapRef.current.setHeading(userHeading); } };
   const handleMapDrag = () => { setIsTracking(false); };
-  const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setNextManeuver({ instruction: '', distance: '' }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; };
+  const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setNextManeuver({ instruction: '', distance: '' }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; window.speechSynthesis.cancel(); };
 
   const toggleOnlineStatus = async () => {
       if (!currentDriver) return;
@@ -477,6 +499,14 @@ function App() {
       await updateDoc(doc(db, "rutas", routeId), { status: 'En Ruta', startTime: getMexicoTime(), createdDate: new Date().toISOString() });
       setSelectedRoute(prev => ({ ...prev, status: 'En Ruta' })); localStorage.setItem('active_trip_id', routeId); localStorage.setItem(`trip_idx_${routeId}`, 0);
       setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
+      
+      // Saludo inicial de voz
+      if (voiceEnabled) {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance("Viaje iniciado. Dirígete a la ruta resaltada en el mapa.");
+          utterance.lang = 'es-MX';
+          window.speechSynthesis.speak(utterance);
+      }
     } catch (e) { alert("Error al iniciar"); }
   };
 
@@ -485,7 +515,7 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: getMexicoTime(), finalDate: getMexicoDate(), "proximityAlert.active": false });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' })); localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
-      alert("¡Ruta finalizada con éxito!"); odometerLocRef.current = null;
+      alert("¡Ruta finalizada con éxito!"); odometerLocRef.current = null; window.speechSynthesis.cancel();
     } catch (e) {}
   };
 
@@ -622,7 +652,7 @@ function App() {
                   </div>
               </div>
 
-              {/* --- INSTRUCCIONES WAZE (TURN BY TURN) --- */}
+              {/* --- INSTRUCCIONES WAZE (TURN BY TURN) CON CONTROL DE VOZ --- */}
               {nextManeuver.instruction && (
                   <div className="absolute top-[85px] left-4 right-4 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 shadow-2xl z-30 border border-slate-700 flex items-center gap-4 animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-blue-600 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
@@ -632,6 +662,15 @@ function App() {
                           <p className="text-xl font-black">{nextManeuver.distance}</p>
                           <p className="text-sm font-medium text-slate-300 leading-tight" dangerouslySetInnerHTML={{ __html: nextManeuver.instruction }}></p>
                       </div>
+                      <button 
+                          onClick={() => {
+                              setVoiceEnabled(!voiceEnabled);
+                              if(voiceEnabled) window.speechSynthesis.cancel();
+                          }} 
+                          className="p-2 rounded-full bg-slate-800 text-slate-300 hover:text-white transition shrink-0"
+                      >
+                          {voiceEnabled ? <Volume2 className="w-5 h-5"/> : <VolumeX className="w-5 h-5 text-red-400"/>}
+                      </button>
                   </div>
               )}
 
