@@ -182,11 +182,17 @@ function App() {
         watchId = navigator.geolocation.watchPosition(
           async (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
+            const accuracy = position.coords.accuracy; // Precisión en metros del hardware móvil
+
+            // La ubicación visual en el mapa se actualiza siempre para que el chofer vea fluidez
             setUserLocation(loc);
             
-            // 1. Odómetro y Ruta Real (Solo audita después del primer abordaje)
+            // 1. Odómetro y Ruta Real con Filtros de Estabilización Anticlono
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                if (nextStopIdx > 0) { 
+                // CANDADO 1: Si la precisión del satélite es pésima (> 35 metros), ignoramos para el odómetro
+                if (accuracy > 35) return;
+
+                if (nextStopIdx > 0) { // Solo cuenta si ya recogió al primer pasajero
                     if (!odometerLocRef.current) { 
                         odometerLocRef.current = loc; 
                     } else {
@@ -194,19 +200,53 @@ function App() {
                         const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
                         const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
                         
-                        if (distMeters > 20) {
+                        // CANDADO 2: Filtramos micro-movimientos (<20m) y brincos fantasma imposibles (>350m por tick de lectura)
+                        if (distMeters > 20 && distMeters < 350) {
                             const distKm = distMeters / 1000;
                             try { 
                                 await updateDoc(doc(db, "rutas", selectedRoute.id), { 
                                     realDistanceDriven: increment(distKm),
-                                    rutaReal: arrayUnion(loc)
+                                    rutaReal: arrayUnion(loc) // Se concatena el rastro limpio
                                 }); 
-                            } catch(e) {}
+                            } catch(e) {
+                                console.error("Error telemétrico:", e);
+                            }
                             odometerLocRef.current = loc; 
                         }
                     }
                 }
             }
+
+            // 2. Filtro estabilizador para la brújula y rotación de flecha
+            if (prevLocRef.current && window.google?.maps?.geometry) {
+                const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
+                const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
+                const distForHeading = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
+
+                if (distForHeading > 3) {
+                    let newHeading = position.coords.heading;
+                    if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
+                        newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
+                    }
+                    if (newHeading !== null && !isNaN(newHeading)) { 
+                        setUserHeading(newHeading); 
+                    }
+                    prevLocRef.current = loc; 
+                }
+            } else {
+                let initialHeading = position.coords.heading || 0;
+                setUserHeading(initialHeading);
+                prevLocRef.current = loc;
+            }
+
+            // 3. Enviar ubicación de respaldo a Firebase para el monitor de despacho si está en pausa
+            if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
+                try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
+            }
+          },
+          (error) => console.error("Error crítico de hardware GPS:", error),
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 } // Forzamos lecturas frescas de hardware
+        );
 
             // 2. Filtro estabilizador para la brújula
             if (prevLocRef.current && window.google?.maps?.geometry) {
