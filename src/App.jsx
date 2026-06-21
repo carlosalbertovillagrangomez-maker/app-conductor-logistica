@@ -119,16 +119,14 @@ function App() {
   // === LÓGICA DEL NARRADOR (TEXT-TO-SPEECH) ===
   useEffect(() => {
       if (voiceEnabled && nextManeuver.instruction) {
-          // Limpiamos las etiquetas de negritas <b> que manda Google para que la voz suene natural
           const cleanText = nextManeuver.instruction.replace(/<[^>]*>?/gm, '');
           const textToSpeak = `${nextManeuver.distance}. ${cleanText}`;
 
-          // Solo hablamos si es una instrucción nueva
           if (lastSpokenRef.current !== textToSpeak) {
-              window.speechSynthesis.cancel(); // Detiene cualquier voz anterior
+              window.speechSynthesis.cancel(); 
               const utterance = new SpeechSynthesisUtterance(textToSpeak);
-              utterance.lang = 'es-MX'; // Acento México
-              utterance.rate = 0.95; // Velocidad ligeramente pausada
+              utterance.lang = 'es-MX'; 
+              utterance.rate = 0.95; 
               
               window.speechSynthesis.speak(utterance);
               lastSpokenRef.current = textToSpeak;
@@ -182,17 +180,15 @@ function App() {
         watchId = navigator.geolocation.watchPosition(
           async (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
-            const accuracy = position.coords.accuracy; // Precisión en metros del hardware móvil
+            const accuracy = position.coords.accuracy; 
 
-            // La ubicación visual en el mapa se actualiza siempre para que el chofer vea fluidez
             setUserLocation(loc);
             
             // 1. Odómetro y Ruta Real con Filtros de Estabilización Anticlono
             if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                // CANDADO 1: Si la precisión del satélite es pésima (> 35 metros), ignoramos para el odómetro
                 if (accuracy > 35) return;
 
-                if (nextStopIdx > 0) { // Solo cuenta si ya recogió al primer pasajero
+                if (nextStopIdx > 0) { 
                     if (!odometerLocRef.current) { 
                         odometerLocRef.current = loc; 
                     } else {
@@ -200,13 +196,12 @@ function App() {
                         const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
                         const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
                         
-                        // CANDADO 2: Filtramos micro-movimientos (<20m) y brincos fantasma imposibles (>350m por tick de lectura)
                         if (distMeters > 20 && distMeters < 350) {
                             const distKm = distMeters / 1000;
                             try { 
                                 await updateDoc(doc(db, "rutas", selectedRoute.id), { 
                                     realDistanceDriven: increment(distKm),
-                                    rutaReal: arrayUnion(loc) // Se concatena el rastro limpio
+                                    rutaReal: arrayUnion(loc) 
                                 }); 
                             } catch(e) {
                                 console.error("Error telemétrico:", e);
@@ -239,44 +234,13 @@ function App() {
                 prevLocRef.current = loc;
             }
 
-            // 3. Enviar ubicación de respaldo a Firebase para el monitor de despacho si está en pausa
+            // 3. Enviar ubicación de respaldo a Firebase
             if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
                 try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
             }
           },
           (error) => console.error("Error crítico de hardware GPS:", error),
-          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 } // Forzamos lecturas frescas de hardware
-        );
-
-            // 2. Filtro estabilizador para la brújula
-            if (prevLocRef.current && window.google?.maps?.geometry) {
-                const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
-                const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
-                const distForHeading = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-
-                if (distForHeading > 3) {
-                    let newHeading = position.coords.heading;
-                    if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
-                        newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
-                    }
-                    if (newHeading !== null && !isNaN(newHeading)) { 
-                        setUserHeading(newHeading); 
-                    }
-                    prevLocRef.current = loc; 
-                }
-            } else {
-                let initialHeading = position.coords.heading || 0;
-                setUserHeading(initialHeading);
-                prevLocRef.current = loc;
-            }
-
-            // 3. Enviar ubicación a Firebase
-            if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
-                try { await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); } catch(e){}
-            }
-          },
-          (error) => console.error("Error GPS:", error),
-          { enableHighAccuracy: true, maximumAge: 1000, timeout: 5000 }
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
         );
       }
     }
@@ -593,7 +557,7 @@ function App() {
 
   if (!isReady) return null;
 
-  const theme = { bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900', card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200', input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-blue-600 shadow-sm' };
+  const theme = { bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900', card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200', input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-orange-500 shadow-sm' };
 
   // ==============================================================
   // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
@@ -638,7 +602,7 @@ function App() {
               {isWaiting && (
                   <div className="absolute inset-0 z-50 bg-slate-50 flex flex-col animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-slate-800 text-white p-4 pt-8 pb-4 flex justify-between items-center shadow-md shrink-0">
-                          <div><p className="text-[10px] font-bold text-blue-300 uppercase tracking-widest">En el punto de encuentro</p><h2 className="text-lg font-black">{currentTarget?.contact || 'Pasajero'}</h2></div>
+                          <div><p className="text-[10px] font-bold text-orange-300 uppercase tracking-widest">En el punto de encuentro</p><h2 className="text-lg font-black">{currentTarget?.contact || 'Pasajero'}</h2></div>
                           <button onClick={() => setIsWaiting(false)} className="p-2 bg-slate-700 rounded-full hover:bg-slate-600 transition"><X className="w-5 h-5"/></button>
                       </div>
 
@@ -649,8 +613,8 @@ function App() {
                               const isDriver = msg.sender === 'Conductor';
                               return (
                                   <div key={i} className={`flex w-full ${isDriver ? 'justify-end' : 'justify-start'}`}>
-                                      <div className={`max-w-[80%] p-3 rounded-2xl shadow-sm relative ${isDriver ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'}`}>
-                                          <p className="text-sm font-medium leading-snug">{msg.text}</p><p className={`text-[9px] mt-1 text-right font-bold ${isDriver ? 'text-blue-300' : 'text-slate-400'}`}>{msg.time}</p>
+                                      <div className={`max-w-[80%] p-3 rounded-2xl shadow-sm relative ${isDriver ? 'bg-orange-500 text-white rounded-tr-sm' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'}`}>
+                                          <p className="text-sm font-medium leading-snug">{msg.text}</p><p className={`text-[9px] mt-1 text-right font-bold ${isDriver ? 'text-orange-200' : 'text-slate-400'}`}>{msg.time}</p>
                                       </div>
                                   </div>
                               );
@@ -658,8 +622,8 @@ function App() {
                       </div>
 
                       <div className="bg-white p-3 border-t border-slate-200 flex items-center gap-2 shrink-0">
-                          <input type="text" value={chatText} onChange={e=>setChatText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()} placeholder="Envía un mensaje al cliente o despacho..." className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-blue-500 focus:bg-white transition-colors text-slate-700" />
-                          <button onClick={enviarMensaje} className="p-3 bg-blue-600 text-white rounded-full shadow-md hover:bg-blue-700 active:scale-95 transition-transform"><Send className="w-5 h-5 ml-1"/></button>
+                          <input type="text" value={chatText} onChange={e=>setChatText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && enviarMensaje()} placeholder="Envía un mensaje al cliente o despacho..." className="flex-1 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-orange-500 focus:bg-white transition-colors text-slate-700" />
+                          <button onClick={enviarMensaje} className="p-3 bg-orange-500 text-white rounded-full shadow-md hover:bg-orange-600 active:scale-95 transition-transform"><Send className="w-5 h-5 ml-1"/></button>
                       </div>
 
                       <div className="bg-white p-4 border-t border-slate-200 shadow-[0_-10px_20px_rgba(0,0,0,0.05)] shrink-0 space-y-3">
@@ -672,7 +636,7 @@ function App() {
                           </div>
                           <div className="flex gap-2">
                               <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SE PRESENTÓ</button>
-                              <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
+                              <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
                                   {isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>}
                               </button>
                           </div>
@@ -695,7 +659,7 @@ function App() {
               {/* --- INSTRUCCIONES WAZE (TURN BY TURN) CON CONTROL DE VOZ --- */}
               {nextManeuver.instruction && (
                   <div className="absolute top-[85px] left-4 right-4 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 shadow-2xl z-30 border border-slate-700 flex items-center gap-4 animate-[fadeIn_0.3s_ease-out]">
-                      <div className="bg-blue-600 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
+                      <div className="bg-orange-500 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
                           <Navigation className="w-6 h-6 text-white" />
                       </div>
                       <div className="flex-1 text-white">
@@ -717,11 +681,11 @@ function App() {
               {/* --- MAPA 3D --- */}
               <div className="flex-1 relative bg-slate-200 w-full h-full">
                   {!isLoaded ? (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-orange-500 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
                         <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
-                            {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 6 }} />}
+                            {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#f97316", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
                             {snappedLocation && (
                                 <Marker 
@@ -742,7 +706,7 @@ function App() {
                         </GoogleMap>
                         
                         {snappedLocation && (
-                            <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-blue-600 border-slate-200 active:bg-blue-50'}`}>
+                            <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-orange-500 text-white border-orange-600' : 'bg-white text-orange-500 border-slate-200 active:bg-orange-50'}`}>
                                 {isTracking ? <Navigation2 className="w-6 h-6" /> : <LocateFixed className="w-6 h-6" />}
                             </button>
                         )}
@@ -763,18 +727,18 @@ function App() {
                             <div className="w-px h-8 bg-slate-200 dark:bg-slate-800"></div>
                             <div className="text-center"><p className="text-[10px] font-black uppercase text-slate-400 mb-0.5 tracking-widest">Tiempo Total</p><p className="text-2xl font-black text-slate-800 dark:text-white">{liveRouteData.totalDuration || selectedRoute.technicalData?.totalDuration} <span className="text-sm text-slate-400">min</span></p></div>
                         </div>
-                        <div className={`mb-6 rounded-xl p-4 border shadow-sm ${isApproaching ? 'bg-orange-100 border-orange-300' : darkMode ? 'bg-slate-800 border-slate-700' : 'bg-blue-50/50 border-blue-100'}`}>
-                            <p className={`text-[10px] font-black uppercase mb-1 tracking-widest ${isApproaching ? 'text-orange-600 animate-pulse' : 'text-blue-500'}`}>{isApproaching ? 'Llegando al punto...' : 'Siguiente Objetivo'}</p>
+                        <div className={`mb-6 rounded-xl p-4 border shadow-sm ${isApproaching ? 'bg-orange-100 border-orange-300' : darkMode ? 'bg-slate-800 border-slate-700' : 'bg-orange-50/50 border-orange-100'}`}>
+                            <p className={`text-[10px] font-black uppercase mb-1 tracking-widest ${isApproaching ? 'text-orange-600 animate-pulse' : 'text-orange-500'}`}>{isApproaching ? 'Llegando al punto...' : 'Siguiente Objetivo'}</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
                             <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
-                                <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-blue-600 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div>
+                                <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-orange-500 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div>
                                 <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
                                 <div className="flex flex-col text-right"><span className="text-[10px] font-bold text-slate-400 uppercase">Llegada en</span><span className="font-black text-green-500 text-xl">{liveRouteData.nextStopDuration || '--'} <span className="text-sm">min</span></span></div>
                             </div>
                         </div>
                         <div className="space-y-3 shrink-0 mt-auto pb-4">
                             {!isHeadingToDestination ? (
-                                <button onClick={marcarLlegada} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black p-4 rounded-2xl shadow-xl shadow-blue-500/30 flex items-center justify-center gap-2 active:scale-95 transition-all tracking-widest"><MessageSquare className="w-5 h-5"/> LLEGUÉ AL PUNTO (VER OPCIONES)</button>
+                                <button onClick={marcarLlegada} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all tracking-widest"><MessageSquare className="w-5 h-5"/> LLEGUÉ AL PUNTO (VER OPCIONES)</button>
                             ) : (
                                 <button onClick={marcarLlegada} className="w-full text-white font-black p-4 rounded-2xl shadow-xl shadow-red-500/40 bg-red-600 hover:bg-red-700 flex items-center justify-center gap-2 active:scale-95 transition-all tracking-widest animate-pulse"><CheckCircle className="w-5 h-5"/> LLEGUÉ AL DESTINO (VER OPCIONES)</button>
                             )}
@@ -782,7 +746,7 @@ function App() {
                       </>
                   ) : (
                       <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
-                          <div><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest line-clamp-1">{nextStopName}</p><p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div>
+                          <div><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest line-clamp-1">{nextStopName}</p><p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div>
                           <div className="text-right"><p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p><p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p></div>
                       </div>
                   )}
@@ -807,17 +771,17 @@ function App() {
           <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'} transition`}><ChevronLeft className="w-5 h-5" /></button>
           <div>
               <h2 className="text-sm font-bold">Vista Previa de Ruta</h2>
-              <p className={`text-[10px] uppercase font-bold text-blue-500`}>{selectedRoute.client}</p>
+              <p className={`text-[10px] uppercase font-bold text-orange-500`}>{selectedRoute.client}</p>
           </div>
         </div>
 
         {/* MAPA ESTÁTICO DE VISTA PREVIA */}
         <div className="flex-1 relative bg-slate-200 w-full h-full">
           {!isLoaded ? (
-              <div className="absolute inset-0 flex items-center justify-center bg-slate-100 z-10"><Loader2 className="animate-spin text-blue-600 w-8 h-8"/></div>
+              <div className="absolute inset-0 flex items-center justify-center bg-slate-100 z-10"><Loader2 className="animate-spin text-orange-500 w-8 h-8"/></div>
           ) : (
               <GoogleMap mapContainerStyle={containerStyle} center={mapCenter} zoom={13} onLoad={handleMapLoad} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
-                  {routeToDisplay.length > 0 && <Polyline path={routeToDisplay} options={{ strokeColor: "#3b82f6", strokeOpacity: 0.9, strokeWeight: 5 }} />}
+                  {routeToDisplay.length > 0 && <Polyline path={routeToDisplay} options={{ strokeColor: "#f97316", strokeOpacity: 0.9, strokeWeight: 5 }} />}
                   {selectedRoute.startCoords && <Marker position={{lat: selectedRoute.startCoords.lat, lng: selectedRoute.startCoords.lng}} label="A" />}
                   {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => ( wp.lat && wp.lng && <Marker key={idx} position={{lat: wp.lat, lng: wp.lng}} label={String.fromCharCode(66 + idx)} /> ))}
                   {selectedRoute.endCoords && <Marker position={{lat: selectedRoute.endCoords.lat, lng: selectedRoute.endCoords.lng}} label={String.fromCharCode(66 + (selectedRoute.waypointsData?.length || 0))} />}
@@ -830,7 +794,7 @@ function App() {
             <div className="flex justify-between items-center mb-4">
                 <div>
                     <p className="text-[10px] font-bold uppercase text-slate-400 mb-1">Estatus</p>
-                    <div className="px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 bg-blue-100 text-blue-700">
+                    <div className="px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-2 bg-orange-100 text-orange-700">
                        <CheckCircle2 className="w-3 h-3"/> {selectedRoute.status}
                     </div>
                 </div>
@@ -847,7 +811,7 @@ function App() {
                 </div>
                 {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => (
                     <div key={idx} className="flex items-start gap-3">
-                        <div className="w-3 h-3 rounded-full bg-blue-500 mt-1"></div>
+                        <div className="w-3 h-3 rounded-full bg-orange-500 mt-1"></div>
                         <div><p className="text-[10px] font-black uppercase text-slate-400">Parada {String.fromCharCode(66 + idx)}</p><p className="text-xs font-medium">{wp.address}</p></div>
                     </div>
                 ))}
@@ -910,7 +874,7 @@ function App() {
                     <div className="bg-yellow-400 p-6 text-center shrink-0 relative overflow-hidden"><div className="absolute inset-0 bg-yellow-500/20 animate-pulse"></div><div className="relative z-10 flex flex-col items-center"><div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg mb-3"><Zap className="w-8 h-8 text-yellow-500" /></div><h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">¡NUEVO VIAJE!</h2><p className="text-xs font-bold text-yellow-900 mt-1 uppercase tracking-widest">A unos kilómetros de ti</p></div></div>
                     <div className="p-6 bg-slate-50 space-y-4">
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Cliente Solicitante</p><p className="text-lg font-black text-slate-800">{incomingOffer.client}</p></div>
-                        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-blue-500"></div><p className="text-[10px] font-black text-blue-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p></div>
+                        <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-orange-500"></div><p className="text-[10px] font-black text-orange-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p></div>
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-red-500"></div><p className="text-[10px] font-black text-red-500 uppercase tracking-widest mb-1 pl-2">Llevar a:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.end}</p></div>
                     </div>
                     <div className="p-6 bg-white border-t border-slate-100 flex gap-3 shrink-0"><button onClick={rechazarViaje} className="w-1/3 py-4 rounded-2xl bg-red-50 text-red-600 font-bold text-xs uppercase tracking-widest border border-red-200 hover:bg-red-100 transition active:scale-95">Rechazar</button><button onClick={aceptarViaje} className="w-2/3 py-4 rounded-2xl bg-green-500 text-white font-black text-sm uppercase tracking-widest shadow-xl shadow-green-500/30 hover:bg-green-600 transition active:scale-95 flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> Aceptar Viaje</button></div>
@@ -918,7 +882,7 @@ function App() {
             </div>
         )}
         <div className={`p-5 flex flex-col gap-4 shadow-sm border-b ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="flex justify-between items-center"><button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/20">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button><div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div></div>
+          <div className="flex justify-between items-center"><button onClick={() => setIsEditingProfile(true)} className="flex items-center gap-3"><div className="w-10 h-10 bg-slate-800 rounded-xl flex items-center justify-center text-white font-black shadow-lg">{currentDriver.initials}</div><div className="text-left"><h2 className="text-xs font-bold leading-tight">{currentDriver.name}</h2><p className="text-[8px] uppercase tracking-tighter text-slate-400">Mi Expediente</p></div></button><div className="flex items-center gap-2"><button onClick={() => setDarkMode(!darkMode)} className="p-2">{darkMode ? <Sun className="w-4 h-4 text-yellow-400" /> : <Moon className="w-4 h-4 text-slate-500" />}</button><button onClick={() => { localStorage.removeItem('driver_session'); setCurrentDriver(null); }} className="p-2 text-slate-400"><LogOut className="w-5 h-5" /></button></div></div>
           <div className="flex justify-between items-center bg-slate-100 dark:bg-slate-800 p-2 rounded-2xl border border-slate-200 dark:border-slate-700">
               <div className="flex items-center gap-2 pl-2">{currentDriver.isOnline ? <Power className="w-4 h-4 text-green-500" /> : <PowerOff className="w-4 h-4 text-slate-400" />}<div><p className="text-[9px] font-black uppercase text-slate-400">Estado de Operador</p><p className={`text-xs font-bold ${currentDriver.isOnline ? 'text-green-600' : 'text-slate-500'}`}>{currentDriver.isOnline ? 'Conectado (Recibiendo Viajes)' : 'Desconectado'}</p></div></div>
               <button onClick={toggleOnlineStatus} className={`w-14 h-8 rounded-full transition-colors relative shadow-inner ${currentDriver.isOnline ? 'bg-green-500' : 'bg-slate-300'}`}><div className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow transition-transform ${currentDriver.isOnline ? 'left-7' : 'left-1'}`}></div></button>
@@ -926,8 +890,8 @@ function App() {
         </div>
         <div className="px-6 pt-6 pb-2">
             <div className="flex gap-4 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
-                <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>En Curso</button>
-                <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400'}`}>Finalizados</button>
+                <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-orange-500 text-orange-500' : 'border-transparent text-slate-400'}`}>En Curso</button>
+                <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-orange-500 text-orange-500' : 'border-transparent text-slate-400'}`}>Finalizados</button>
             </div>
             
             {/* CAMBIO: Nuevos Botones de Filtro Intuitivos */}
@@ -944,7 +908,7 @@ function App() {
             {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados para este filtro'}</div> : rFiltradas.map(ruta => (
                 <div key={ruta.id} onClick={() => handleSelectRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}>
                     <div className="flex items-center gap-4">
-                        <div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-blue-50 text-blue-600'}`}>
+                        <div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-orange-50 text-orange-500'}`}>
                             {ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}
                         </div>
                         <div>
@@ -952,7 +916,7 @@ function App() {
                             <p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p>
                         </div>
                     </div>
-                    <ChevronRight className="w-4 h-4 text-blue-500" />
+                    <ChevronRight className="w-4 h-4 text-orange-500" />
                 </div>
             ))}
         </div>
@@ -967,27 +931,35 @@ function App() {
         <button onClick={() => isEditing ? setIsEditingProfile(false) : setIsRegistering(false)} className="mb-6 flex items-center gap-2 text-slate-500 font-bold uppercase text-[10px] tracking-widest"><ChevronLeft className="w-4 h-4"/> Volver</button>
         <h1 className="text-3xl font-black tracking-tight mb-2">{isEditing ? 'Mi Expediente' : 'Nuevo Operador'}</h1>
         <form onSubmit={handleSubmit} className="space-y-8 mt-6">
-          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-blue-500 tracking-widest flex items-center gap-2"><User className="w-3 h-3"/> Identidad</p><input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={name} onChange={e => setName(e.target.value)} required={!isEditing} />{!isEditing && (<><input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={password} onChange={e => setPassword(e.target.value)} required /></>)}<div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={rfc} onChange={e => setRfc(e.target.value)} required={!isEditing} /><input type="tel" placeholder="WhatsApp / Teléfono *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={phone} onChange={e => setPhone(e.target.value)} required={!isEditing} /></div><input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={address} onChange={e => setAddress(e.target.value)} /></div>
-          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest flex items-center gap-2"><Truck className="w-3 h-3"/> Vehículo</p><input type="text" placeholder="Modelo (Ej. Ford) *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Placas *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} required={!isEditing} /><input type="text" placeholder="Tipo (Caja, etc)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={vehicleType} onChange={e => setVehicleType(e.target.value)} /></div></div>
-          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-purple-500 tracking-widest flex items-center gap-2"><FileText className="w-3 h-3"/> Licencia</p><input type="text" placeholder="Número *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo (Federal, B)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseType} onChange={e => setLicenseType(e.target.value)} /><input type="text" placeholder="Vigencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={licenseExp} onChange={e => setLicenseExp(e.target.value)} /></div></div>
-          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-red-500 tracking-widest flex items-center gap-2"><ShieldAlert className="w-3 h-3"/> Salud</p><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo Sangre" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input}`} value={bloodType} onChange={e => setBloodType(e.target.value)} /><input type="text" placeholder="Tel. Emergencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input}`} value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} /></div></div>
+          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest flex items-center gap-2"><User className="w-3 h-3"/> Identidad</p><input type="text" placeholder="Nombre completo *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={name} onChange={e => setName(e.target.value)} required={!isEditing} />{!isEditing && (<><input type="password" placeholder="Contraseña *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={password} onChange={e => setPassword(e.target.value)} required /></>)}<div className="grid grid-cols-2 gap-4"><input type="text" placeholder="RFC *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input} focus:border-orange-500 outline-none`} value={rfc} onChange={e => setRfc(e.target.value)} required={!isEditing} /><input type="tel" placeholder="WhatsApp / Teléfono *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={phone} onChange={e => setPhone(e.target.value)} required={!isEditing} /></div><input type="text" placeholder="Dirección completa" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={address} onChange={e => setAddress(e.target.value)} /></div>
+          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest flex items-center gap-2"><Truck className="w-3 h-3"/> Vehículo</p><input type="text" placeholder="Modelo (Ej. Ford) *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={vehicleModel} onChange={e => setVehicleModel(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Placas *" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input} focus:border-orange-500 outline-none`} value={vehiclePlate} onChange={e => setVehiclePlate(e.target.value)} required={!isEditing} /><input type="text" placeholder="Tipo (Caja, etc)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={vehicleType} onChange={e => setVehicleType(e.target.value)} /></div></div>
+          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2"><FileText className="w-3 h-3"/> Licencia</p><input type="text" placeholder="Número *" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={licenseNumber} onChange={e => setLicenseNumber(e.target.value)} required={!isEditing} /><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo (Federal, B)" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={licenseType} onChange={e => setLicenseType(e.target.value)} /><input type="text" placeholder="Vigencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={licenseExp} onChange={e => setLicenseExp(e.target.value)} /></div></div>
+          <div className="space-y-4"><p className="text-[10px] font-black uppercase text-red-500 tracking-widest flex items-center gap-2"><ShieldAlert className="w-3 h-3"/> Salud</p><div className="grid grid-cols-2 gap-4"><input type="text" placeholder="Tipo Sangre" className={`w-full p-4 rounded-2xl text-sm border uppercase ${theme.input} focus:border-orange-500 outline-none`} value={bloodType} onChange={e => setBloodType(e.target.value)} /><input type="text" placeholder="Tel. Emergencia" className={`w-full p-4 rounded-2xl text-sm border ${theme.input} focus:border-orange-500 outline-none`} value={emergencyContact} onChange={e => setEmergencyContact(e.target.value)} /></div></div>
           {error && <p className="text-red-500 text-xs text-center">{error}</p>}
-          <div className={`p-5 border-t fixed bottom-0 left-0 right-0 z-30 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}><button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : (isEditing ? <><Save className="w-5 h-5"/> GUARDAR CAMBIOS</> : 'Enviar Registro')}</button></div>
+          <div className={`p-5 border-t fixed bottom-0 left-0 right-0 z-30 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}><button type="submit" disabled={loading} className="w-full bg-slate-800 text-white font-black p-4 rounded-2xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition-all">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : (isEditing ? <><Save className="w-5 h-5"/> GUARDAR CAMBIOS</> : 'Enviar Registro')}</button></div>
         </form>
       </div>
     );
   }
 
-  // --- VISTA DE LOGIN ACTUALIZADA A TELÉFONO ---
+  // --- VISTA DE LOGIN ACTUALIZADA A TRIPLOGIX ---
   return (
     <div className={`min-h-screen flex flex-col items-center justify-between p-8 transition-colors bg-slate-50 text-slate-900`}>
-      <div className="flex flex-col items-center mt-12 w-full max-w-sm"><div className="w-24 h-24 bg-blue-600 rounded-[2.2rem] flex items-center justify-center mb-8 shadow-2xl rotate-6 shadow-blue-500/30"><Truck className="w-12 h-12 text-white" /></div><h1 className="text-4xl font-black tracking-tighter italic">LOGÍSTICA</h1></div>
+      <div className="flex flex-col items-center mt-12 w-full max-w-sm">
+        <div className="mb-6 flex justify-center">
+            <img src="/logo.png" alt="TripLogix Conductor" className="w-32 h-32 object-contain drop-shadow-md" />
+        </div>
+        <h1 className="text-3xl font-black text-slate-800 uppercase tracking-wider mb-1">
+          Trip<span className="text-orange-500">Logix</span>
+        </h1>
+        <p className="text-sm font-bold text-slate-500 uppercase tracking-widest">Portal de Operador</p>
+      </div>
       <form onSubmit={handleLogin} className="w-full max-w-sm space-y-4">
-        <input type="tel" placeholder="WhatsApp / Teléfono" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={phone} onChange={e => setPhone(e.target.value)} />
-        <input type="password" placeholder="Contraseña" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900" value={password} onChange={e => setPassword(e.target.value)} />
+        <input type="tel" placeholder="WhatsApp / Teléfono" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900 focus:border-orange-500 outline-none" value={phone} onChange={e => setPhone(e.target.value)} />
+        <input type="password" placeholder="Contraseña" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900 focus:border-orange-500 outline-none" value={password} onChange={e => setPassword(e.target.value)} />
         {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
-        <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
-        <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo Operador? <span className="text-blue-600">Regístrate</span></button>
+        <button type="submit" disabled={loading} className="w-full bg-slate-800 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center active:scale-95 transition-transform uppercase tracking-wider">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
+        <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo Operador? <span className="text-orange-500">Regístrate</span></button>
       </form>
     </div>
   );
