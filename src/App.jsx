@@ -37,7 +37,7 @@ const getMexicoDate = () => new Date().toLocaleDateString('es-MX', { timeZone: '
 
 // === NUEVO HELPER: SNAP TO ROUTE (Pegar flecha a la línea azul) ===
 const getSnappedLocation = (loc, path) => {
-    if (!loc || !path || path.length < 2) return loc;
+    if (!loc || isNaN(loc.lat) || isNaN(loc.lng) || !path || path.length < 2) return loc; // PREVENCIÓN DE PANTALLA NEGRA
     let minDist = Infinity;
     let closestLoc = loc;
     for (let i = 0; i < path.length - 1; i++) {
@@ -55,6 +55,14 @@ const getSnappedLocation = (loc, path) => {
     return closestLoc;
 };
 
+// --- NUEVO: REPRODUCTOR DE SONIDO DE ALERTA ---
+const playAlertSound = () => {
+    try {
+        const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+        audio.play().catch(e => console.log("Navegador bloqueó el audio automático"));
+    } catch(e) {}
+};
+
 function App() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -63,6 +71,8 @@ function App() {
   const [isReady, setIsReady] = useState(false);
   
   const [misRutas, setMisRutas] = useState([]);
+  const [prevRutasCount, setPrevRutasCount] = useState(0); // Para detectar si el despachador asignó algo manual
+
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Próximo');
   const [mainTab, setMainTab] = useState('Pendientes'); 
@@ -146,6 +156,15 @@ function App() {
     }
   }, [misRutas, selectedRoute]);
 
+  // --- DETECCIÓN DE VIAJES ASIGNADOS MANUALMENTE DESDE EL DESPACHO ---
+  useEffect(() => {
+      if (misRutas.length > prevRutasCount && prevRutasCount !== 0) {
+          playAlertSound();
+          if ("vibrate" in navigator) navigator.vibrate([300, 100, 300, 100, 300]);
+      }
+      setPrevRutasCount(misRutas.length);
+  }, [misRutas.length, prevRutasCount]);
+
   useEffect(() => {
     const requestWakeLock = async () => { if ('wakeLock' in navigator && selectedRoute?.status === 'En Ruta') { try { wakeLockRef.current = await navigator.wakeLock.request('screen'); } catch (err) {} } };
     const handleVisibilityChange = () => { if (document.visibilityState === 'visible') requestWakeLock(); };
@@ -153,12 +172,13 @@ function App() {
     return () => { document.removeEventListener('visibilitychange', handleVisibilityChange); if (wakeLockRef.current) { wakeLockRef.current.release().catch(() => {}); wakeLockRef.current = null; } };
   }, [selectedRoute?.status]);
 
+  // INYECTAMOS LOS NOMBRES REALES DEL PASAJERO A LA UI
   const allTargets = useMemo(() => {
       if (!selectedRoute) return [];
       const targets = [];
-      if (selectedRoute.startCoords) { targets.push({ ...selectedRoute.startCoords, label: 'Origen', address: selectedRoute.start, icon: ICON_START, contact: selectedRoute.startCoords.contact }); }
-      if (selectedRoute.waypointsData) { selectedRoute.waypointsData.forEach((wp, idx) => { targets.push({ ...wp, label: `Parada ${String.fromCharCode(66 + idx)}`, address: selectedRoute.waypoints[idx], icon: ICON_WAYPOINT, contact: wp.contact }); }); }
-      if (selectedRoute.endCoords) { targets.push({ ...selectedRoute.endCoords, label: 'Destino Final', address: selectedRoute.end, icon: ICON_END, contact: selectedRoute.endCoords.contact }); }
+      if (selectedRoute.startCoords) { targets.push({ ...selectedRoute.startCoords, label: 'Origen', address: selectedRoute.start, icon: ICON_START, contact: selectedRoute.startCoords.passengerName || selectedRoute.startCoords.contact }); }
+      if (selectedRoute.waypointsData) { selectedRoute.waypointsData.forEach((wp, idx) => { targets.push({ ...wp, label: `Parada ${String.fromCharCode(66 + idx)}`, address: selectedRoute.waypoints[idx], icon: ICON_WAYPOINT, contact: wp.passengerName || wp.contact }); }); }
+      if (selectedRoute.endCoords) { targets.push({ ...selectedRoute.endCoords, label: 'Destino Final', address: selectedRoute.end, icon: ICON_END, contact: selectedRoute.endCoords.passengerName || selectedRoute.endCoords.contact }); }
       return targets;
   }, [selectedRoute]);
 
@@ -181,6 +201,9 @@ function App() {
           async (position) => {
             const loc = { lat: position.coords.latitude, lng: position.coords.longitude };
             const accuracy = position.coords.accuracy; 
+
+            // Filtro de prevención de Pantalla Negra (Evita coordenadas inválidas)
+            if (isNaN(loc.lat) || isNaN(loc.lng)) return;
 
             setUserLocation(loc);
             
@@ -223,14 +246,17 @@ function App() {
                     if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
                         newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
                     }
+                    // FIX PANTALLA NEGRA: Asegurar que el heading NUNCA sea NaN
                     if (newHeading !== null && !isNaN(newHeading)) { 
                         setUserHeading(newHeading); 
+                    } else {
+                        setUserHeading(0); // Fallback de emergencia
                     }
                     prevLocRef.current = loc; 
                 }
             } else {
                 let initialHeading = position.coords.heading || 0;
-                setUserHeading(initialHeading);
+                setUserHeading(isNaN(initialHeading) ? 0 : initialHeading);
                 prevLocRef.current = loc;
             }
 
@@ -257,7 +283,7 @@ function App() {
           mapRef.current.panTo(snappedLocation); 
           mapRef.current.setZoom(19); 
           mapRef.current.setTilt(60);
-          mapRef.current.setHeading(userHeading);
+          mapRef.current.setHeading(isNaN(userHeading) ? 0 : userHeading);
       }
   }, [snappedLocation, selectedRoute?.status, userHeading]);
 
@@ -267,6 +293,7 @@ function App() {
       const unsubscribe = onSnapshot(q, (snapshot) => {
           if (!snapshot.empty) {
               setIncomingOffer({ id: snapshot.docs[0].id, ...snapshot.docs[0].data() });
+              playAlertSound(); // SONIDO AL RECIBIR VIAJE
               if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]); 
           } else { setIncomingOffer(null); }
       });
@@ -338,7 +365,7 @@ function App() {
       updateLiveRoute();
   }, [routeUpdateTick, nextStopIdx, selectedRoute, allTargets, isLoaded]);
 
-  const centerOnUser = () => { setIsTracking(true); if (mapRef.current && snappedLocation) { mapRef.current.panTo(snappedLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60); if (userHeading) mapRef.current.setHeading(userHeading); } };
+  const centerOnUser = () => { setIsTracking(true); if (mapRef.current && snappedLocation) { mapRef.current.panTo(snappedLocation); mapRef.current.setZoom(19); mapRef.current.setTilt(60); if (userHeading) mapRef.current.setHeading(isNaN(userHeading) ? 0 : userHeading); } };
   const handleMapDrag = () => { setIsTracking(false); };
   const cerrarRuta = () => { localStorage.removeItem('active_trip_id'); setSelectedRoute(null); setNextStopIdx(0); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false); setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 }); setNextManeuver({ instruction: '', distance: '' }); setIsPanelExpanded(true); setIsTracking(true); odometerLocRef.current = null; window.speechSynthesis.cancel(); };
 
@@ -684,10 +711,10 @@ function App() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-100 gap-3 z-10"><Loader2 className="animate-spin text-orange-500 w-8 h-8"/><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Cargando GPS...</p></div>
                   ) : (
                       <>
-                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? userHeading : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
+                        <GoogleMap mapContainerStyle={containerStyle} center={centerMX} zoom={isTracking ? 19 : 16} tilt={isTracking ? 60 : 0} heading={isTracking ? (isNaN(userHeading) ? 0 : userHeading) : 0} onLoad={handleMapLoad} onDragStart={handleMapDrag} options={{ mapId: "73f56298887c80075f6fc648", disableDefaultUI: true, gestureHandling: "greedy" }}>
                             {currentGeometry && <Polyline path={currentGeometry} options={{ strokeColor: "#f97316", strokeOpacity: 0.9, strokeWeight: 6 }} />}
                             {allTargets.map((target, idx) => { if (idx < nextStopIdx) return null; return <Marker key={idx} position={{lat: target.lat, lng: target.lng}} icon={target.icon} />; })}
-                            {snappedLocation && (
+                            {snappedLocation && !isNaN(snappedLocation.lat) && (
                                 <Marker 
                                     position={snappedLocation} 
                                     icon={{ 
@@ -697,7 +724,7 @@ function App() {
                                         fillOpacity: 1, 
                                         strokeWeight: 2, 
                                         strokeColor: "white", 
-                                        rotation: userHeading,
+                                        rotation: isNaN(userHeading) ? 0 : userHeading,
                                         anchor: new window.google.maps.Point(0, 2.5) 
                                     }} 
                                     zIndex={999} 
@@ -807,17 +834,17 @@ function App() {
             <div className="space-y-4 mb-4">
                 <div className="flex items-start gap-3">
                     <div className="w-3 h-3 rounded-full bg-green-500 mt-1"></div>
-                    <div><p className="text-[10px] font-black uppercase text-slate-400">Origen</p><p className="text-xs font-medium">{selectedRoute.start}</p></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Origen • {selectedRoute.startCoords?.passengerName || 'Pasajero'}</p><p className="text-xs font-medium">{selectedRoute.start}</p></div>
                 </div>
                 {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => (
                     <div key={idx} className="flex items-start gap-3">
                         <div className="w-3 h-3 rounded-full bg-orange-500 mt-1"></div>
-                        <div><p className="text-[10px] font-black uppercase text-slate-400">Parada {String.fromCharCode(66 + idx)}</p><p className="text-xs font-medium">{wp.address}</p></div>
+                        <div><p className="text-[10px] font-black uppercase text-slate-400">Parada {String.fromCharCode(66 + idx)} • {wp.passengerName || 'Pasajero'}</p><p className="text-xs font-medium">{wp.address}</p></div>
                     </div>
                 ))}
                 <div className="flex items-start gap-3">
                     <div className="w-3 h-3 rounded-full bg-red-500 mt-1"></div>
-                    <div><p className="text-[10px] font-black uppercase text-slate-400">Destino</p><p className="text-xs font-medium">{selectedRoute.end}</p></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Destino • {selectedRoute.endCoords?.passengerName || 'Pasajero'}</p><p className="text-xs font-medium">{selectedRoute.end}</p></div>
                 </div>
             </div>
 
