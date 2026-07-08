@@ -35,6 +35,135 @@ const getDistanceMeters = (p1, p2) => {
 const getMexicoTime = () => new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' });
 const getMexicoDate = () => new Date().toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' });
 
+
+// === HELPER: MOSTRAR FECHA Y HORA PROGRAMADA DE RECOGIDA ===
+// Soporta varios nombres de campo por si el despachador guarda la hora con otro nombre.
+const getPickupDateValue = (route) => {
+    return route?.pickupDate || route?.scheduledDate || route?.fechaServicio || route?.fechaRecogida || route?.date || '';
+};
+
+const getPickupTimeValue = (route) => {
+    return route?.pickupTime || route?.scheduledTime || route?.horaRecogida || route?.horaPickup || route?.time || '';
+};
+
+const formatPickupDate = (dateValue) => {
+    if (!dateValue) return 'Fecha pendiente';
+
+    try {
+        if (dateValue?.toDate) {
+            return dateValue.toDate().toLocaleDateString('es-MX', {
+                weekday: 'short',
+                day: '2-digit',
+                month: 'short',
+                timeZone: 'America/Mexico_City'
+            });
+        }
+
+        const raw = String(dateValue).trim();
+
+        // Formato recomendado: YYYY-MM-DD
+        if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+            const [year, month, day] = raw.split('-').map(Number);
+            const date = new Date(year, month - 1, day);
+
+            return date.toLocaleDateString('es-MX', {
+                weekday: 'short',
+                day: '2-digit',
+                month: 'short'
+            });
+        }
+
+        return raw;
+    } catch (e) {
+        return String(dateValue);
+    }
+};
+
+const formatPickupTime = (timeValue) => {
+    if (!timeValue) return 'Hora pendiente';
+
+    try {
+        if (timeValue?.toDate) {
+            return timeValue.toDate().toLocaleTimeString('es-MX', {
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZone: 'America/Mexico_City'
+            });
+        }
+
+        const raw = String(timeValue).trim();
+
+        // Formato recomendado: HH:mm
+        if (/^\d{1,2}:\d{2}$/.test(raw)) {
+            const [hour, minute] = raw.split(':').map(Number);
+            const date = new Date(2000, 0, 1, hour, minute);
+
+            return date.toLocaleTimeString('es-MX', {
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
+        return raw;
+    } catch (e) {
+        return String(timeValue);
+    }
+};
+
+const getPickupScheduleText = (route) => {
+    const dateText = formatPickupDate(getPickupDateValue(route));
+    const timeText = formatPickupTime(getPickupTimeValue(route));
+    return `${dateText} • ${timeText}`;
+};
+
+// === HELPER: HORA ESTIMADA DE LLEGADA AL PUNTO ACTUAL ===
+const getEstimatedArrivalTimeFromMinutes = (minutesToAdd) => {
+    const minutes = Number(minutesToAdd);
+
+    if (!Number.isFinite(minutes) || minutes < 0) {
+        return 'Calculando...';
+    }
+
+    try {
+        const etaDate = new Date(Date.now() + minutes * 60000);
+
+        return etaDate.toLocaleTimeString('es-MX', {
+            timeZone: 'America/Mexico_City',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } catch (e) {
+        return 'Calculando...';
+    }
+};
+
+const getFirstPointArrivalText = (route) => {
+    return formatPickupTime(getPickupTimeValue(route));
+};
+
+const getPickupDateForFilter = (route) => {
+    const value = getPickupDateValue(route);
+    if (!value) return '';
+
+    try {
+        if (value?.toDate) {
+            return value.toDate().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+        }
+
+        const raw = String(value).trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+        return raw;
+    } catch (e) {
+        return String(value);
+    }
+};
+
+const getPickupSortableDateTime = (route) => {
+    const dateValue = getPickupDateForFilter(route) || '2099-12-31';
+    const timeValue = getPickupTimeValue(route) || '00:00';
+    return new Date(`${dateValue}T${String(timeValue).trim() || '00:00'}`);
+};
+
 // === NUEVO HELPER: SNAP TO ROUTE (Pegar flecha a la línea azul) ===
 const getSnappedLocation = (loc, path) => {
     if (!loc || isNaN(loc.lat) || isNaN(loc.lng) || !path || path.length < 2) return loc; // PREVENCIÓN DE PANTALLA NEGRA
@@ -595,6 +724,9 @@ function App() {
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       const nextStopName = currentTarget?.label || 'Destino';
       const nextStopAddress = currentTarget?.address || '';
+      const firstPointArrivalTime = getFirstPointArrivalText(selectedRoute);
+      const currentEstimatedArrivalTime = getEstimatedArrivalTimeFromMinutes(liveRouteData.nextStopDuration);
+      const isHeadingToFirstPoint = nextStopIdx === 0;
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
@@ -680,6 +812,9 @@ function App() {
                           <h2 className={`text-sm font-black tracking-tight uppercase ${isApproaching ? 'text-orange-600' : 'text-green-500'}`}>{isApproaching ? 'Notificando al Pasajero...' : 'Navegación Activa'}</h2>
                       </div>
                       <p className={`text-[10px] uppercase font-bold text-slate-400 line-clamp-1`}>{selectedRoute.client} • {nextStopName}</p>
+                      <p className="text-[10px] uppercase font-black text-orange-500 flex items-center gap-1 mt-0.5">
+                          <Clock className="w-3 h-3" /> {isHeadingToFirstPoint ? `Primer punto: llegar ${firstPointArrivalTime}` : `Llegada estimada: ${currentEstimatedArrivalTime}`}
+                      </p>
                   </div>
               </div>
 
@@ -757,6 +892,24 @@ function App() {
                         <div className={`mb-6 rounded-xl p-4 border shadow-sm ${isApproaching ? 'bg-orange-100 border-orange-300' : darkMode ? 'bg-slate-800 border-slate-700' : 'bg-orange-50/50 border-orange-100'}`}>
                             <p className={`text-[10px] font-black uppercase mb-1 tracking-widest ${isApproaching ? 'text-orange-600 animate-pulse' : 'text-orange-500'}`}>{isApproaching ? 'Llegando al punto...' : 'Siguiente Objetivo'}</p>
                             <p className="font-bold text-sm text-slate-800 dark:text-white truncate mb-3">{nextStopName}: <span className="font-medium text-slate-500 dark:text-slate-400">{nextStopAddress}</span></p>
+
+                            {isHeadingToFirstPoint && (
+                                <div className="mb-3 grid grid-cols-2 gap-2">
+                                    <div className="bg-white dark:bg-slate-900 rounded-lg p-3 border border-orange-100 dark:border-slate-800 shadow-sm">
+                                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Debes llegar</span>
+                                        <p className="font-black text-orange-500 text-lg flex items-center gap-1 mt-1">
+                                            <Clock className="w-4 h-4" /> {firstPointArrivalTime}
+                                        </p>
+                                    </div>
+                                    <div className="bg-white dark:bg-slate-900 rounded-lg p-3 border border-green-100 dark:border-slate-800 shadow-sm text-right">
+                                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Llegas aprox.</span>
+                                        <p className="font-black text-green-500 text-lg mt-1">
+                                            {currentEstimatedArrivalTime}
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+
                             <div className="flex justify-between items-center bg-white dark:bg-slate-900 rounded-lg p-3 border border-slate-100 dark:border-slate-800 shadow-sm">
                                 <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-400 uppercase">Faltan</span><span className="font-black text-orange-500 text-xl">{liveRouteData.nextStopDistance || '--'} <span className="text-sm">km</span></span></div>
                                 <div className="w-px h-8 bg-slate-100 dark:bg-slate-800"></div>
@@ -773,8 +926,16 @@ function App() {
                       </>
                   ) : (
                       <div className="flex justify-between items-center px-2" onClick={() => setIsPanelExpanded(true)}>
-                          <div><p className="text-[10px] font-black uppercase text-orange-500 tracking-widest line-clamp-1">{nextStopName}</p><p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p></div>
-                          <div className="text-right"><p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p><p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p></div>
+                          <div>
+                              <p className="text-[10px] font-black uppercase text-orange-500 tracking-widest line-clamp-1">{nextStopName}</p>
+                              <p className="text-xl font-black text-slate-800 dark:text-white leading-none mt-1">{liveRouteData.nextStopDistance || '--'} <span className="text-sm font-medium text-slate-500">km</span></p>
+                              {isHeadingToFirstPoint && <p className="text-[9px] font-black text-orange-500 uppercase mt-1">Debes llegar: {firstPointArrivalTime}</p>}
+                          </div>
+                          <div className="text-right">
+                              <p className="text-[10px] font-black uppercase text-green-500 tracking-widest">Llegada en</p>
+                              <p className="text-xl font-black text-green-500 leading-none mt-1">{liveRouteData.nextStopDuration || '--'} <span className="text-sm font-medium text-green-400">min</span></p>
+                              {isHeadingToFirstPoint && <p className="text-[9px] font-black text-green-500 uppercase mt-1">Aprox: {currentEstimatedArrivalTime}</p>}
+                          </div>
                       </div>
                   )}
               </div>
@@ -831,6 +992,20 @@ function App() {
                 </div>
             </div>
 
+            <div className="mb-5 rounded-2xl p-4 bg-orange-500 text-white shadow-xl shadow-orange-500/30 flex items-center gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
+                    <Clock className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-orange-100">
+                        Debes recoger al cliente
+                    </p>
+                    <p className="text-xl font-black leading-tight">
+                        {getPickupScheduleText(selectedRoute)}
+                    </p>
+                </div>
+            </div>
+
             <div className="space-y-4 mb-4">
                 <div className="flex items-start gap-3">
                     <div className="w-3 h-3 rounded-full bg-green-500 mt-1"></div>
@@ -875,7 +1050,7 @@ function App() {
             
             // --- NUEVOS FILTROS LÓGICOS ---
             if (filterType === 'Hoy') {
-                return x.scheduledDate === todayStr || x.serviceType === 'Prioritario';
+                return getPickupDateForFilter(x) === todayStr || x.serviceType === 'Prioritario';
             }
             return true; // 'Todos' y 'Próximo' pasan este primer filtro
         })
@@ -883,8 +1058,8 @@ function App() {
             if (a.status === 'En Ruta' && b.status !== 'En Ruta') return -1;
             if (b.status === 'En Ruta' && a.status !== 'En Ruta') return 1;
             
-            const dateA = new Date(`${a.scheduledDate || '2099-12-31'}T${a.scheduledTime || '00:00'}`);
-            const dateB = new Date(`${b.scheduledDate || '2099-12-31'}T${b.scheduledTime || '00:00'}`);
+            const dateA = getPickupSortableDateTime(a);
+            const dateB = getPickupSortableDateTime(b);
             return dateA - dateB;
         });
 
@@ -901,6 +1076,13 @@ function App() {
                     <div className="bg-yellow-400 p-6 text-center shrink-0 relative overflow-hidden"><div className="absolute inset-0 bg-yellow-500/20 animate-pulse"></div><div className="relative z-10 flex flex-col items-center"><div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg mb-3"><Zap className="w-8 h-8 text-yellow-500" /></div><h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">¡NUEVO VIAJE!</h2><p className="text-xs font-bold text-yellow-900 mt-1 uppercase tracking-widest">A unos kilómetros de ti</p></div></div>
                     <div className="p-6 bg-slate-50 space-y-4">
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Cliente Solicitante</p><p className="text-lg font-black text-slate-800">{incomingOffer.client}</p></div>
+                        <div className="bg-slate-900 p-4 rounded-2xl shadow-sm text-center border border-slate-800">
+                            <p className="text-[10px] font-black text-orange-300 uppercase tracking-widest mb-1">Hora de recogida</p>
+                            <p className="text-xl font-black text-white flex items-center justify-center gap-2">
+                                <Clock className="w-5 h-5 text-orange-400" />
+                                {getPickupScheduleText(incomingOffer)}
+                            </p>
+                        </div>
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-orange-500"></div><p className="text-[10px] font-black text-orange-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p></div>
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-red-500"></div><p className="text-[10px] font-black text-red-500 uppercase tracking-widest mb-1 pl-2">Llevar a:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.end}</p></div>
                     </div>
@@ -940,7 +1122,11 @@ function App() {
                         </div>
                         <div>
                             <h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4>
-                            <p className="text-[10px] text-slate-400 font-bold uppercase">Cliente: {ruta.client}</p>
+                            <div className="mt-1 flex items-center gap-1 text-[10px] font-black text-orange-500 uppercase">
+                                <Clock className="w-3 h-3" />
+                                <span>Recoger: {getPickupScheduleText(ruta)}</span>
+                            </div>
+                            <p className="text-[10px] text-slate-400 font-bold uppercase mt-0.5">Cliente: {ruta.client}</p>
                         </div>
                     </div>
                     <ChevronRight className="w-4 h-4 text-orange-500" />
