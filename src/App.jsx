@@ -265,32 +265,6 @@ const getEstimatedArrivalTimeFromMinutes = (minutesToAdd) => {
     }
 };
 
-const getFirstPointArrivalText = (route) => {
-    return formatPickupTime(getPickupTimeValue(route));
-};
-
-const getPickupDateForFilter = (route) => {
-    const value = getPickupDateValue(route);
-    if (!value) return '';
-
-    try {
-        if (value?.toDate) {
-            return value.toDate().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
-        }
-
-        const raw = String(value).trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-        return raw;
-    } catch (e) {
-        return String(value);
-    }
-};
-
-const getPickupSortableDateTime = (route) => {
-    const dateValue = getPickupDateForFilter(route) || '2099-12-31';
-    const timeValue = getPickupTimeValue(route) || '00:00';
-    return new Date(`${dateValue}T${String(timeValue).trim() || '00:00'}`);
-};
 
 // === HELPERS: MAPA SEGURO Y SNAP TO ROUTE ===
 const toFiniteNumber = (value) => {
