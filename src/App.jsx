@@ -31,6 +31,37 @@ const getDistanceMeters = (p1, p2) => {
     return R * c;
 };
 
+// HELPER: ETA estable sin DirectionsService.
+// En Android WebView, recalcular DirectionsService cada pocos segundos puede volver inestable el canvas de Google Maps.
+// Usamos distancia directa para mantener la navegación estable y el trazo oficial del despachador como referencia visual.
+const estimateMinutesFromMeters = (meters, avgKmh = 28) => {
+    const n = Number(meters);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    const minutes = (n / 1000) / avgKmh * 60;
+    return Math.max(1, Math.round(minutes));
+};
+
+const getRemainingStraightDistanceMeters = (origin, targets, startIndex) => {
+    const validOrigin = origin && Number.isFinite(Number(origin.lat)) && Number.isFinite(Number(origin.lng))
+        ? { lat: Number(origin.lat), lng: Number(origin.lng) }
+        : null;
+
+    if (!validOrigin || !Array.isArray(targets) || targets.length === 0) return 0;
+
+    let total = 0;
+    let cursor = validOrigin;
+
+    for (let i = startIndex; i < targets.length; i++) {
+        const target = targets[i];
+        if (!target || !Number.isFinite(Number(target.lat)) || !Number.isFinite(Number(target.lng))) continue;
+        const next = { lat: Number(target.lat), lng: Number(target.lng) };
+        total += getDistanceMeters(cursor, next);
+        cursor = next;
+    }
+
+    return total;
+};
+
 // === NUEVOS HELPERS: FORZAR HORA MÉXICO CENTRAL ===
 const getMexicoTime = () => new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' });
 const getMexicoDate = () => new Date().toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' });
@@ -376,7 +407,9 @@ function App() {
 
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const mapRef = useRef(null);
-  const [mapRenderKey, setMapRenderKey] = useState(0);
+  const [mapRenderKey] = useState(0); // Se conserva para compatibilidad, pero ya no forzamos remounts del mapa.
+  const lastCameraMoveRef = useRef(0);
+  const lastDriverLocationWriteRef = useRef(0);
   
   const [userLocation, setUserLocation] = useState(null);
   const [userHeading, setUserHeading] = useState(0); 
@@ -413,25 +446,31 @@ function App() {
       }
   }, []);
 
-  // Recupera el mapa al volver de segundo plano o al regresar desde navegación externa.
-  // Esto evita la pantalla negra en Android/PWA cuando Google Maps pierde el canvas.
+  // Recuperación segura al volver de segundo plano.
+  // Importante: NO desmontamos ni remontamos el componente GoogleMap.
+  // En Android WebView, remount + GPS + Firestore puede provocar pantalla negra.
   useEffect(() => {
-      const recoverMap = () => {
-          mapRef.current = null;
-          setMapRenderKey(k => k + 1);
+      const resumeMapSafely = () => {
           setRouteUpdateTick(t => t + 1);
+
+          setTimeout(() => {
+              const loc = latestLocRef.current;
+              if (mapRef.current && loc) {
+                  safeSetMapCamera(mapRef.current, loc, 0, 17);
+              }
+          }, 350);
       };
 
       const onVisibilityChange = () => {
-          if (document.visibilityState === 'visible') recoverMap();
+          if (document.visibilityState === 'visible') resumeMapSafely();
       };
 
       document.addEventListener('visibilitychange', onVisibilityChange);
-      window.addEventListener('pageshow', recoverMap);
+      window.addEventListener('pageshow', resumeMapSafely);
 
       return () => {
           document.removeEventListener('visibilitychange', onVisibilityChange);
-          window.removeEventListener('pageshow', recoverMap);
+          window.removeEventListener('pageshow', resumeMapSafely);
       };
   }, []);
 
@@ -551,7 +590,7 @@ function App() {
               }
           }
       }
-  }, [isLoaded, selectedRoute?.id, selectedRoute?.status, mapRenderKey]); 
+  }, [isLoaded, selectedRoute?.id, selectedRoute?.status]); 
 
   // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
@@ -635,8 +674,7 @@ function App() {
           },
           (error) => {
               console.error("Error crítico de hardware GPS:", error);
-              // Si el GPS falla al regresar de otra app, reintentamos montar el mapa.
-              setMapRenderKey(k => k + 1);
+              setRouteUpdateTick(t => t + 1);
           },
           { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 }
         );
@@ -657,9 +695,15 @@ function App() {
 
   useEffect(() => {
       if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta' && snappedLocation) {
-          safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 18);
+          const now = Date.now();
+
+          // Throttle de cámara: mover el mapa en cada pulso de GPS puede colgar Android WebView.
+          if (now - lastCameraMoveRef.current > 2000) {
+              safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
+              lastCameraMoveRef.current = now;
+          }
       }
-  }, [snappedLocation, selectedRoute?.status, userHeading, mapRenderKey]);
+  }, [snappedLocation, selectedRoute?.status, userHeading]);
 
   useEffect(() => {
       if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
@@ -690,102 +734,61 @@ function App() {
   }, [selectedRoute?.status]);
 
   useEffect(() => {
-      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0 || !isLoaded || !window.google?.maps) return;
+      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
 
       const loc = normalizePoint(latestLocRef.current);
       if (!loc) return;
 
-      const updateLiveRoute = async () => {
-          try {
-              const directionsService = new window.google.maps.DirectionsService();
-              const origin = { lat: loc.lat, lng: loc.lng };
-              const destinationPoint = normalizePoint(allTargets[allTargets.length - 1]);
+      const currentTarget = normalizePoint(allTargets[nextStopIdx]);
+      if (!currentTarget) return;
 
-              if (!destinationPoint) return;
+      const nextDistMeters = getDistanceMeters(loc, currentTarget);
+      const remainingDistMeters = getRemainingStraightDistanceMeters(loc, allTargets, nextStopIdx);
 
-              const destination = { lat: destinationPoint.lat, lng: destinationPoint.lng };
-              const waypts = [];
+      const nextDurMins = estimateMinutesFromMeters(nextDistMeters);
+      const totalDurMins = estimateMinutesFromMeters(remainingDistMeters);
 
-              for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
-                  const targetPoint = normalizePoint(allTargets[i]);
-                  if (targetPoint) {
-                      waypts.push({
-                          location: { lat: targetPoint.lat, lng: targetPoint.lng },
-                          stopover: true
-                      });
-                  }
+      setLiveRouteData(prev => ({
+          // Mantener la geometría vacía evita redibujos pesados. El mapa usa la ruta oficial guardada por despacho.
+          geometry: [],
+          totalDuration: totalDurMins,
+          totalDistance: (remainingDistMeters / 1000).toFixed(1),
+          nextStopDuration: nextDurMins,
+          nextStopDistance: (nextDistMeters / 1000).toFixed(1)
+      }));
+
+      // No usamos DirectionsService ni pasos turn-by-turn en esta versión estable.
+      // El objetivo es evitar pantalla negra en Android WebView.
+      setNextManeuver({ instruction: '', distance: '' });
+
+      let proximityUpdate = {};
+      if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
+          setAlertedStops(prev => [...prev, nextStopIdx]);
+          setIsApproaching(true);
+          proximityUpdate = {
+              proximityAlert: {
+                  active: true,
+                  stopIndex: nextStopIdx,
+                  passenger: allTargets[nextStopIdx]?.contact || 'Pasajero',
+                  etaMins: nextDurMins,
+                  timestamp: new Date().toISOString()
               }
+          };
+      }
 
-              directionsService.route({
-                  origin,
-                  destination,
-                  waypoints: waypts,
-                  travelMode: window.google.maps.TravelMode.DRIVING
-              }, async (result, status) => {
-                  if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) return;
+      const now = Date.now();
 
-                  const r = result.routes[0];
-                  const geo = normalizePath(r.overview_path.map(p => ({ lat: p.lat(), lng: p.lng() })));
+      // Throttle Firestore: demasiadas escrituras + mapa activo puede volver inestable la APK.
+      if (now - lastDriverLocationWriteRef.current > 10000 || Object.keys(proximityUpdate).length > 0) {
+          lastDriverLocationWriteRef.current = now;
 
-                  let totalDistMeters = 0;
-                  let totalDurSecs = 0;
-
-                  r.legs.forEach(leg => {
-                      totalDistMeters += leg.distance?.value || 0;
-                      totalDurSecs += leg.duration?.value || 0;
-                  });
-
-                  const newTotalDist = (totalDistMeters / 1000).toFixed(1);
-                  const newTotalDur = Math.round(totalDurSecs / 60);
-                  const nextDistMeters = r.legs.length > 0 ? (r.legs[0].distance?.value || 0) : 0;
-                  const nextDurMins = r.legs.length > 0 ? Math.round((r.legs[0].duration?.value || 0) / 60) : 0;
-
-                  if (r.legs.length > 0 && r.legs[0].steps && r.legs[0].steps.length > 0) {
-                      const currentStep = r.legs[0].steps[0];
-                      setNextManeuver({
-                          instruction: currentStep.instructions || '',
-                          distance: currentStep.distance?.text || ''
-                      });
-                  }
-
-                  setLiveRouteData({
-                      geometry: geo,
-                      totalDuration: newTotalDur,
-                      totalDistance: newTotalDist,
-                      nextStopDuration: nextDurMins,
-                      nextStopDistance: (nextDistMeters / 1000).toFixed(1)
-                  });
-
-                  let proximityUpdate = {};
-                  if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
-                      setAlertedStops(prev => [...prev, nextStopIdx]);
-                      setIsApproaching(true);
-                      proximityUpdate = {
-                          proximityAlert: {
-                              active: true,
-                              stopIndex: nextStopIdx,
-                              passenger: allTargets[nextStopIdx]?.contact || 'Pasajero',
-                              etaMins: nextDurMins,
-                              timestamp: new Date().toISOString()
-                          }
-                      };
-                  }
-
-                  // No sobreescribimos technicalData.geometry porque es la ruta planificada del despachador.
-                  await updateDoc(doc(db, "rutas", selectedRoute.id), {
-                      currentLocation: loc,
-                      lastUpdate: new Date().toISOString(),
-                      liveRouteGeometry: geo,
-                      ...proximityUpdate
-                  });
-              });
-          } catch (e) {
-              console.error('Error recalculando ruta en vivo:', e);
-          }
-      };
-
-      updateLiveRoute();
-  }, [routeUpdateTick, nextStopIdx, selectedRoute?.id, selectedRoute?.status, allTargets, isLoaded, alertedStops]);
+          updateDoc(doc(db, "rutas", selectedRoute.id), {
+              currentLocation: loc,
+              lastUpdate: new Date().toISOString(),
+              ...proximityUpdate
+          }).catch(e => console.error('Error actualizando ubicación en vivo:', e));
+      }
+  }, [routeUpdateTick, userLocation, nextStopIdx, selectedRoute?.id, selectedRoute?.status, allTargets, alertedStops]);
 
   const centerOnUser = () => {
       setIsTracking(true);
@@ -810,7 +813,6 @@ function App() {
       odometerLocRef.current = null;
       prevLocRef.current = null;
       mapRef.current = null;
-      setMapRenderKey(k => k + 1);
       window.speechSynthesis.cancel();
   };
 
@@ -1024,7 +1026,6 @@ function App() {
       setIsWaiting(false);
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
       setNextManeuver({ instruction: '', distance: '' });
-      setMapRenderKey(k => k + 1);
 
       // Saludo inicial de voz
       if (voiceEnabled) {
@@ -1222,7 +1223,7 @@ function App() {
                   ) : (
                       <>
                         <GoogleMap
-                            key={`nav-map-${selectedRoute.id}-${mapRenderKey}`}
+                            key={`nav-map-${selectedRoute.id}`}
                             mapContainerStyle={containerStyle}
                             center={safeMapCenter}
                             zoom={isTracking ? 18 : 16}
@@ -1240,16 +1241,7 @@ function App() {
                             {snappedLocation && (
                                 <Marker
                                     position={snappedLocation}
-                                    icon={{
-                                        path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-                                        scale: 6,
-                                        fillColor: "#22c55e",
-                                        fillOpacity: 1,
-                                        strokeWeight: 2,
-                                        strokeColor: "white",
-                                        rotation: Number.isFinite(Number(userHeading)) ? Number(userHeading) : 0,
-                                        anchor: new window.google.maps.Point(0, 2.5)
-                                    }}
+                                    icon={ICON_START}
                                     zIndex={999}
                                 />
                             )}
