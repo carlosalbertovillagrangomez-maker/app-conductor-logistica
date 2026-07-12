@@ -20,6 +20,40 @@ const ICON_START = "http://maps.google.com/mapfiles/ms/icons/green-dot.png";
 const ICON_WAYPOINT = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 const ICON_END = "http://maps.google.com/mapfiles/ms/icons/red-dot.png";
 
+
+const buildDriverIconSvg = (heading = 0) => {
+    const h = Number.isFinite(Number(heading)) ? Number(heading) : 0;
+    return `
+        <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+                <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+                    <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.35"/>
+                </filter>
+            </defs>
+            <circle cx="32" cy="32" r="26" fill="#ffffff" filter="url(#shadow)"/>
+            <circle cx="32" cy="32" r="21" fill="#f97316"/>
+            <g transform="rotate(${h} 32 32)">
+                <path d="M32 11 L46 42 L32 36 L18 42 Z" fill="#ffffff"/>
+                <path d="M32 17 L40 36 L32 32 L24 36 Z" fill="#0f172a" opacity="0.18"/>
+            </g>
+        </svg>
+    `;
+};
+
+const getDriverMarkerIcon = (heading = 0) => {
+    try {
+        if (!window.google?.maps) return ICON_START;
+        const svg = buildDriverIconSvg(heading);
+        return {
+            url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
+            scaledSize: new window.google.maps.Size(46, 46),
+            anchor: new window.google.maps.Point(23, 23)
+        };
+    } catch (e) {
+        return ICON_START;
+    }
+};
+
 // HELPER: Cálculo de distancia para la GEOCERCA
 const getDistanceMeters = (p1, p2) => {
     if (!p1 || !p2 || !p1.lat || !p2.lat) return 0;
@@ -60,6 +94,81 @@ const getRemainingStraightDistanceMeters = (origin, targets, startIndex) => {
     }
 
     return total;
+};
+
+
+const getDistanceAlongPathMeters = (path, fromIndex, toIndex) => {
+    const validPath = normalizePath(path);
+    if (validPath.length < 2) return 0;
+
+    const start = Math.max(0, Math.min(validPath.length - 1, fromIndex || 0));
+    const end = Math.max(0, Math.min(validPath.length - 1, toIndex ?? validPath.length - 1));
+    if (end <= start) return 0;
+
+    let total = 0;
+    for (let i = start; i < end; i++) {
+        total += getDistanceMeters(validPath[i], validPath[i + 1]);
+    }
+    return total;
+};
+
+const findClosestPathIndex = (point, path) => {
+    const validPoint = normalizePoint(point);
+    const validPath = normalizePath(path);
+    if (!validPoint || validPath.length === 0) return -1;
+
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+
+    validPath.forEach((candidate, index) => {
+        const d = getDistanceMeters(validPoint, candidate);
+        if (d < bestDistance) {
+            bestDistance = d;
+            bestIndex = index;
+        }
+    });
+
+    return bestIndex;
+};
+
+const getFallbackRouteMetrics = (origin, targets, nextIndex, plannedGeometry) => {
+    const loc = normalizePoint(origin);
+    const currentTarget = normalizePoint(targets?.[nextIndex]);
+    const geometry = normalizePath(plannedGeometry);
+
+    if (!loc || !currentTarget) {
+        return {
+            nextDistMeters: 0,
+            remainingDistMeters: 0,
+            nextDurMins: 0,
+            totalDurMins: 0
+        };
+    }
+
+    let nextDistMeters = getDistanceMeters(loc, currentTarget);
+    let remainingDistMeters = getRemainingStraightDistanceMeters(loc, targets, nextIndex);
+
+    if (geometry.length > 2) {
+        const locIdx = findClosestPathIndex(loc, geometry);
+        const targetIdx = findClosestPathIndex(currentTarget, geometry);
+        const finalTarget = normalizePoint(targets?.[targets.length - 1]);
+        const finalIdx = finalTarget ? findClosestPathIndex(finalTarget, geometry) : geometry.length - 1;
+
+        if (locIdx >= 0 && targetIdx >= 0 && targetIdx >= locIdx) {
+            nextDistMeters = Math.max(0, getDistanceAlongPathMeters(geometry, locIdx, targetIdx));
+        }
+
+        if (locIdx >= 0 && finalIdx >= locIdx) {
+            remainingDistMeters = Math.max(0, getDistanceAlongPathMeters(geometry, locIdx, finalIdx));
+        }
+    }
+
+    return {
+        nextDistMeters,
+        remainingDistMeters,
+        nextDurMins: estimateMinutesFromMeters(nextDistMeters),
+        totalDurMins: estimateMinutesFromMeters(remainingDistMeters)
+    };
 };
 
 // === NUEVOS HELPERS: FORZAR HORA MÉXICO CENTRAL ===
@@ -410,6 +519,9 @@ function App() {
   const [mapRenderKey] = useState(0); // Se conserva para compatibilidad, pero ya no forzamos remounts del mapa.
   const lastCameraMoveRef = useRef(0);
   const lastDriverLocationWriteRef = useRef(0);
+  const lastDirectionsRequestRef = useRef(0);
+  const directionsBusyRef = useRef(false);
+  const lastDirectionsStopRef = useRef(null);
   
   const [userLocation, setUserLocation] = useState(null);
   const [userHeading, setUserHeading] = useState(0); 
@@ -686,12 +798,20 @@ function App() {
     };
   }, [currentDriver, selectedRoute?.id, selectedRoute?.status, nextStopIdx]);
 
+  const driverLocationForMap = useMemo(() => {
+      return (
+          normalizePoint(userLocation) ||
+          normalizePoint(selectedRoute?.currentLocation) ||
+          normalizePoint(currentDriver?.currentLocation)
+      );
+  }, [userLocation, selectedRoute?.currentLocation, currentDriver?.currentLocation]);
+
   const snappedLocation = useMemo(() => {
       const liveGeometry = normalizePath(liveRouteData.geometry);
       const savedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
       const geo = liveGeometry.length > 0 ? liveGeometry : savedGeometry;
-      return getSnappedLocation(userLocation, geo);
-  }, [userLocation, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
+      return getSnappedLocation(driverLocationForMap, geo);
+  }, [driverLocationForMap, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
 
   useEffect(() => {
       if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta' && snappedLocation) {
@@ -736,59 +856,143 @@ function App() {
   useEffect(() => {
       if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
 
-      const loc = normalizePoint(latestLocRef.current);
+      const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
       if (!loc) return;
 
-      const currentTarget = normalizePoint(allTargets[nextStopIdx]);
-      if (!currentTarget) return;
+      const plannedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
+      const fallbackMetrics = getFallbackRouteMetrics(loc, allTargets, nextStopIdx, plannedGeometry);
 
-      const nextDistMeters = getDistanceMeters(loc, currentTarget);
-      const remainingDistMeters = getRemainingStraightDistanceMeters(loc, allTargets, nextStopIdx);
+      const applyMetricsAndProximity = (metrics) => {
+          const nextDistMeters = Number(metrics.nextDistMeters) || 0;
+          const remainingDistMeters = Number(metrics.remainingDistMeters) || 0;
+          const nextDurMins = Number(metrics.nextDurMins) || 0;
+          const totalDurMins = Number(metrics.totalDurMins) || 0;
 
-      const nextDurMins = estimateMinutesFromMeters(nextDistMeters);
-      const totalDurMins = estimateMinutesFromMeters(remainingDistMeters);
+          setLiveRouteData({
+              // Mantenemos geometry vacío para no redibujar rutas dinámicas pesadas en Android.
+              // El mapa sigue mostrando la ruta oficial enviada por el despachador.
+              geometry: [],
+              totalDuration: totalDurMins,
+              totalDistance: (remainingDistMeters / 1000).toFixed(1),
+              nextStopDuration: nextDurMins,
+              nextStopDistance: (nextDistMeters / 1000).toFixed(1)
+          });
 
-      setLiveRouteData(prev => ({
-          // Mantener la geometría vacía evita redibujos pesados. El mapa usa la ruta oficial guardada por despacho.
-          geometry: [],
-          totalDuration: totalDurMins,
-          totalDistance: (remainingDistMeters / 1000).toFixed(1),
-          nextStopDuration: nextDurMins,
-          nextStopDistance: (nextDistMeters / 1000).toFixed(1)
-      }));
+          let proximityUpdate = {};
+          if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
+              setAlertedStops(prev => [...prev, nextStopIdx]);
+              setIsApproaching(true);
+              proximityUpdate = {
+                  proximityAlert: {
+                      active: true,
+                      stopIndex: nextStopIdx,
+                      passenger: allTargets[nextStopIdx]?.contact || 'Pasajero',
+                      etaMins: nextDurMins,
+                      timestamp: new Date().toISOString()
+                  }
+              };
+          }
 
-      // No usamos DirectionsService ni pasos turn-by-turn en esta versión estable.
-      // El objetivo es evitar pantalla negra en Android WebView.
-      setNextManeuver({ instruction: '', distance: '' });
+          const now = Date.now();
+          if (now - lastDriverLocationWriteRef.current > 10000 || Object.keys(proximityUpdate).length > 0) {
+              lastDriverLocationWriteRef.current = now;
+              updateDoc(doc(db, "rutas", selectedRoute.id), {
+                  currentLocation: loc,
+                  lastUpdate: new Date().toISOString(),
+                  ...proximityUpdate
+              }).catch(e => console.error('Error actualizando ubicación en vivo:', e));
+          }
+      };
 
-      let proximityUpdate = {};
-      if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
-          setAlertedStops(prev => [...prev, nextStopIdx]);
-          setIsApproaching(true);
-          proximityUpdate = {
-              proximityAlert: {
-                  active: true,
-                  stopIndex: nextStopIdx,
-                  passenger: allTargets[nextStopIdx]?.contact || 'Pasajero',
-                  etaMins: nextDurMins,
-                  timestamp: new Date().toISOString()
-              }
-          };
-      }
+      // Fallback inmediato para que la UI siempre tenga km/min aunque Google tarde o falle.
+      applyMetricsAndProximity(fallbackMetrics);
+
+      if (!isLoaded || !window.google?.maps?.DirectionsService || directionsBusyRef.current) return;
 
       const now = Date.now();
+      const shouldRequestDirections =
+          lastDirectionsStopRef.current !== nextStopIdx ||
+          now - lastDirectionsRequestRef.current > 25000;
 
-      // Throttle Firestore: demasiadas escrituras + mapa activo puede volver inestable la APK.
-      if (now - lastDriverLocationWriteRef.current > 10000 || Object.keys(proximityUpdate).length > 0) {
-          lastDriverLocationWriteRef.current = now;
+      if (!shouldRequestDirections) return;
 
-          updateDoc(doc(db, "rutas", selectedRoute.id), {
-              currentLocation: loc,
-              lastUpdate: new Date().toISOString(),
-              ...proximityUpdate
-          }).catch(e => console.error('Error actualizando ubicación en vivo:', e));
+      lastDirectionsStopRef.current = nextStopIdx;
+      lastDirectionsRequestRef.current = now;
+      directionsBusyRef.current = true;
+
+      try {
+          const destinationPoint = normalizePoint(allTargets[allTargets.length - 1]);
+          if (!destinationPoint) {
+              directionsBusyRef.current = false;
+              return;
+          }
+
+          const waypoints = [];
+          for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
+              const p = normalizePoint(allTargets[i]);
+              if (p) {
+                  waypoints.push({
+                      location: { lat: p.lat, lng: p.lng },
+                      stopover: true
+                  });
+              }
+          }
+
+          const directionsService = new window.google.maps.DirectionsService();
+          directionsService.route({
+              origin: { lat: loc.lat, lng: loc.lng },
+              destination: { lat: destinationPoint.lat, lng: destinationPoint.lng },
+              waypoints,
+              optimizeWaypoints: false,
+              travelMode: window.google.maps.TravelMode.DRIVING
+          }, (result, status) => {
+              directionsBusyRef.current = false;
+
+              if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
+                  console.warn('DirectionsService no disponible:', status);
+                  return;
+              }
+
+              const route = result.routes[0];
+              const legs = route.legs || [];
+              let remainingMeters = 0;
+              let remainingSeconds = 0;
+
+              legs.forEach(leg => {
+                  remainingMeters += leg.distance?.value || 0;
+                  remainingSeconds += leg.duration?.value || 0;
+              });
+
+              const firstLeg = legs[0];
+              const nextDistMeters = firstLeg?.distance?.value || fallbackMetrics.nextDistMeters;
+              const nextDurMins = Math.max(1, Math.round((firstLeg?.duration?.value || 0) / 60)) || fallbackMetrics.nextDurMins;
+              const totalDurMins = Math.max(1, Math.round(remainingSeconds / 60)) || fallbackMetrics.totalDurMins;
+
+              applyMetricsAndProximity({
+                  nextDistMeters,
+                  remainingDistMeters: remainingMeters || fallbackMetrics.remainingDistMeters,
+                  nextDurMins,
+                  totalDurMins
+              });
+
+              const firstStep = firstLeg?.steps?.[0];
+              if (firstStep) {
+                  setNextManeuver({
+                      instruction: firstStep.instructions || '',
+                      distance: firstStep.distance?.text || ''
+                  });
+              } else {
+                  setNextManeuver({
+                      instruction: 'Continúa hacia el siguiente punto',
+                      distance: firstLeg?.distance?.text || ''
+                  });
+              }
+          });
+      } catch (e) {
+          directionsBusyRef.current = false;
+          console.error('Error consultando indicaciones:', e);
       }
-  }, [routeUpdateTick, userLocation, nextStopIdx, selectedRoute?.id, selectedRoute?.status, allTargets, alertedStops]);
+  }, [routeUpdateTick, driverLocationForMap, nextStopIdx, selectedRoute?.id, selectedRoute?.status, selectedRoute?.technicalData?.geometry, allTargets, alertedStops, isLoaded]);
 
   const centerOnUser = () => {
       setIsTracking(true);
@@ -1081,6 +1285,11 @@ function App() {
     setLoading(false);
   };
 
+  const driverMarkerIcon = useMemo(() => {
+      if (!isLoaded || !window.google?.maps) return ICON_START;
+      return getDriverMarkerIcon(userHeading);
+  }, [isLoaded, userHeading]);
+
   if (!isReady) return null;
 
   const theme = { bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900', card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200', input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-orange-500 shadow-sm' };
@@ -1241,11 +1450,20 @@ function App() {
                             {snappedLocation && (
                                 <Marker
                                     position={snappedLocation}
-                                    icon={ICON_START}
-                                    zIndex={999}
+                                    icon={driverMarkerIcon}
+                                    title="Tu ubicación actual"
+                                    label={{ text: ' ', fontSize: '1px' }}
+                                    zIndex={9999}
                                 />
                             )}
                         </GoogleMap>
+
+                        {!snappedLocation && (
+                            <div className="absolute top-4 left-4 right-4 z-20 bg-white/95 border border-orange-200 rounded-2xl px-4 py-3 shadow-lg text-center">
+                                <p className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Esperando GPS del conductor</p>
+                                <p className="text-xs font-bold text-slate-600 mt-1">Activa ubicación precisa y permisos de localización para ver el carrito en el mapa.</p>
+                            </div>
+                        )}
                         
                         {snappedLocation && (
                             <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-orange-500 text-white border-orange-600' : 'bg-white text-orange-500 border-slate-200 active:bg-orange-50'}`}>
