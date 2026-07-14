@@ -13,41 +13,56 @@ import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, 
 import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
 const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
 const containerStyle = { width: '100%', height: '100%' };
-const centerMX = { lat: 19.4326, lng: -99.1332 }; 
-const libraries = ['places', 'geometry']; 
+const centerMX = { lat: 19.4326, lng: -99.1332 };
+const libraries = ['places', 'geometry'];
 
-const ICON_START = "http://maps.google.com/mapfiles/ms/icons/green-dot.png";
-const ICON_WAYPOINT = "http://maps.google.com/mapfiles/ms/icons/blue-dot.png";
-const ICON_END = "http://maps.google.com/mapfiles/ms/icons/red-dot.png";
+const ICON_START = "https://maps.google.com/mapfiles/ms/icons/green-dot.png";
+const ICON_WAYPOINT = "https://maps.google.com/mapfiles/ms/icons/blue-dot.png";
+const ICON_END = "https://maps.google.com/mapfiles/ms/icons/red-dot.png";
 
-
-const buildDriverIconSvg = (heading = 0) => {
-    const h = Number.isFinite(Number(heading)) ? Number(heading) : 0;
-    return `
-        <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-            <defs>
-                <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-                    <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.35"/>
-                </filter>
-            </defs>
-            <circle cx="32" cy="32" r="26" fill="#ffffff" filter="url(#shadow)"/>
-            <circle cx="32" cy="32" r="21" fill="#f97316"/>
-            <g transform="rotate(${h} 32 32)">
-                <path d="M32 11 L46 42 L32 36 L18 42 Z" fill="#ffffff"/>
-                <path d="M32 17 L40 36 L32 32 L24 36 Z" fill="#0f172a" opacity="0.18"/>
-            </g>
-        </svg>
-    `;
+const NAV_MAP_OPTIONS = {
+    disableDefaultUI: true,
+    gestureHandling: "greedy",
+    backgroundColor: "#e2e8f0",
+    clickableIcons: false,
+    keyboardShortcuts: false,
+    mapTypeControl: false,
+    fullscreenControl: false,
+    streetViewControl: false,
+    rotateControl: false
 };
 
-const getDriverMarkerIcon = (heading = 0) => {
+const NAV_POLYLINE_OPTIONS = {
+    strokeColor: "#f97316",
+    strokeOpacity: 0.92,
+    strokeWeight: 6
+};
+
+
+const DRIVER_MARKER_SVG = `
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="s" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <circle cx="32" cy="32" r="27" fill="#ffffff" filter="url(#s)"/>
+  <circle cx="32" cy="32" r="22" fill="#f97316"/>
+  <path d="M20 35h24l-2.5-9.5c-.6-2.1-2.5-3.5-4.7-3.5h-9.6c-2.2 0-4.1 1.4-4.7 3.5L20 35Z" fill="#ffffff"/>
+  <rect x="18" y="33" width="28" height="10" rx="4" fill="#ffffff"/>
+  <circle cx="24" cy="43" r="4" fill="#0f172a"/>
+  <circle cx="40" cy="43" r="4" fill="#0f172a"/>
+  <rect x="26" y="25" width="12" height="6" rx="2" fill="#bae6fd"/>
+  <path d="M32 10l5 8h-3v5h-4v-5h-3l5-8Z" fill="#ffffff"/>
+</svg>`;
+
+const getDriverMarkerIcon = () => {
     try {
         if (!window.google?.maps) return ICON_START;
-        const svg = buildDriverIconSvg(heading);
         return {
-            url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
-            scaledSize: new window.google.maps.Size(46, 46),
-            anchor: new window.google.maps.Point(23, 23)
+            url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(DRIVER_MARKER_SVG)}`,
+            scaledSize: new window.google.maps.Size(48, 48),
+            anchor: new window.google.maps.Point(24, 24)
         };
     } catch (e) {
         return ICON_START;
@@ -56,11 +71,19 @@ const getDriverMarkerIcon = (heading = 0) => {
 
 // HELPER: Cálculo de distancia para la GEOCERCA
 const getDistanceMeters = (p1, p2) => {
-    if (!p1 || !p2 || !p1.lat || !p2.lat) return 0;
-    const R = 6371e3; // Metros
-    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
-    const dLon = (p2.lng - p1.lng) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const aPoint = normalizePoint(p1);
+    const bPoint = normalizePoint(p2);
+    if (!aPoint || !bPoint) return 0;
+
+    const R = 6371e3;
+    const dLat = (bPoint.lat - aPoint.lat) * Math.PI / 180;
+    const dLon = (bPoint.lng - aPoint.lng) * Math.PI / 180;
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(aPoint.lat * Math.PI / 180) *
+        Math.cos(bPoint.lat * Math.PI / 180) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 };
@@ -168,6 +191,91 @@ const getFallbackRouteMetrics = (origin, targets, nextIndex, plannedGeometry) =>
         remainingDistMeters,
         nextDurMins: estimateMinutesFromMeters(nextDistMeters),
         totalDurMins: estimateMinutesFromMeters(remainingDistMeters)
+    };
+};
+
+const downsamplePath = (path, maxPoints = 260) => {
+    const valid = normalizePath(path);
+    if (valid.length <= maxPoints) return valid;
+
+    const step = Math.ceil(valid.length / maxPoints);
+    const sampled = valid.filter((_, index) => index % step === 0);
+    const last = valid[valid.length - 1];
+
+    if (!sampled.length || sampled[sampled.length - 1].lat !== last.lat || sampled[sampled.length - 1].lng !== last.lng) {
+        sampled.push(last);
+    }
+
+    return sampled;
+};
+
+const stripHtml = (value = '') => String(value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+const formatInstructionDistance = (meters) => {
+    const value = Number(meters);
+    if (!Number.isFinite(value) || value <= 0) return '';
+
+    if (value >= 1000) {
+        return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)} km`;
+    }
+
+    const rounded = value > 300
+        ? Math.round(value / 100) * 100
+        : value > 100
+            ? Math.round(value / 50) * 50
+            : Math.max(10, Math.round(value / 10) * 10);
+
+    return `${rounded} m`;
+};
+
+const getVoiceDistanceBucket = (meters) => {
+    const value = Number(meters);
+    if (!Number.isFinite(value)) return 'far';
+    if (value <= 70) return '70';
+    if (value <= 180) return '180';
+    if (value <= 450) return '450';
+    if (value <= 900) return '900';
+    return 'far';
+};
+
+const getNextNavigationStep = (location, steps, startIndex = 0) => {
+    const loc = normalizePoint(location);
+    if (!loc || !Array.isArray(steps) || steps.length === 0) return null;
+
+    let bestIndex = 0;
+    let bestScore = Infinity;
+
+    const safeStart = Math.max(0, Math.min(steps.length - 1, Number(startIndex) || 0));
+    const searchFrom = Math.max(0, safeStart - 1);
+
+    for (let index = searchFrom; index < steps.length; index++) {
+        const step = steps[index];
+        const end = normalizePoint(step.end);
+        if (!end) continue;
+
+        const distance = getDistanceMeters(loc, end);
+        const passedPenalty = index < safeStart ? 2500 : 0;
+        const score = distance + passedPenalty;
+
+        if (score < bestScore) {
+            bestScore = score;
+            bestIndex = index;
+        }
+
+        // No necesitamos recorrer cientos de pasos lejanos.
+        if (index > safeStart + 25 && bestScore < 1500) break;
+    }
+
+    const selected = steps[bestIndex];
+    const endPoint = normalizePoint(selected?.end);
+    const meters = endPoint ? getDistanceMeters(loc, endPoint) : Number(selected?.distanceMeters) || 0;
+
+    return {
+        ...selected,
+        index: bestIndex,
+        meters,
+        distanceText: formatInstructionDistance(meters),
+        voiceKey: `${bestIndex}-${getVoiceDistanceBucket(meters)}`
     };
 };
 
@@ -426,17 +534,22 @@ const normalizePath = (path) => {
     return path.map(normalizePoint).filter(Boolean);
 };
 
-const safeSetMapCamera = (map, loc, heading = 0, zoom = 18) => {
-    if (!map || !loc) return;
-    try {
-        map.panTo(loc);
-        map.setZoom(zoom);
+const safeSetMapCamera = (map, loc, heading = 0, zoom = 17) => {
+    const validLoc = normalizePoint(loc);
+    if (!map || !validLoc) return;
 
-        // Importante: se evita forzar tilt/heading 3D.
-        // En algunos dispositivos Android/PWA el mapa vectorial con tilt al regresar de segundo plano
-        // puede quedarse negro. La flecha conserva la orientación del conductor.
-        if (typeof map.setTilt === 'function') map.setTilt(0);
-        if (typeof map.setHeading === 'function') map.setHeading(0);
+    try {
+        map.panTo({ lat: validLoc.lat, lng: validLoc.lng });
+
+        const currentZoom = Number(map.getZoom?.());
+        if (!Number.isFinite(currentZoom) || Math.abs(currentZoom - zoom) >= 2) {
+            map.setZoom(zoom);
+        }
+
+        // Nunca forzamos inclinación ni rotación del mapa en Android WebView.
+        // La orientación se comunica con el icono y las instrucciones, no girando el canvas.
+        if (typeof map.setTilt === 'function' && map.getTilt?.() !== 0) map.setTilt(0);
+        if (typeof map.setHeading === 'function' && map.getHeading?.() !== 0) map.setHeading(0);
     } catch (e) {
         console.error('No se pudo ajustar la cámara del mapa:', e);
     }
@@ -516,12 +629,24 @@ function App() {
 
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
   const mapRef = useRef(null);
-  const [mapRenderKey] = useState(0); // Se conserva para compatibilidad, pero ya no forzamos remounts del mapa.
+  const [mapRenderKey] = useState(0); // Se mantiene únicamente para la vista previa.
+  const mapReadyRef = useRef(false);
   const lastCameraMoveRef = useRef(0);
   const lastDriverLocationWriteRef = useRef(0);
   const lastDirectionsRequestRef = useRef(0);
+  const lastDirectionsOriginRef = useRef(null);
   const directionsBusyRef = useRef(false);
+  const directionsServiceRef = useRef(null);
+  const directionsRequestIdRef = useRef(0);
   const lastDirectionsStopRef = useRef(null);
+  const navigationStepsRef = useRef([]);
+  const navigationStepIndexRef = useRef(0);
+  const navigationGeometryRef = useRef([]);
+  const lastUiLocationRef = useRef({ loc: null, timestamp: 0 });
+  const pendingDistanceKmRef = useRef(0);
+  const pendingRoutePointsRef = useRef([]);
+  const telemetryBusyRef = useRef(false);
+  const routeListenerUnsubscribeRef = useRef(null);
   
   const [userLocation, setUserLocation] = useState(null);
   const [userHeading, setUserHeading] = useState(0); 
@@ -543,46 +668,74 @@ function App() {
   // === ESTADOS PARA EL ASISTENTE DE NAVEGACIÓN Y VOZ ===
   const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
   const [voiceEnabled, setVoiceEnabled] = useState(true);
-  const lastSpokenRef = useRef('');
+  const lastSpokenRef = useRef(null);
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
 
   const handleMapLoad = useCallback((map) => {
       mapRef.current = map;
+      mapReadyRef.current = true;
+
       try {
           if (typeof map.setTilt === 'function') map.setTilt(0);
           if (typeof map.setHeading === 'function') map.setHeading(0);
+
+          setTimeout(() => {
+              try {
+                  if (window.google?.maps?.event) {
+                      window.google.maps.event.trigger(map, 'resize');
+                  }
+
+                  const loc = normalizePoint(latestLocRef.current);
+                  if (loc) safeSetMapCamera(map, loc, 0, 17);
+              } catch (e) {
+                  console.warn('No se pudo refrescar el mapa al cargar:', e);
+              }
+          }, 250);
       } catch (e) {
           console.error('Error inicializando mapa:', e);
       }
   }, []);
 
+  const handleMapUnmount = useCallback((map) => {
+      if (mapRef.current === map) {
+          mapRef.current = null;
+          mapReadyRef.current = false;
+      }
+  }, []);
+
   // Recuperación segura al volver de segundo plano.
-  // Importante: NO desmontamos ni remontamos el componente GoogleMap.
-  // En Android WebView, remount + GPS + Firestore puede provocar pantalla negra.
+  // No cambia estados, no remonta el mapa y no dispara una nueva ruta automáticamente.
   useEffect(() => {
       const resumeMapSafely = () => {
-          setRouteUpdateTick(t => t + 1);
+          if (document.visibilityState && document.visibilityState !== 'visible') return;
 
           setTimeout(() => {
-              const loc = latestLocRef.current;
-              if (mapRef.current && loc) {
-                  safeSetMapCamera(mapRef.current, loc, 0, 17);
+              const map = mapRef.current;
+              if (!map) return;
+
+              try {
+                  if (window.google?.maps?.event) {
+                      window.google.maps.event.trigger(map, 'resize');
+                  }
+
+                  const loc = normalizePoint(latestLocRef.current);
+                  if (loc) safeSetMapCamera(map, loc, 0, 17);
+              } catch (e) {
+                  console.warn('No se pudo recuperar el mapa:', e);
               }
-          }, 350);
+          }, 450);
       };
 
-      const onVisibilityChange = () => {
-          if (document.visibilityState === 'visible') resumeMapSafely();
-      };
-
-      document.addEventListener('visibilitychange', onVisibilityChange);
+      document.addEventListener('visibilitychange', resumeMapSafely);
       window.addEventListener('pageshow', resumeMapSafely);
+      window.addEventListener('focus', resumeMapSafely);
 
       return () => {
-          document.removeEventListener('visibilitychange', onVisibilityChange);
+          document.removeEventListener('visibilitychange', resumeMapSafely);
           window.removeEventListener('pageshow', resumeMapSafely);
+          window.removeEventListener('focus', resumeMapSafely);
       };
   }, []);
 
@@ -592,19 +745,34 @@ function App() {
 
   // === LÓGICA DEL NARRADOR (TEXT-TO-SPEECH) ===
   useEffect(() => {
-      if (voiceEnabled && nextManeuver.instruction) {
-          const cleanText = nextManeuver.instruction.replace(/<[^>]*>?/gm, '');
-          const textToSpeak = `${nextManeuver.distance}. ${cleanText}`;
+      if (!voiceEnabled || !nextManeuver.instruction || !('speechSynthesis' in window)) return;
 
-          if (lastSpokenRef.current !== textToSpeak) {
-              window.speechSynthesis.cancel(); 
-              const utterance = new SpeechSynthesisUtterance(textToSpeak);
-              utterance.lang = 'es-MX'; 
-              utterance.rate = 0.95; 
-              
-              window.speechSynthesis.speak(utterance);
-              lastSpokenRef.current = textToSpeak;
+      const cleanText = stripHtml(nextManeuver.instruction);
+      if (!cleanText) return;
+
+      const voiceKey = nextManeuver.voiceKey || `${cleanText}-${nextManeuver.distance}`;
+      if (lastSpokenRef.current?.key === voiceKey) return;
+
+      const now = Date.now();
+      const isUrgent = ['70', '180'].some(bucket => String(voiceKey).endsWith(`-${bucket}`));
+      if (!isUrgent && lastSpokenRef.current && now - (lastSpokenRef.current.timestamp || 0) < 8000) return;
+
+      try {
+          if (window.speechSynthesis.speaking) {
+              window.speechSynthesis.cancel();
           }
+
+          const utterance = new SpeechSynthesisUtterance(
+              `${nextManeuver.distance ? `${nextManeuver.distance}. ` : ''}${cleanText}`
+          );
+          utterance.lang = 'es-MX';
+          utterance.rate = 0.94;
+          utterance.volume = 1;
+
+          window.speechSynthesis.speak(utterance);
+          lastSpokenRef.current = { key: voiceKey, timestamp: now };
+      } catch (e) {
+          console.warn('Narración no disponible:', e);
       }
   }, [nextManeuver, voiceEnabled]);
 
@@ -619,6 +787,36 @@ function App() {
         }
     }
   }, [misRutas, selectedRoute]);
+
+
+  useEffect(() => {
+      if (!selectedRoute?.id || misRutas.length === 0) return;
+
+      const latest = misRutas.find(route => route.id === selectedRoute.id);
+      if (!latest) return;
+
+      const currentChatLength = selectedRoute.chat?.length || 0;
+      const latestChatLength = latest.chat?.length || 0;
+      const currentStatus = selectedRoute.status;
+      const latestStatus = latest.status;
+      const currentAlert = Boolean(selectedRoute.proximityAlert?.active);
+      const latestAlert = Boolean(latest.proximityAlert?.active);
+
+      if (
+          currentChatLength === latestChatLength &&
+          currentStatus === latestStatus &&
+          currentAlert === latestAlert
+      ) {
+          return;
+      }
+
+      setSelectedRoute(prev => prev ? {
+          ...prev,
+          status: latest.status,
+          chat: latest.chat || [],
+          proximityAlert: latest.proximityAlert || prev.proximityAlert
+      } : prev);
+  }, [misRutas, selectedRoute?.id, selectedRoute?.status, selectedRoute?.chat?.length, selectedRoute?.proximityAlert?.active]);
 
   // --- DETECCIÓN DE VIAJES ASIGNADOS MANUALMENTE DESDE EL DESPACHO ---
   useEffect(() => {
@@ -690,7 +888,7 @@ function App() {
   }, [selectedRoute]);
 
   useEffect(() => {
-      const geometry = normalizePath(selectedRoute?.technicalData?.geometry);
+      const geometry = downsamplePath(selectedRoute?.technicalData?.geometry, 220);
       if (isLoaded && mapRef.current && geometry.length > 0) {
           if (!userLocation || selectedRoute.status !== 'En Ruta') {
               try {
@@ -706,97 +904,100 @@ function App() {
 
   // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
-    let watchId;
+    let watchId = null;
 
-    if (currentDriver && (currentDriver.isOnline || (selectedRoute && selectedRoute.status === 'En Ruta'))) {
-      if ("geolocation" in navigator) {
-        watchId = navigator.geolocation.watchPosition(
-          async (position) => {
-            const loc = normalizePoint({
-                lat: position.coords.latitude,
-                lng: position.coords.longitude
-            });
-            const accuracy = Number(position.coords.accuracy) || 9999;
+    const shouldTrack = Boolean(
+        currentDriver &&
+        (currentDriver.isOnline || selectedRoute?.status === 'En Ruta')
+    );
 
-            // Prevención: nunca mandamos coordenadas inválidas al mapa.
-            if (!loc) return;
+    if (!shouldTrack || !('geolocation' in navigator)) return undefined;
 
+    watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const loc = normalizePoint({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+        });
+        if (!loc) return;
+
+        const now = Date.now();
+        const accuracy = Number(position.coords.accuracy) || 9999;
+        const previousUiLoc = normalizePoint(lastUiLocationRef.current.loc);
+        const movedForUi = previousUiLoc ? getDistanceMeters(previousUiLoc, loc) : Infinity;
+
+        // La referencia se actualiza siempre; React solo se actualiza a una frecuencia controlada.
+        latestLocRef.current = loc;
+
+        if (
+            !previousUiLoc ||
+            movedForUi >= 2.5 ||
+            now - lastUiLocationRef.current.timestamp >= 1500
+        ) {
+            lastUiLocationRef.current = { loc, timestamp: now };
             setUserLocation(loc);
+        }
 
-            // 1. Odómetro y Ruta Real con Filtros de Estabilización Anticlono
-            if (selectedRoute?.status === 'En Ruta' && window.google?.maps?.geometry) {
-                if (accuracy > 35) return;
+        // Rumbo estable sin girar el canvas del mapa.
+        const previousHeadingLoc = normalizePoint(prevLocRef.current);
+        if (previousHeadingLoc && window.google?.maps?.geometry) {
+            const p1 = new window.google.maps.LatLng(previousHeadingLoc.lat, previousHeadingLoc.lng);
+            const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
+            const moved = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
 
-                if (nextStopIdx > 0) {
-                    if (!odometerLocRef.current) {
-                        odometerLocRef.current = loc;
-                    } else {
-                        const p1 = new window.google.maps.LatLng(odometerLocRef.current.lat, odometerLocRef.current.lng);
-                        const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
-                        const distMeters = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-
-                        if (distMeters > 20 && distMeters < 350) {
-                            const distKm = distMeters / 1000;
-                            try {
-                                await updateDoc(doc(db, "rutas", selectedRoute.id), {
-                                    realDistanceDriven: increment(distKm),
-                                    rutaReal: arrayUnion(loc)
-                                });
-                            } catch(e) {
-                                console.error("Error telemétrico:", e);
-                            }
-                            odometerLocRef.current = loc;
-                        }
-                    }
+            if (moved >= 5) {
+                let newHeading = Number(position.coords.heading);
+                if (!Number.isFinite(newHeading) || Number(position.coords.speed) < 1) {
+                    newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
                 }
-            }
 
-            // 2. Filtro estabilizador para brújula y rotación de flecha.
-            // Importante: ya no reiniciamos el watcher en cada cambio de heading.
-            if (prevLocRef.current && window.google?.maps?.geometry) {
-                const p1 = new window.google.maps.LatLng(prevLocRef.current.lat, prevLocRef.current.lng);
-                const p2 = new window.google.maps.LatLng(loc.lat, loc.lng);
-                const distForHeading = window.google.maps.geometry.spherical.computeDistanceBetween(p1, p2);
-
-                if (distForHeading > 3) {
-                    let newHeading = position.coords.heading;
-
-                    if (newHeading === null || isNaN(newHeading) || (position.coords.speed !== null && position.coords.speed < 1)) {
-                        newHeading = window.google.maps.geometry.spherical.computeHeading(p1, p2);
-                    }
-
-                    if (newHeading !== null && !isNaN(newHeading)) {
-                        setUserHeading(newHeading);
-                    }
-
-                    prevLocRef.current = loc;
+                if (Number.isFinite(newHeading)) {
+                    const normalizedHeading = ((newHeading % 360) + 360) % 360;
+                    setUserHeading(Math.round(normalizedHeading / 10) * 10);
                 }
-            } else {
-                const initialHeading = Number(position.coords.heading);
-                setUserHeading(Number.isFinite(initialHeading) ? initialHeading : 0);
+
                 prevLocRef.current = loc;
             }
+        } else {
+            prevLocRef.current = loc;
+        }
 
-            // 3. Enviar ubicación de respaldo a Firebase
-            if (currentDriver.isOnline && (!selectedRoute || selectedRoute.status !== 'En Ruta')) {
-                try {
-                    await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc });
-                } catch(e){}
+        // Telemetría local: se acumula y se envía por lotes, no dentro de cada pulso GPS.
+        if (selectedRoute?.status === 'En Ruta' && accuracy <= 40) {
+            const previousOdometerLoc = normalizePoint(odometerLocRef.current);
+
+            if (!previousOdometerLoc) {
+                odometerLocRef.current = loc;
+            } else {
+                const movedMeters = getDistanceMeters(previousOdometerLoc, loc);
+
+                if (movedMeters >= 8 && movedMeters <= 350) {
+                    pendingDistanceKmRef.current += movedMeters / 1000;
+                    pendingRoutePointsRef.current.push(loc);
+
+                    if (pendingRoutePointsRef.current.length > 12) {
+                        pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-12);
+                    }
+
+                    odometerLocRef.current = loc;
+                }
             }
-          },
-          (error) => {
-              console.error("Error crítico de hardware GPS:", error);
-              setRouteUpdateTick(t => t + 1);
-          },
-          { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 }
-        );
+        }
+      },
+      (gpsError) => {
+          console.error('Error de GPS:', gpsError);
+      },
+      {
+          enableHighAccuracy: true,
+          maximumAge: 5000,
+          timeout: 20000
       }
-    }
+    );
 
     return () => {
-        if (watchId) navigator.geolocation.clearWatch(watchId);
+        if (watchId !== null) navigator.geolocation.clearWatch(watchId);
     };
-  }, [currentDriver, selectedRoute?.id, selectedRoute?.status, nextStopIdx]);
+  }, [currentDriver?.id, currentDriver?.isOnline, selectedRoute?.id, selectedRoute?.status]);
 
   const driverLocationForMap = useMemo(() => {
       return (
@@ -806,6 +1007,76 @@ function App() {
       );
   }, [userLocation, selectedRoute?.currentLocation, currentDriver?.currentLocation]);
 
+
+  // Envío por lotes de ubicación, odómetro y puntos reales para evitar saturar WebView/Firestore.
+  useEffect(() => {
+      if (!currentDriver || selectedRoute?.status !== 'En Ruta' || !selectedRoute?.id) return undefined;
+
+      const flushTelemetry = async () => {
+          if (telemetryBusyRef.current) return;
+
+          const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
+          if (!loc) return;
+
+          const now = Date.now();
+          if (now - lastDriverLocationWriteRef.current < 10000) return;
+
+          telemetryBusyRef.current = true;
+          lastDriverLocationWriteRef.current = now;
+
+          const distanceToFlush = pendingDistanceKmRef.current;
+          const pointsToFlush = pendingRoutePointsRef.current.slice(-10);
+
+          try {
+              const payload = {
+                  currentLocation: loc,
+                  lastUpdate: new Date().toISOString()
+              };
+
+              if (distanceToFlush > 0) {
+                  payload.realDistanceDriven = increment(distanceToFlush);
+              }
+
+              if (pointsToFlush.length > 0) {
+                  payload.rutaReal = arrayUnion(...pointsToFlush);
+              }
+
+              await updateDoc(doc(db, 'rutas', selectedRoute.id), payload);
+
+              if (distanceToFlush > 0) {
+                  pendingDistanceKmRef.current = Math.max(
+                      0,
+                      pendingDistanceKmRef.current - distanceToFlush
+                  );
+              }
+
+              if (pointsToFlush.length > 0) {
+                  pendingRoutePointsRef.current = [];
+              }
+
+              if (currentDriver.isOnline) {
+                  updateDoc(doc(db, 'conductores', currentDriver.id), {
+                      currentLocation: loc,
+                      lastLocationUpdate: new Date().toISOString()
+                  }).catch(() => {});
+              }
+          } catch (e) {
+              console.error('Error enviando telemetría:', e);
+          } finally {
+              telemetryBusyRef.current = false;
+          }
+      };
+
+      flushTelemetry();
+      const interval = setInterval(flushTelemetry, 12000);
+      return () => clearInterval(interval);
+  }, [
+      currentDriver?.id,
+      currentDriver?.isOnline,
+      selectedRoute?.id,
+      selectedRoute?.status
+  ]);
+
   const snappedLocation = useMemo(() => {
       const liveGeometry = normalizePath(liveRouteData.geometry);
       const savedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
@@ -814,16 +1085,14 @@ function App() {
   }, [driverLocationForMap, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
 
   useEffect(() => {
-      if (isTrackingRef.current && mapRef.current && selectedRoute?.status === 'En Ruta' && snappedLocation) {
-          const now = Date.now();
+      if (!isTrackingRef.current || !mapRef.current || selectedRoute?.status !== 'En Ruta' || !snappedLocation) return;
 
-          // Throttle de cámara: mover el mapa en cada pulso de GPS puede colgar Android WebView.
-          if (now - lastCameraMoveRef.current > 2000) {
-              safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
-              lastCameraMoveRef.current = now;
-          }
-      }
-  }, [snappedLocation, selectedRoute?.status, userHeading]);
+      const now = Date.now();
+      if (now - lastCameraMoveRef.current < 2800) return;
+
+      safeSetMapCamera(mapRef.current, snappedLocation, 0, 17);
+      lastCameraMoveRef.current = now;
+  }, [snappedLocation, selectedRoute?.status]);
 
   useEffect(() => {
       if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
@@ -848,41 +1117,68 @@ function App() {
   };
 
   useEffect(() => {
-      if (selectedRoute?.status !== 'En Ruta') return;
-      const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 15000);
+      if (selectedRoute?.status !== 'En Ruta') return undefined;
+
+      setRouteUpdateTick(t => t + 1);
+      const interval = setInterval(() => setRouteUpdateTick(t => t + 1), 30000);
       return () => clearInterval(interval);
-  }, [selectedRoute?.status]);
+  }, [selectedRoute?.id, selectedRoute?.status]);
 
   useEffect(() => {
-      if (selectedRoute?.status !== 'En Ruta' || allTargets.length === 0) return;
+      if (
+          selectedRoute?.status !== 'En Ruta' ||
+          !selectedRoute?.id ||
+          allTargets.length === 0
+      ) return;
 
       const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
       if (!loc) return;
 
       const plannedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
-      const fallbackMetrics = getFallbackRouteMetrics(loc, allTargets, nextStopIdx, plannedGeometry);
+      const fallbackMetrics = getFallbackRouteMetrics(
+          loc,
+          allTargets,
+          nextStopIdx,
+          plannedGeometry
+      );
 
-      const applyMetricsAndProximity = (metrics) => {
-          const nextDistMeters = Number(metrics.nextDistMeters) || 0;
-          const remainingDistMeters = Number(metrics.remainingDistMeters) || 0;
-          const nextDurMins = Number(metrics.nextDurMins) || 0;
-          const totalDurMins = Number(metrics.totalDurMins) || 0;
+      const applyMetricsAndProximity = (metrics, geometry = null) => {
+          const nextDistMeters = Math.max(0, Number(metrics.nextDistMeters) || 0);
+          const remainingDistMeters = Math.max(0, Number(metrics.remainingDistMeters) || 0);
+          const nextDurMins = Math.max(0, Number(metrics.nextDurMins) || 0);
+          const totalDurMins = Math.max(0, Number(metrics.totalDurMins) || 0);
 
-          setLiveRouteData({
-              // Mantenemos geometry vacío para no redibujar rutas dinámicas pesadas en Android.
-              // El mapa sigue mostrando la ruta oficial enviada por el despachador.
-              geometry: [],
-              totalDuration: totalDurMins,
-              totalDistance: (remainingDistMeters / 1000).toFixed(1),
-              nextStopDuration: nextDurMins,
-              nextStopDistance: (nextDistMeters / 1000).toFixed(1)
+          setLiveRouteData(prev => {
+              const nextGeometry = geometry
+                  ? downsamplePath(geometry, 260)
+                  : prev.geometry;
+
+              const nextState = {
+                  geometry: nextGeometry,
+                  totalDuration: totalDurMins,
+                  totalDistance: (remainingDistMeters / 1000).toFixed(1),
+                  nextStopDuration: nextDurMins,
+                  nextStopDistance: (nextDistMeters / 1000).toFixed(1)
+              };
+
+              const same =
+                  prev.totalDuration === nextState.totalDuration &&
+                  prev.totalDistance === nextState.totalDistance &&
+                  prev.nextStopDuration === nextState.nextStopDuration &&
+                  prev.nextStopDistance === nextState.nextStopDistance &&
+                  prev.geometry === nextState.geometry;
+
+              return same ? prev : nextState;
           });
 
-          let proximityUpdate = {};
-          if ((nextDistMeters <= 500 || nextDurMins <= 2) && !alertedStops.includes(nextStopIdx)) {
-              setAlertedStops(prev => [...prev, nextStopIdx]);
+          if (
+              (nextDistMeters <= 500 || nextDurMins <= 2) &&
+              !alertedStops.includes(nextStopIdx)
+          ) {
+              setAlertedStops(prev => prev.includes(nextStopIdx) ? prev : [...prev, nextStopIdx]);
               setIsApproaching(true);
-              proximityUpdate = {
+
+              updateDoc(doc(db, 'rutas', selectedRoute.id), {
                   proximityAlert: {
                       active: true,
                       stopIndex: nextStopIdx,
@@ -890,114 +1186,213 @@ function App() {
                       etaMins: nextDurMins,
                       timestamp: new Date().toISOString()
                   }
-              };
-          }
-
-          const now = Date.now();
-          if (now - lastDriverLocationWriteRef.current > 10000 || Object.keys(proximityUpdate).length > 0) {
-              lastDriverLocationWriteRef.current = now;
-              updateDoc(doc(db, "rutas", selectedRoute.id), {
-                  currentLocation: loc,
-                  lastUpdate: new Date().toISOString(),
-                  ...proximityUpdate
-              }).catch(e => console.error('Error actualizando ubicación en vivo:', e));
+              }).catch(e => console.error('Error enviando alerta de proximidad:', e));
           }
       };
 
-      // Fallback inmediato para que la UI siempre tenga km/min aunque Google tarde o falle.
+      // La interfaz recibe datos inmediatamente sin esperar a Google.
       applyMetricsAndProximity(fallbackMetrics);
 
-      if (!isLoaded || !window.google?.maps?.DirectionsService || directionsBusyRef.current) return;
+      if (!isLoaded || !window.google?.maps?.DirectionsService || directionsBusyRef.current) {
+          return;
+      }
 
       const now = Date.now();
-      const shouldRequestDirections =
-          lastDirectionsStopRef.current !== nextStopIdx ||
-          now - lastDirectionsRequestRef.current > 25000;
+      const previousOrigin = normalizePoint(lastDirectionsOriginRef.current);
+      const movedSinceLastRoute = previousOrigin
+          ? getDistanceMeters(previousOrigin, loc)
+          : Infinity;
 
-      if (!shouldRequestDirections) return;
+      const stopChanged = lastDirectionsStopRef.current !== nextStopIdx;
+      const routeExpired = now - lastDirectionsRequestRef.current >= 60000;
+      const driverLeftRouteArea = movedSinceLastRoute >= 180;
 
-      lastDirectionsStopRef.current = nextStopIdx;
-      lastDirectionsRequestRef.current = now;
+      if (!stopChanged && !routeExpired && !driverLeftRouteArea) return;
+
+      if (!directionsServiceRef.current) {
+          directionsServiceRef.current = new window.google.maps.DirectionsService();
+      }
+
+      const destinationPoint = normalizePoint(allTargets[allTargets.length - 1]);
+      if (!destinationPoint) return;
+
+      const waypoints = [];
+      for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
+          const point = normalizePoint(allTargets[i]);
+          if (point) {
+              waypoints.push({
+                  location: { lat: point.lat, lng: point.lng },
+                  stopover: true
+              });
+          }
+      }
+
       directionsBusyRef.current = true;
+      lastDirectionsRequestRef.current = now;
+      lastDirectionsOriginRef.current = loc;
+      lastDirectionsStopRef.current = nextStopIdx;
 
-      try {
-          const destinationPoint = normalizePoint(allTargets[allTargets.length - 1]);
-          if (!destinationPoint) {
-              directionsBusyRef.current = false;
+      const requestId = ++directionsRequestIdRef.current;
+
+      directionsServiceRef.current.route({
+          origin: { lat: loc.lat, lng: loc.lng },
+          destination: { lat: destinationPoint.lat, lng: destinationPoint.lng },
+          waypoints,
+          optimizeWaypoints: false,
+          travelMode: window.google.maps.TravelMode.DRIVING,
+          provideRouteAlternatives: false
+      }, (result, status) => {
+          if (requestId !== directionsRequestIdRef.current) return;
+          directionsBusyRef.current = false;
+
+          if (
+              status !== window.google.maps.DirectionsStatus.OK ||
+              !result?.routes?.[0]
+          ) {
+              console.warn('DirectionsService no disponible:', status);
               return;
           }
 
-          const waypoints = [];
-          for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
-              const p = normalizePoint(allTargets[i]);
-              if (p) {
-                  waypoints.push({
-                      location: { lat: p.lat, lng: p.lng },
-                      stopover: true
+          const route = result.routes[0];
+          const legs = Array.isArray(route.legs) ? route.legs : [];
+          let remainingMeters = 0;
+          let remainingSeconds = 0;
+
+          const steps = [];
+          legs.forEach((leg, legIndex) => {
+              remainingMeters += Number(leg.distance?.value) || 0;
+              remainingSeconds += Number(leg.duration?.value) || 0;
+
+              (leg.steps || []).forEach((step, stepIndex) => {
+                  const startPoint = normalizePoint({
+                      lat: typeof step.start_location?.lat === 'function'
+                          ? step.start_location.lat()
+                          : step.start_location?.lat,
+                      lng: typeof step.start_location?.lng === 'function'
+                          ? step.start_location.lng()
+                          : step.start_location?.lng
                   });
-              }
-          }
 
-          const directionsService = new window.google.maps.DirectionsService();
-          directionsService.route({
-              origin: { lat: loc.lat, lng: loc.lng },
-              destination: { lat: destinationPoint.lat, lng: destinationPoint.lng },
-              waypoints,
-              optimizeWaypoints: false,
-              travelMode: window.google.maps.TravelMode.DRIVING
-          }, (result, status) => {
-              directionsBusyRef.current = false;
+                  const endPoint = normalizePoint({
+                      lat: typeof step.end_location?.lat === 'function'
+                          ? step.end_location.lat()
+                          : step.end_location?.lat,
+                      lng: typeof step.end_location?.lng === 'function'
+                          ? step.end_location.lng()
+                          : step.end_location?.lng
+                  });
 
-              if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
-                  console.warn('DirectionsService no disponible:', status);
-                  return;
-              }
+                  if (!endPoint) return;
 
-              const route = result.routes[0];
-              const legs = route.legs || [];
-              let remainingMeters = 0;
-              let remainingSeconds = 0;
-
-              legs.forEach(leg => {
-                  remainingMeters += leg.distance?.value || 0;
-                  remainingSeconds += leg.duration?.value || 0;
+                  steps.push({
+                      key: `${legIndex}-${stepIndex}`,
+                      instruction: stripHtml(step.instructions || 'Continúa por la ruta'),
+                      distanceMeters: Number(step.distance?.value) || 0,
+                      distanceText: step.distance?.text || '',
+                      start: startPoint,
+                      end: endPoint
+                  });
               });
-
-              const firstLeg = legs[0];
-              const nextDistMeters = firstLeg?.distance?.value || fallbackMetrics.nextDistMeters;
-              const nextDurMins = Math.max(1, Math.round((firstLeg?.duration?.value || 0) / 60)) || fallbackMetrics.nextDurMins;
-              const totalDurMins = Math.max(1, Math.round(remainingSeconds / 60)) || fallbackMetrics.totalDurMins;
-
-              applyMetricsAndProximity({
-                  nextDistMeters,
-                  remainingDistMeters: remainingMeters || fallbackMetrics.remainingDistMeters,
-                  nextDurMins,
-                  totalDurMins
-              });
-
-              const firstStep = firstLeg?.steps?.[0];
-              if (firstStep) {
-                  setNextManeuver({
-                      instruction: firstStep.instructions || '',
-                      distance: firstStep.distance?.text || ''
-                  });
-              } else {
-                  setNextManeuver({
-                      instruction: 'Continúa hacia el siguiente punto',
-                      distance: firstLeg?.distance?.text || ''
-                  });
-              }
           });
-      } catch (e) {
-          directionsBusyRef.current = false;
-          console.error('Error consultando indicaciones:', e);
-      }
-  }, [routeUpdateTick, driverLocationForMap, nextStopIdx, selectedRoute?.id, selectedRoute?.status, selectedRoute?.technicalData?.geometry, allTargets, alertedStops, isLoaded]);
+
+          const firstLeg = legs[0];
+          const nextDistMeters =
+              Number(firstLeg?.distance?.value) ||
+              fallbackMetrics.nextDistMeters;
+          const nextDurMins =
+              Math.max(1, Math.round((Number(firstLeg?.duration?.value) || 0) / 60)) ||
+              fallbackMetrics.nextDurMins;
+          const totalDurMins =
+              Math.max(1, Math.round(remainingSeconds / 60)) ||
+              fallbackMetrics.totalDurMins;
+
+          const routeGeometry = downsamplePath(
+              (route.overview_path || []).map(point => ({
+                  lat: typeof point.lat === 'function' ? point.lat() : point.lat,
+                  lng: typeof point.lng === 'function' ? point.lng() : point.lng
+              })),
+              260
+          );
+
+          navigationStepsRef.current = steps;
+          navigationGeometryRef.current = routeGeometry;
+
+          applyMetricsAndProximity({
+              nextDistMeters,
+              remainingDistMeters: remainingMeters || fallbackMetrics.remainingDistMeters,
+              nextDurMins,
+              totalDurMins
+          }, routeGeometry);
+
+          navigationStepIndexRef.current = 0;
+          const nextStep = getNextNavigationStep(loc, steps, navigationStepIndexRef.current);
+          if (nextStep) {
+              navigationStepIndexRef.current = Math.max(
+                  navigationStepIndexRef.current,
+                  nextStep.index
+              );
+              setNextManeuver(prev => {
+                  const next = {
+                      instruction: nextStep.instruction,
+                      distance: nextStep.distanceText || formatInstructionDistance(nextStep.meters),
+                      voiceKey: nextStep.voiceKey
+                  };
+
+                  return (
+                      prev.instruction === next.instruction &&
+                      prev.distance === next.distance &&
+                      prev.voiceKey === next.voiceKey
+                  ) ? prev : next;
+              });
+          }
+      });
+  }, [
+      routeUpdateTick,
+      nextStopIdx,
+      selectedRoute?.id,
+      selectedRoute?.status,
+      selectedRoute?.technicalData?.geometry,
+      allTargets,
+      alertedStops,
+      isLoaded
+  ]);
+
+  // Actualiza el texto de la maniobra usando la ruta ya descargada.
+  // No vuelve a consultar Google y, por lo tanto, no sobrecarga el mapa.
+  useEffect(() => {
+      if (selectedRoute?.status !== 'En Ruta') return;
+
+      const loc = normalizePoint(driverLocationForMap);
+      const steps = navigationStepsRef.current;
+      if (!loc || !steps.length) return;
+
+      const nextStep = getNextNavigationStep(loc, steps, navigationStepIndexRef.current);
+      if (!nextStep) return;
+
+      navigationStepIndexRef.current = Math.max(
+          navigationStepIndexRef.current,
+          nextStep.index
+      );
+
+      setNextManeuver(prev => {
+          const next = {
+              instruction: nextStep.instruction,
+              distance: nextStep.distanceText || formatInstructionDistance(nextStep.meters),
+              voiceKey: nextStep.voiceKey
+          };
+
+          return (
+              prev.instruction === next.instruction &&
+              prev.distance === next.distance &&
+              prev.voiceKey === next.voiceKey
+          ) ? prev : next;
+      });
+  }, [driverLocationForMap, selectedRoute?.status]);
 
   const centerOnUser = () => {
       setIsTracking(true);
       if (mapRef.current && snappedLocation) {
-          safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 18);
+          safeSetMapCamera(mapRef.current, snappedLocation, 0, 17);
       }
   };
 
@@ -1017,7 +1412,22 @@ function App() {
       odometerLocRef.current = null;
       prevLocRef.current = null;
       mapRef.current = null;
-      window.speechSynthesis.cancel();
+      mapReadyRef.current = false;
+      directionsBusyRef.current = false;
+      directionsRequestIdRef.current += 1;
+      directionsServiceRef.current = null;
+      navigationStepsRef.current = [];
+      navigationStepIndexRef.current = 0;
+      navigationGeometryRef.current = [];
+      lastDirectionsOriginRef.current = null;
+      lastDirectionsRequestRef.current = 0;
+      lastDirectionsStopRef.current = null;
+      pendingDistanceKmRef.current = 0;
+      pendingRoutePointsRef.current = [];
+
+      if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+      }
   };
 
   const toggleOnlineStatus = async () => {
@@ -1171,9 +1581,38 @@ function App() {
   };
 
   const escucharRutas = (driverId) => {
+    if (!driverId) return;
+
+    if (routeListenerUnsubscribeRef.current) {
+        routeListenerUnsubscribeRef.current();
+        routeListenerUnsubscribeRef.current = null;
+    }
+
     const q = query(collection(db, "rutas"), where("driverId", "==", driverId));
-    return onSnapshot(q, (snapshot) => setMisRutas(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }))));
+    routeListenerUnsubscribeRef.current = onSnapshot(
+        q,
+        (snapshot) => {
+            setMisRutas(snapshot.docs.map(routeDoc => ({
+                id: routeDoc.id,
+                ...routeDoc.data()
+            })));
+        },
+        (listenerError) => {
+            console.error('Error escuchando rutas:', listenerError);
+        }
+    );
+
+    return routeListenerUnsubscribeRef.current;
   };
+
+  useEffect(() => {
+      return () => {
+          if (routeListenerUnsubscribeRef.current) {
+              routeListenerUnsubscribeRef.current();
+              routeListenerUnsubscribeRef.current = null;
+          }
+      };
+  }, []);
 
   const handleStartTrip = async (routeId) => {
     const routeToStart = selectedRoute?.id === routeId
@@ -1229,14 +1668,33 @@ function App() {
       setIsApproaching(false);
       setIsWaiting(false);
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
-      setNextManeuver({ instruction: '', distance: '' });
+      setNextManeuver({ instruction: '', distance: '', voiceKey: '' });
+
+      directionsBusyRef.current = false;
+      directionsRequestIdRef.current += 1;
+      navigationStepsRef.current = [];
+      navigationStepIndexRef.current = 0;
+      navigationGeometryRef.current = [];
+      lastDirectionsOriginRef.current = null;
+      lastDirectionsRequestRef.current = 0;
+      lastDirectionsStopRef.current = null;
+      pendingDistanceKmRef.current = 0;
+      pendingRoutePointsRef.current = [];
+      setRouteUpdateTick(t => t + 1);
 
       // Saludo inicial de voz
-      if (voiceEnabled) {
-          window.speechSynthesis.cancel();
-          const utterance = new SpeechSynthesisUtterance(`Viaje iniciado. Respeta el horario planificado. Primer punto programado: ${formatPickupTime(getStopPlannedTimeValue(routeToStart, 0))}.`);
-          utterance.lang = 'es-MX';
-          window.speechSynthesis.speak(utterance);
+      if (voiceEnabled && 'speechSynthesis' in window) {
+          try {
+              window.speechSynthesis.cancel();
+              const utterance = new SpeechSynthesisUtterance(
+                  `Viaje iniciado. Respeta el horario planificado. Primer punto programado: ${formatPickupTime(getStopPlannedTimeValue(routeToStart, 0))}.`
+              );
+              utterance.lang = 'es-MX';
+              utterance.rate = 0.94;
+              window.speechSynthesis.speak(utterance);
+          } catch (voiceError) {
+              console.warn('No se pudo iniciar la voz:', voiceError);
+          }
       }
     } catch (e) {
         console.error(e);
@@ -1249,7 +1707,9 @@ function App() {
     try {
       await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: getMexicoTime(), finalDate: getMexicoDate(), "proximityAlert.active": false });
       setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' })); localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
-      alert("¡Ruta finalizada con éxito!"); odometerLocRef.current = null; window.speechSynthesis.cancel();
+      alert("¡Ruta finalizada con éxito!");
+      odometerLocRef.current = null;
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     } catch (e) {}
   };
 
@@ -1287,8 +1747,39 @@ function App() {
 
   const driverMarkerIcon = useMemo(() => {
       if (!isLoaded || !window.google?.maps) return ICON_START;
-      return getDriverMarkerIcon(userHeading);
-  }, [isLoaded, userHeading]);
+      return getDriverMarkerIcon();
+  }, [isLoaded]);
+
+  useEffect(() => {
+      if (selectedRoute?.status !== 'En Ruta' || !mapRef.current) return;
+
+      const timer = setTimeout(() => {
+          try {
+              if (window.google?.maps?.event) {
+                  window.google.maps.event.trigger(mapRef.current, 'resize');
+              }
+
+              const loc = normalizePoint(latestLocRef.current);
+              if (loc && isTrackingRef.current) {
+                  safeSetMapCamera(mapRef.current, loc, 0, 17);
+              }
+          } catch (e) {
+              console.warn('No se pudo redimensionar el mapa:', e);
+          }
+      }, 380);
+
+      return () => clearTimeout(timer);
+  }, [isPanelExpanded, selectedRoute?.status]);
+
+  const navigationRenderGeometry = useMemo(() => {
+      const liveGeometry = normalizePath(liveRouteData.geometry);
+      const plannedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
+
+      return downsamplePath(
+          liveGeometry.length > 0 ? liveGeometry : plannedGeometry,
+          260
+      );
+  }, [liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
 
   if (!isReady) return null;
 
@@ -1298,12 +1789,14 @@ function App() {
   // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
   // ==============================================================
   if (currentDriver && selectedRoute && selectedRoute.status === 'En Ruta') {
-      const currentGeometry = normalizePath(liveRouteData.geometry).length > 0
-          ? normalizePath(liveRouteData.geometry)
-          : normalizePath(selectedRoute.technicalData?.geometry);
+      const currentGeometry = navigationRenderGeometry;
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
-      const safeMapCenter = snappedLocation || currentGeometry[0] || normalizePoint(currentTarget) || centerMX;
+      const safeMapCenter =
+          normalizePoint(selectedRoute.startCoords) ||
+          currentGeometry[0] ||
+          normalizePoint(currentTarget) ||
+          centerMX;
       const nextStopName = currentTarget?.label || 'Destino';
       const nextStopAddress = currentTarget?.address || '';
       const plannedCurrentStopTimeRaw = getStopPlannedTimeValue(selectedRoute, nextStopIdx);
@@ -1416,7 +1909,7 @@ function App() {
                       <button 
                           onClick={() => {
                               setVoiceEnabled(!voiceEnabled);
-                              if(voiceEnabled) window.speechSynthesis.cancel();
+                              if (voiceEnabled && 'speechSynthesis' in window) window.speechSynthesis.cancel();
                           }} 
                           className="p-2 rounded-full bg-slate-800 text-slate-300 hover:text-white transition shrink-0"
                       >
@@ -1434,13 +1927,14 @@ function App() {
                         <GoogleMap
                             key={`nav-map-${selectedRoute.id}`}
                             mapContainerStyle={containerStyle}
-                            center={safeMapCenter}
-                            zoom={isTracking ? 18 : 16}
+                            center={centerMX}
+                            zoom={16}
                             onLoad={handleMapLoad}
+                            onUnmount={handleMapUnmount}
                             onDragStart={handleMapDrag}
-                            options={{ disableDefaultUI: true, gestureHandling: "greedy", backgroundColor: "#e2e8f0" }}
+                            options={NAV_MAP_OPTIONS}
                         >
-                            {currentGeometry.length > 0 && <Polyline path={currentGeometry} options={{ strokeColor: "#f97316", strokeOpacity: 0.9, strokeWeight: 6 }} />}
+                            {currentGeometry.length > 0 && <Polyline path={currentGeometry} options={NAV_POLYLINE_OPTIONS} />}
                             {allTargets.map((target, idx) => {
                                 if (idx < nextStopIdx) return null;
                                 const safeTarget = normalizePoint(target);
@@ -1452,7 +1946,6 @@ function App() {
                                     position={snappedLocation}
                                     icon={driverMarkerIcon}
                                     title="Tu ubicación actual"
-                                    label={{ text: ' ', fontSize: '1px' }}
                                     zIndex={9999}
                                 />
                             )}
