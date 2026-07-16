@@ -4,13 +4,14 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX, Download, Share2
 } from 'lucide-react';
 import { db, requestForToken } from './firebase';
-import { collection, query, where, getDocs, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
+import { collection, query, where, getDocs, getDoc, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
+import { jsPDF } from 'jspdf';
 const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
 const containerStyle = { width: '100%', height: '100%' };
 const centerMX = { lat: 19.4326, lng: -99.1332 };
@@ -68,6 +69,424 @@ const getDriverMarkerIcon = () => {
         return ICON_START;
     }
 };
+
+
+// =========================================================================
+// TRIPLOGIX: TARIFA Y COMPROBANTE OFICIAL DE VIAJE (NO FISCAL)
+// La estructura se inspira en plataformas de movilidad: tarifa base + distancia
+// + tiempo + cuota operativa + ajustes autorizados. Las tarifas son propias de
+// TripLogix y se concentran aquí para poder cambiarlas sin tocar el resto de la app.
+// =========================================================================
+const TRIPLOGIX_RECEIPT_CONFIG = Object.freeze({
+    brandName: 'TripLogix',
+    slogan: 'Movilidad inteligente, segura y regulada',
+    currency: 'MXN',
+    baseFare: 35,
+    perKm: 15,
+    perMinute: 1.5,
+    serviceFee: 12,
+    minimumFare: 75,
+    defaultDemandMultiplier: 1
+});
+
+const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+const getTimestampMs = (value) => {
+    if (!value) return null;
+    try {
+        if (typeof value?.toDate === 'function') return value.toDate().getTime();
+        if (value instanceof Date) return value.getTime();
+        const parsed = new Date(value).getTime();
+        return Number.isFinite(parsed) ? parsed : null;
+    } catch (e) {
+        return null;
+    }
+};
+
+const getTripDistanceKmForReceipt = (route) => {
+    const candidates = [
+        route?.receipt?.distanceKm,
+        route?.realDistanceDriven,
+        route?.actualDistanceKm,
+        route?.technicalData?.actualDistance,
+        route?.technicalData?.totalDistance
+    ];
+
+    for (const candidate of candidates) {
+        const value = Number(candidate);
+        if (Number.isFinite(value) && value > 0) return roundMoney(value);
+    }
+
+    return 0;
+};
+
+const getTripDurationMinutesForReceipt = (route, forcedEndTimestamp = null) => {
+    const startMs = getTimestampMs(
+        route?.actualStartTimestamp ||
+        route?.navigationStartedAt ||
+        route?.startedAt
+    );
+
+    const endMs = getTimestampMs(
+        forcedEndTimestamp ||
+        route?.actualEndTimestamp ||
+        route?.finishedAt ||
+        route?.receipt?.actualEndTimestamp
+    );
+
+    if (startMs && endMs && endMs > startMs) {
+        return Math.max(1, Math.round((endMs - startMs) / 60000));
+    }
+
+    const candidates = [
+        route?.receipt?.durationMinutes,
+        route?.actualDurationMinutes,
+        route?.technicalData?.actualDuration,
+        route?.technicalData?.totalDuration
+    ];
+
+    for (const candidate of candidates) {
+        const value = Number(candidate);
+        if (Number.isFinite(value) && value > 0) return Math.max(1, Math.round(value));
+    }
+
+    return 0;
+};
+
+const calculateTripLogixFare = (route, overrides = {}) => {
+    const distanceKm = Number.isFinite(Number(overrides.distanceKm))
+        ? Number(overrides.distanceKm)
+        : getTripDistanceKmForReceipt(route);
+
+    const durationMinutes = Number.isFinite(Number(overrides.durationMinutes))
+        ? Number(overrides.durationMinutes)
+        : getTripDurationMinutesForReceipt(route, overrides.actualEndTimestamp);
+
+    const configuredPricing = route?.pricing || {};
+    const baseFare = Number(configuredPricing.baseFare ?? TRIPLOGIX_RECEIPT_CONFIG.baseFare);
+    const perKm = Number(configuredPricing.perKm ?? TRIPLOGIX_RECEIPT_CONFIG.perKm);
+    const perMinute = Number(configuredPricing.perMinute ?? TRIPLOGIX_RECEIPT_CONFIG.perMinute);
+    const serviceFee = Number(configuredPricing.serviceFee ?? TRIPLOGIX_RECEIPT_CONFIG.serviceFee);
+    const minimumFare = Number(configuredPricing.minimumFare ?? TRIPLOGIX_RECEIPT_CONFIG.minimumFare);
+    const tolls = Math.max(0, Number(route?.tolls ?? configuredPricing.tolls ?? 0) || 0);
+
+    const demandMultiplierRaw = Number(
+        route?.demandMultiplier ??
+        route?.surgeMultiplier ??
+        configuredPricing.demandMultiplier ??
+        TRIPLOGIX_RECEIPT_CONFIG.defaultDemandMultiplier
+    );
+    const demandMultiplier = Math.min(3, Math.max(1, Number.isFinite(demandMultiplierRaw) ? demandMultiplierRaw : 1));
+
+    const baseAmount = roundMoney(baseFare);
+    const distanceAmount = roundMoney(distanceKm * perKm);
+    const timeAmount = roundMoney(durationMinutes * perMinute);
+    const standardVariableFare = roundMoney(baseAmount + distanceAmount + timeAmount);
+    const adjustedVariableFare = roundMoney(standardVariableFare * demandMultiplier);
+    const demandAdjustment = roundMoney(adjustedVariableFare - standardVariableFare);
+    const minimumFareApplied = adjustedVariableFare < minimumFare;
+    const mobilityFare = roundMoney(Math.max(minimumFare, adjustedVariableFare));
+    const subtotal = roundMoney(mobilityFare + serviceFee + tolls);
+
+    // Este comprobante no es CFDI, por lo que no se desglosan impuestos fiscales.
+    const taxes = 0;
+    const total = roundMoney(subtotal + taxes);
+
+    return {
+        currency: TRIPLOGIX_RECEIPT_CONFIG.currency,
+        distanceKm: roundMoney(distanceKm),
+        durationMinutes: Math.max(0, Math.round(durationMinutes)),
+        baseFare: roundMoney(baseFare),
+        perKm: roundMoney(perKm),
+        perMinute: roundMoney(perMinute),
+        distanceAmount,
+        timeAmount,
+        demandMultiplier,
+        demandAdjustment,
+        minimumFare,
+        minimumFareApplied,
+        mobilityFare,
+        serviceFee: roundMoney(serviceFee),
+        tolls: roundMoney(tolls),
+        subtotal,
+        taxes,
+        total
+    };
+};
+
+const makeTripLogixFolio = (route, issuedAt) => {
+    if (route?.receipt?.folio) return String(route.receipt.folio);
+    const datePart = new Date(issuedAt).toISOString().slice(0, 10).replace(/-/g, '');
+    const idPart = String(route?.id || route?.tripId || 'VIAJE')
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .slice(-8)
+        .toUpperCase()
+        .padStart(8, '0');
+    return `TLX-${datePart}-${idPart}`;
+};
+
+const buildTripLogixReceipt = (route, overrides = {}) => {
+    const existingReceipt = route?.receipt && typeof route.receipt === 'object'
+        ? route.receipt
+        : null;
+
+    const issuedAt = overrides.issuedAt || existingReceipt?.issuedAt || new Date().toISOString();
+    const actualEndTimestamp = overrides.actualEndTimestamp || route?.actualEndTimestamp || existingReceipt?.actualEndTimestamp || issuedAt;
+    const calculatedPricing = calculateTripLogixFare(route, {
+        ...overrides,
+        actualEndTimestamp
+    });
+
+    const pricing = existingReceipt?.pricing && Number.isFinite(Number(existingReceipt.pricing.total))
+        ? { ...calculatedPricing, ...existingReceipt.pricing }
+        : calculatedPricing;
+
+    const distanceKm = Number.isFinite(Number(existingReceipt?.distanceKm))
+        ? Number(existingReceipt.distanceKm)
+        : Number(pricing.distanceKm || 0);
+
+    const durationMinutes = Number.isFinite(Number(existingReceipt?.durationMinutes))
+        ? Number(existingReceipt.durationMinutes)
+        : Number(pricing.durationMinutes || 0);
+
+    return {
+        version: Number(existingReceipt?.version || 1),
+        documentType: String(existingReceipt?.documentType || 'Comprobante oficial de viaje'),
+        fiscalType: String(existingReceipt?.fiscalType || 'NO_FISCAL'),
+        folio: String(existingReceipt?.folio || makeTripLogixFolio(route, issuedAt)),
+        issuedAt: String(issuedAt),
+        issuer: {
+            tradeName: String(existingReceipt?.issuer?.tradeName || TRIPLOGIX_RECEIPT_CONFIG.brandName),
+            slogan: String(existingReceipt?.issuer?.slogan || TRIPLOGIX_RECEIPT_CONFIG.slogan)
+        },
+        tripId: String(existingReceipt?.tripId || route?.id || route?.tripId || ''),
+        clientName: String(existingReceipt?.clientName || route?.client || route?.clientName || 'Cliente'),
+        clientPhone: String(existingReceipt?.clientPhone || route?.clientPhone || route?.requestUser || ''),
+        driverName: String(existingReceipt?.driverName || route?.driver || route?.driverName || 'Conductor no registrado'),
+        driverId: String(existingReceipt?.driverId || route?.driverId || ''),
+        vehicle: String(existingReceipt?.vehicle || route?.vehicle || route?.driverVehicle || route?.vehicleModel || 'Unidad no registrada'),
+        vehiclePlate: String(existingReceipt?.vehiclePlate || route?.vehiclePlate || route?.driverVehiclePlate || ''),
+        origin: String(existingReceipt?.origin || route?.start || route?.origin || 'Origen no registrado'),
+        destination: String(existingReceipt?.destination || route?.end || route?.destination || 'Destino no registrado'),
+        serviceType: String(existingReceipt?.serviceType || route?.serviceType || 'Servicio TripLogix'),
+        scheduledDate: String(existingReceipt?.scheduledDate || route?.scheduledDate || route?.pickupDate || route?.finalDate || ''),
+        scheduledTime: String(existingReceipt?.scheduledTime || route?.scheduledTime || route?.pickupTime || ''),
+        actualStartTime: String(existingReceipt?.actualStartTime || route?.actualStartTime || route?.startTime || ''),
+        actualStartTimestamp: String(existingReceipt?.actualStartTimestamp || route?.actualStartTimestamp || route?.navigationStartedAt || ''),
+        actualEndTime: String(overrides.actualEndTime || existingReceipt?.actualEndTime || route?.actualEndTime || route?.endTime || ''),
+        actualEndTimestamp: String(actualEndTimestamp || ''),
+        distanceKm: roundMoney(distanceKm),
+        durationMinutes: Math.max(0, Math.round(durationMinutes)),
+        pricing,
+        paymentMethod: String(existingReceipt?.paymentMethod || route?.paymentMethod || 'No registrado'),
+        paymentStatus: String(existingReceipt?.paymentStatus || route?.paymentStatus || 'Pendiente de conciliación'),
+        notes: String(existingReceipt?.notes || 'Comprobante operativo no fiscal. No sustituye una factura CFDI.')
+    };
+};
+
+const formatTripLogixMoney = (value, currency = 'MXN') => {
+    try {
+        return new Intl.NumberFormat('es-MX', {
+            style: 'currency',
+            currency,
+            minimumFractionDigits: 2
+        }).format(Number(value) || 0);
+    } catch (e) {
+        return `$${(Number(value) || 0).toFixed(2)} ${currency}`;
+    }
+};
+
+const formatTripLogixDateTime = (value) => {
+    const ms = getTimestampMs(value);
+    if (!ms) return 'No registrado';
+    return new Date(ms).toLocaleString('es-MX', {
+        timeZone: 'America/Mexico_City',
+        dateStyle: 'medium',
+        timeStyle: 'short'
+    });
+};
+
+const createTripLogixReceiptPdf = (route) => {
+    const receipt = buildTripLogixReceipt(route);
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const margin = 16;
+    const contentWidth = pageWidth - margin * 2;
+    let y = 16;
+
+    const ensureSpace = (needed = 16) => {
+        if (y + needed > 286) {
+            pdf.addPage();
+            y = 18;
+        }
+    };
+
+    const addLine = (label, value, options = {}) => {
+        ensureSpace(options.height || 9);
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(options.labelSize || 7.5);
+        pdf.setTextColor(100, 116, 139);
+        pdf.text(String(label).toUpperCase(), margin, y);
+        y += 3.2;
+
+        pdf.setFont('helvetica', options.bold ? 'bold' : 'normal');
+        pdf.setFontSize(options.valueSize || 9.2);
+        pdf.setTextColor(15, 23, 42);
+        const lines = pdf.splitTextToSize(String(value || 'No registrado'), contentWidth);
+        pdf.text(lines, margin, y);
+        y += lines.length * 4.2 + 2.6;
+    };
+
+    const addSectionTitle = (title) => {
+        ensureSpace(11);
+        y += 1;
+        pdf.setFillColor(248, 250, 252);
+        pdf.roundedRect(margin, y - 4.5, contentWidth, 8.5, 2, 2, 'F');
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(8.5);
+        pdf.setTextColor(249, 115, 22);
+        pdf.text(String(title).toUpperCase(), margin + 4, y + 1);
+        y += 8.5;
+    };
+
+    // Encabezado oficial TripLogix.
+    pdf.setFillColor(15, 23, 42);
+    pdf.roundedRect(margin, y, contentWidth, 33, 4, 4, 'F');
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(22);
+    pdf.setTextColor(255, 255, 255);
+    pdf.text('Trip', margin + 8, y + 13);
+    pdf.setTextColor(249, 115, 22);
+    pdf.text('Logix', margin + 24.5, y + 13);
+    pdf.setFontSize(9);
+    pdf.setTextColor(226, 232, 240);
+    pdf.text(TRIPLOGIX_RECEIPT_CONFIG.slogan, margin + 8, y + 21);
+    pdf.setFontSize(8);
+    pdf.text('COMPROBANTE OFICIAL DE VIAJE - NO FISCAL', margin + 8, y + 28);
+    y += 38;
+
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(12);
+    pdf.setTextColor(15, 23, 42);
+    pdf.text(`Folio: ${receipt.folio}`, margin, y);
+    y += 7;
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(9);
+    pdf.setTextColor(100, 116, 139);
+    pdf.text(`Emitido: ${formatTripLogixDateTime(receipt.issuedAt)}`, margin, y);
+    y += 7;
+    pdf.text(`ID de viaje: ${receipt.tripId || 'No registrado'}`, margin, y);
+    y += 6;
+
+    addSectionTitle('Pasajero y conductor');
+    addLine('Pasajero', receipt.clientName);
+    if (receipt.clientPhone) addLine('Contacto del pasajero', receipt.clientPhone);
+    addLine('Conductor', receipt.driverName);
+    addLine('Unidad', `${receipt.vehicle}${receipt.vehiclePlate ? ` - Placas ${receipt.vehiclePlate}` : ''}`);
+
+    addSectionTitle('Ruta del servicio');
+    addLine('Origen', receipt.origin);
+    addLine('Destino', receipt.destination);
+    addLine('Tipo de servicio', receipt.serviceType);
+    addLine('Inicio real', receipt.actualStartTime || formatTripLogixDateTime(receipt.actualStartTimestamp));
+    addLine('Finalización', receipt.actualEndTime || formatTripLogixDateTime(receipt.actualEndTimestamp));
+    addLine('Distancia considerada', `${receipt.distanceKm.toFixed(2)} km`);
+    addLine('Duración considerada', `${receipt.durationMinutes} min`);
+
+    addSectionTitle('Desglose del importe');
+    const pricingRows = [
+        ['Tarifa base', receipt.pricing.baseFare],
+        [`Distancia (${receipt.distanceKm.toFixed(2)} km x ${formatTripLogixMoney(receipt.pricing.perKm)})`, receipt.pricing.distanceAmount],
+        [`Tiempo (${receipt.durationMinutes} min x ${formatTripLogixMoney(receipt.pricing.perMinute)})`, receipt.pricing.timeAmount]
+    ];
+
+    if (receipt.pricing.demandMultiplier > 1) {
+        pricingRows.push([`Ajuste de demanda x${receipt.pricing.demandMultiplier.toFixed(2)}`, receipt.pricing.demandAdjustment]);
+    }
+    if (receipt.pricing.minimumFareApplied) {
+        pricingRows.push(['Ajuste a tarifa mínima', Math.max(0, receipt.pricing.minimumFare - (receipt.pricing.baseFare + receipt.pricing.distanceAmount + receipt.pricing.timeAmount + receipt.pricing.demandAdjustment))]);
+    }
+    pricingRows.push(['Cuota operativa y de seguridad', receipt.pricing.serviceFee]);
+    if (receipt.pricing.tolls > 0) pricingRows.push(['Peajes registrados', receipt.pricing.tolls]);
+
+    pricingRows.forEach(([label, value]) => {
+        ensureSpace(8);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(9);
+        pdf.setTextColor(71, 85, 105);
+        pdf.text(String(label), margin, y);
+        pdf.setFont('helvetica', 'bold');
+        pdf.setTextColor(15, 23, 42);
+        pdf.text(formatTripLogixMoney(value, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
+        y += 7;
+    });
+
+    ensureSpace(22);
+    pdf.setDrawColor(226, 232, 240);
+    pdf.line(margin, y, pageWidth - margin, y);
+    y += 8;
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(14);
+    pdf.setTextColor(249, 115, 22);
+    pdf.text('TOTAL', margin, y);
+    pdf.text(formatTripLogixMoney(receipt.pricing.total, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
+    y += 10;
+
+    addLine('Método de pago', receipt.paymentMethod);
+    addLine('Estado del pago', receipt.paymentStatus);
+
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(6.8);
+    pdf.setTextColor(124, 45, 18);
+    pdf.text(receipt.notes, pageWidth / 2, 284, { align: 'center' });
+
+    const pages = pdf.getNumberOfPages();
+    for (let page = 1; page <= pages; page += 1) {
+        pdf.setPage(page);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(7);
+        pdf.setTextColor(148, 163, 184);
+        pdf.text(`TripLogix - ${receipt.folio} - Página ${page} de ${pages}`, pageWidth / 2, 291, { align: 'center' });
+    }
+
+    return { pdf, receipt };
+};
+
+const downloadTripLogixReceiptPdf = (route) => {
+    const { pdf, receipt } = createTripLogixReceiptPdf(route);
+    pdf.save(`TripLogix_Recibo_${receipt.folio}.pdf`);
+};
+
+const shareTripLogixReceiptPdf = async (route) => {
+    const { pdf, receipt } = createTripLogixReceiptPdf(route);
+    const blob = pdf.output('blob');
+    const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
+
+    try {
+        const file = new File([blob], filename, { type: 'application/pdf' });
+        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({
+                title: `Recibo TripLogix ${receipt.folio}`,
+                text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
+                files: [file]
+            });
+            return;
+        }
+    } catch (error) {
+        if (error?.name === 'AbortError') return;
+        console.warn('No se pudo compartir directamente el PDF:', error);
+    }
+
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+};
+
 
 // HELPER: Cálculo de distancia para la GEOCERCA
 const getDistanceMeters = (p1, p2) => {
@@ -615,6 +1034,7 @@ function App() {
   const [filterType, setFilterType] = useState('Próximo');
   const [mainTab, setMainTab] = useState('Pendientes'); 
   const [selectedRoute, setSelectedRoute] = useState(null);
+  const [completedTripNotice, setCompletedTripNotice] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
@@ -646,6 +1066,7 @@ function App() {
   const pendingDistanceKmRef = useRef(0);
   const pendingRoutePointsRef = useRef([]);
   const telemetryBusyRef = useRef(false);
+  const flushTelemetryRef = useRef(async () => {});
   const routeListenerUnsubscribeRef = useRef(null);
   
   const [userLocation, setUserLocation] = useState(null);
@@ -1012,14 +1433,14 @@ function App() {
   useEffect(() => {
       if (!currentDriver || selectedRoute?.status !== 'En Ruta' || !selectedRoute?.id) return undefined;
 
-      const flushTelemetry = async () => {
+      const flushTelemetry = async (force = false) => {
           if (telemetryBusyRef.current) return;
 
           const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
           if (!loc) return;
 
           const now = Date.now();
-          if (now - lastDriverLocationWriteRef.current < 10000) return;
+          if (!force && now - lastDriverLocationWriteRef.current < 10000) return;
 
           telemetryBusyRef.current = true;
           lastDriverLocationWriteRef.current = now;
@@ -1067,9 +1488,13 @@ function App() {
           }
       };
 
+      flushTelemetryRef.current = flushTelemetry;
       flushTelemetry();
       const interval = setInterval(flushTelemetry, 12000);
-      return () => clearInterval(interval);
+      return () => {
+          clearInterval(interval);
+          flushTelemetryRef.current = async () => {};
+      };
   }, [
       currentDriver?.id,
       currentDriver?.isOnline,
@@ -1704,13 +2129,78 @@ function App() {
 
   const handleEndTrip = async (routeId) => {
     if (!confirm("¿Has completado el viaje por completo?")) return;
+
     try {
-      await updateDoc(doc(db, "rutas", routeId), { status: 'Finalizado', endTime: getMexicoTime(), finalDate: getMexicoDate(), "proximityAlert.active": false });
-      setSelectedRoute(prev => ({ ...prev, status: 'Finalizado' })); localStorage.removeItem('active_trip_id'); localStorage.removeItem(`trip_idx_${routeId}`);
-      alert("¡Ruta finalizada con éxito!");
+      // Vaciar primero la telemetría acumulada para que el recibo use la distancia real más reciente.
+      await flushTelemetryRef.current(true);
+
+      let routeFromRealtime = misRutas.find(item => item.id === routeId) || selectedRoute || {};
+      try {
+          const freshRouteSnapshot = await getDoc(doc(db, 'rutas', routeId));
+          if (freshRouteSnapshot.exists()) {
+              routeFromRealtime = { id: freshRouteSnapshot.id, ...freshRouteSnapshot.data() };
+          }
+      } catch (readError) {
+          console.warn('No se pudo releer el viaje antes del recibo:', readError);
+      }
+      const actualEndTimestamp = new Date().toISOString();
+      const actualEndTime = getMexicoTime();
+
+      const routeForReceipt = {
+          ...routeFromRealtime,
+          ...selectedRoute,
+          id: routeId,
+          actualEndTimestamp,
+          actualEndTime,
+          endTime: actualEndTime,
+          vehicle: routeFromRealtime?.vehicle || currentDriver?.vehicle || `${currentDriver?.vehicleModel || 'Unidad'} (${currentDriver?.vehiclePlate || 'sin placas'})`,
+          vehiclePlate: routeFromRealtime?.vehiclePlate || currentDriver?.vehiclePlate || '',
+          realDistanceDriven: roundMoney(Number(routeFromRealtime?.realDistanceDriven) || 0)
+      };
+
+      const receipt = buildTripLogixReceipt(routeForReceipt, {
+          issuedAt: actualEndTimestamp,
+          actualEndTimestamp,
+          actualEndTime
+      });
+
+      const finalUpdate = {
+          status: 'Finalizado',
+          endTime: actualEndTime,
+          actualEndTime,
+          actualEndTimestamp,
+          finishedAt: actualEndTimestamp,
+          finalDate: getMexicoDate(),
+          receipt,
+          finalFare: receipt.pricing.total,
+          finalDistanceKm: receipt.distanceKm,
+          finalDurationMinutes: receipt.durationMinutes,
+          "proximityAlert.active": false
+      };
+
+      await updateDoc(doc(db, "rutas", routeId), finalUpdate);
+
+      const completedRoute = {
+          ...routeForReceipt,
+          ...finalUpdate,
+          id: routeId
+      };
+
+      setSelectedRoute(completedRoute);
+      setCompletedTripNotice(completedRoute);
+      localStorage.removeItem('active_trip_id');
+      localStorage.removeItem(`trip_idx_${routeId}`);
       odometerLocRef.current = null;
+      pendingDistanceKmRef.current = 0;
+      pendingRoutePointsRef.current = [];
+      directionsRequestIdRef.current += 1;
+      directionsBusyRef.current = false;
+
       if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-    } catch (e) {}
+    } catch (e) {
+      console.error('No se pudo finalizar el viaje y generar el recibo:', e);
+      alert('No se pudo finalizar el viaje. Revisa la conexión e inténtalo nuevamente.');
+    }
   };
 
   const handleRegister = async (e) => {
@@ -1808,6 +2298,64 @@ function App() {
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
+
+              {completedTripNotice && (
+                  <div className="fixed inset-0 z-[10020] bg-slate-900/85 backdrop-blur-md flex items-center justify-center p-5">
+                      <div className="w-full max-w-sm bg-white rounded-[2rem] shadow-2xl overflow-hidden border-4 border-green-500 text-slate-800">
+                          <div className="bg-green-600 text-white p-6 text-center">
+                              <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center mx-auto mb-3">
+                                  <CheckCircle2 className="w-9 h-9" />
+                              </div>
+                              <p className="text-[10px] font-black uppercase tracking-widest text-green-100">Cierre registrado</p>
+                              <h2 className="text-2xl font-black mt-1">Viaje finalizado</h2>
+                              <p className="text-sm text-green-100 mt-2">El mismo comprobante queda disponible para conductor, cliente y despacho.</p>
+                          </div>
+                          <div className="p-5">
+                              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 mb-4">
+                                  <p className="text-[10px] font-black uppercase text-slate-400">Folio</p>
+                                  <p className="font-black text-slate-800 mt-1">{buildTripLogixReceipt(completedTripNotice).folio}</p>
+                                  <div className="grid grid-cols-2 gap-3 mt-4">
+                                      <div>
+                                          <p className="text-[10px] font-black uppercase text-slate-400">Distancia</p>
+                                          <p className="text-lg font-black">{buildTripLogixReceipt(completedTripNotice).distanceKm.toFixed(2)} km</p>
+                                      </div>
+                                      <div className="text-right">
+                                          <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
+                                          <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                      </div>
+                                  </div>
+                              </div>
+                              <div className="grid grid-cols-2 gap-3">
+                                  <button
+                                      type="button"
+                                      onClick={() => downloadTripLogixReceiptPdf(completedTripNotice)}
+                                      className="p-4 rounded-2xl bg-orange-500 text-white font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition"
+                                  >
+                                      <Download className="w-4 h-4" /> PDF
+                                  </button>
+                                  <button
+                                      type="button"
+                                      onClick={() => shareTripLogixReceiptPdf(completedTripNotice)}
+                                      className="p-4 rounded-2xl bg-slate-800 text-white font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition"
+                                  >
+                                      <Share2 className="w-4 h-4" /> COMPARTIR
+                                  </button>
+                              </div>
+                              <button
+                                  type="button"
+                                  onClick={() => {
+                                      setCompletedTripNotice(null);
+                                      setSelectedRoute(null);
+                                      setMainTab('Finalizados');
+                                  }}
+                                  className="w-full mt-3 p-3 rounded-2xl bg-slate-100 text-slate-700 font-black text-xs uppercase tracking-widest"
+                              >
+                                  Ver viajes finalizados
+                              </button>
+                          </div>
+                      </div>
+                  </div>
+              )}
               
               {/* --- MODAL GEOCERCA (FUERA DE RANGO) --- */}
               {showJustification && (
@@ -2048,6 +2596,64 @@ function App() {
 
     return (
       <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
+
+        {completedTripNotice && (
+            <div className="fixed inset-0 z-[10020] bg-slate-900/85 backdrop-blur-md flex items-center justify-center p-5">
+                <div className="w-full max-w-sm bg-white rounded-[2rem] shadow-2xl overflow-hidden border-4 border-green-500 text-slate-800">
+                    <div className="bg-green-600 text-white p-6 text-center">
+                        <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center mx-auto mb-3">
+                            <CheckCircle2 className="w-9 h-9" />
+                        </div>
+                        <p className="text-[10px] font-black uppercase tracking-widest text-green-100">Cierre registrado</p>
+                        <h2 className="text-2xl font-black mt-1">Viaje finalizado</h2>
+                        <p className="text-sm text-green-100 mt-2">El comprobante quedó guardado para conductor, cliente y despacho.</p>
+                    </div>
+                    <div className="p-5">
+                        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 mb-4">
+                            <p className="text-[10px] font-black uppercase text-slate-400">Folio</p>
+                            <p className="font-black text-slate-800 mt-1">{buildTripLogixReceipt(completedTripNotice).folio}</p>
+                            <div className="grid grid-cols-2 gap-3 mt-4">
+                                <div>
+                                    <p className="text-[10px] font-black uppercase text-slate-400">Distancia</p>
+                                    <p className="text-lg font-black">{buildTripLogixReceipt(completedTripNotice).distanceKm.toFixed(2)} km</p>
+                                </div>
+                                <div className="text-right">
+                                    <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
+                                    <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <button
+                                type="button"
+                                onClick={() => downloadTripLogixReceiptPdf(completedTripNotice)}
+                                className="p-4 rounded-2xl bg-orange-500 text-white font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition"
+                            >
+                                <Download className="w-4 h-4" /> PDF
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => shareTripLogixReceiptPdf(completedTripNotice)}
+                                className="p-4 rounded-2xl bg-slate-800 text-white font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition"
+                            >
+                                <Share2 className="w-4 h-4" /> COMPARTIR
+                            </button>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setCompletedTripNotice(null);
+                                setSelectedRoute(null);
+                                setMainTab('Finalizados');
+                            }}
+                            className="w-full mt-3 p-3 rounded-2xl bg-slate-100 text-slate-700 font-black text-xs uppercase tracking-widest"
+                        >
+                            Ver viajes finalizados
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
         
         {/* Header */}
         <div className={`p-4 flex items-center gap-4 shadow-lg z-20 shrink-0 ${darkMode ? 'bg-slate-900 border-b border-slate-800' : 'bg-white'}`}>
@@ -2139,8 +2745,26 @@ function App() {
                     <Play className="w-5 h-5 fill-white"/> INICIAR VIAJE AHORA
                 </button>
             ) : (
-                <div className="w-full mt-2 bg-slate-100 text-slate-400 font-black p-4 rounded-2xl flex items-center justify-center gap-2">
-                    <CheckCircle2 className="w-5 h-5"/> VIAJE FINALIZADO
+                <div className="space-y-3 mt-2">
+                    <div className="w-full bg-green-50 text-green-700 border border-green-200 font-black p-4 rounded-2xl flex items-center justify-center gap-2">
+                        <CheckCircle2 className="w-5 h-5"/> VIAJE FINALIZADO
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <button
+                            type="button"
+                            onClick={() => downloadTripLogixReceiptPdf(selectedRoute)}
+                            className="p-3 rounded-xl bg-orange-500 text-white font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2"
+                        >
+                            <Download className="w-4 h-4" /> Recibo PDF
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => shareTripLogixReceiptPdf(selectedRoute)}
+                            className="p-3 rounded-xl bg-slate-800 text-white font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2"
+                        >
+                            <Share2 className="w-4 h-4" /> Compartir
+                        </button>
+                    </div>
                 </div>
             )}
         </div>
@@ -2240,7 +2864,22 @@ function App() {
                             <p className="text-[10px] text-slate-400 font-bold uppercase mt-0.5">Cliente: {ruta.client}</p>
                         </div>
                     </div>
-                    <ChevronRight className="w-4 h-4 text-orange-500" />
+                    <div className="flex items-center gap-2">
+                        {ruta.status === 'Finalizado' && (
+                            <button
+                                type="button"
+                                onClick={(event) => {
+                                    event.stopPropagation();
+                                    downloadTripLogixReceiptPdf(ruta);
+                                }}
+                                className="p-2.5 rounded-xl bg-orange-100 text-orange-600 border border-orange-200 active:scale-95 transition"
+                                title="Descargar recibo PDF"
+                            >
+                                <FileText className="w-4 h-4" />
+                            </button>
+                        )}
+                        <ChevronRight className="w-4 h-4 text-orange-500" />
+                    </div>
                 </div>
             ))}
         </div>
