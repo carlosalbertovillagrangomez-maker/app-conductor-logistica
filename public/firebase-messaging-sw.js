@@ -1,7 +1,7 @@
-importScripts('https://www.gstatic.com/firebasejs/10.8.1/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/10.8.1/firebase-messaging-compat.js');
+/* public/firebase-messaging-sw.js */
+importScripts("https://www.gstatic.com/firebasejs/12.9.0/firebase-app-compat.js");
+importScripts("https://www.gstatic.com/firebasejs/12.9.0/firebase-messaging-compat.js");
 
-// 1. Configuramos Firebase con los datos de tu proyecto
 firebase.initializeApp({
   apiKey: "AIzaSyDCWNc2Lqh4Girn2PHU4Xiy9e-O2JCa8Gk",
   authDomain: "sistema-transporte-dec9d.firebaseapp.com",
@@ -13,18 +13,19 @@ firebase.initializeApp({
 
 const messaging = firebase.messaging();
 
-// 2. El "Cartero" escucha la alarma cuando el celular está bloqueado
 messaging.onBackgroundMessage((payload) => {
-  console.log('[firebase-messaging-sw.js] Mensaje recibido en segundo plano', payload);
-  
-  const notificationTitle = payload.notification.title || "¡NUEVO VIAJE!";
-  const notificationOptions = {
-    body: payload.notification.body || "Revisa la app, tienes un viaje prioritario cerca.",
-    icon: '/vite.svg', 
-    badge: '/vite.svg',
-    vibrate: [500, 200, 500, 200, 1000], // Patrón de vibración de alarma
-    requireInteraction: true // Obliga al usuario a tocar o cerrar la notificación
+  const title = payload?.notification?.title || "Nuevo servicio TripLogix";
+  const options = {
+    body: payload?.notification?.body || "Tienes una nueva asignación.",
+    icon: "/logo.png",
+    badge: "/logo.png",
+    data: payload?.data || {}
   };
 
-  self.registration.showNotification(notificationTitle, notificationOptions);
+  self.registration.showNotification(title, options);
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(clients.openWindow("/"));
 });

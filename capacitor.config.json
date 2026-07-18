@@ -1,5 +1,16 @@
 {
   "appId": "com.example.app",
   "appName": "TripLogix",
-  "webDir": "dist"
+  "webDir": "dist",
+  "plugins": {
+    "PushNotifications": {
+      "presentationOptions": [
+        "badge",
+        "sound",
+        "alert",
+        "banner",
+        "list"
+      ]
+    }
+  }
 }

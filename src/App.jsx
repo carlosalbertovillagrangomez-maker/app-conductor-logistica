@@ -6,13 +6,14 @@ import {
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
   Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX, Download, Share2
 } from 'lucide-react';
-import { db, requestForToken } from './firebase';
+import { db, requestForToken, setupPushNotifications } from './firebase';
 import { collection, query, where, getDocs, getDoc, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
 import { jsPDF } from 'jspdf';
-const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0"; 
+const GOOGLE_MAPS_API_KEY = "AIzaSyA-t6YcuPK1PdOoHZJOyOsw6PK0tCDJrn0";
+const GOOGLE_VECTOR_MAP_ID = "73f56298887c80075f6fc648";
 const containerStyle = { width: '100%', height: '100%' };
 const centerMX = { lat: 19.4326, lng: -99.1332 };
 const libraries = ['places', 'geometry'];
@@ -22,6 +23,7 @@ const ICON_WAYPOINT = "https://maps.google.com/mapfiles/ms/icons/blue-dot.png";
 const ICON_END = "https://maps.google.com/mapfiles/ms/icons/red-dot.png";
 
 const NAV_MAP_OPTIONS = {
+    mapId: GOOGLE_VECTOR_MAP_ID,
     disableDefaultUI: true,
     gestureHandling: "greedy",
     backgroundColor: "#e2e8f0",
@@ -30,7 +32,9 @@ const NAV_MAP_OPTIONS = {
     mapTypeControl: false,
     fullscreenControl: false,
     streetViewControl: false,
-    rotateControl: false
+    rotateControl: false,
+    tilt: 0,
+    heading: 0
 };
 
 const NAV_POLYLINE_OPTIONS = {
@@ -294,6 +298,61 @@ const formatTripLogixMoney = (value, currency = 'MXN') => {
     } catch (e) {
         return `$${(Number(value) || 0).toFixed(2)} ${currency}`;
     }
+};
+
+const getTripDisplayedPricing = (route) => {
+    if (!route) {
+        return {
+            currency: 'MXN',
+            total: 0,
+            distanceKm: 0,
+            durationMinutes: 0,
+            source: 'Sin información'
+        };
+    }
+
+    const storedCandidates = [
+        route?.pricing?.total,
+        route?.pricing?.estimatedTotal,
+        route?.receipt?.pricing?.total,
+        route?.finalFare,
+        route?.estimatedFare,
+        route?.fare,
+        route?.price,
+        route?.totalPrice,
+        route?.technicalData?.pricing?.total,
+        route?.technicalData?.carpool?.price,
+        route?.technicalData?.carpool?.totalPrice
+    ];
+
+    const storedTotal = storedCandidates
+        .map(value => Number(value))
+        .find(value => Number.isFinite(value) && value > 0);
+
+    const distanceKm = Number(
+        route?.liveNavigation?.distanceKm ??
+        route?.technicalData?.totalDistance ??
+        route?.distanceKm ??
+        0
+    ) || 0;
+
+    const durationMinutes = Number(
+        route?.liveNavigation?.durationMinutes ??
+        route?.technicalData?.totalDuration ??
+        route?.durationMinutes ??
+        0
+    ) || 0;
+
+    const calculated = calculateTripLogixFare(route, {
+        distanceKm,
+        durationMinutes
+    });
+
+    return {
+        ...calculated,
+        total: Number.isFinite(storedTotal) ? roundMoney(storedTotal) : calculated.total,
+        source: Number.isFinite(storedTotal) ? 'Tarifa oficial del despacho' : 'Estimación TripLogix'
+    };
 };
 
 const formatTripLogixDateTime = (value) => {
@@ -953,6 +1012,18 @@ const normalizePath = (path) => {
     return path.map(normalizePoint).filter(Boolean);
 };
 
+const normalizeHeadingDegrees = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return ((number % 360) + 360) % 360;
+};
+
+const getHeadingDifference = (from, to) => {
+    const a = normalizeHeadingDegrees(from);
+    const b = normalizeHeadingDegrees(to);
+    return Math.abs(((b - a + 540) % 360) - 180);
+};
+
 const safeSetMapCamera = (map, loc, heading = 0, zoom = 17) => {
     const validLoc = normalizePoint(loc);
     if (!map || !validLoc) return;
@@ -965,10 +1036,21 @@ const safeSetMapCamera = (map, loc, heading = 0, zoom = 17) => {
             map.setZoom(zoom);
         }
 
-        // Nunca forzamos inclinación ni rotación del mapa en Android WebView.
-        // La orientación se comunica con el icono y las instrucciones, no girando el canvas.
-        if (typeof map.setTilt === 'function' && map.getTilt?.() !== 0) map.setTilt(0);
-        if (typeof map.setHeading === 'function' && map.getHeading?.() !== 0) map.setHeading(0);
+        // Rumbo-arriba estable: gira el mapa vectorial, pero mantiene tilt 0.
+        // Así la ruta queda hacia adelante sin reactivar el modo 3D que causaba pantalla negra.
+        if (typeof map.setTilt === 'function' && Number(map.getTilt?.()) !== 0) {
+            map.setTilt(0);
+        }
+
+        const targetHeading = normalizeHeadingDegrees(heading);
+        const currentHeading = normalizeHeadingDegrees(map.getHeading?.() || 0);
+
+        if (
+            typeof map.setHeading === 'function' &&
+            getHeadingDifference(currentHeading, targetHeading) >= 8
+        ) {
+            map.setHeading(targetHeading);
+        }
     } catch (e) {
         console.error('No se pudo ajustar la cámara del mapa:', e);
     }
@@ -1068,7 +1150,16 @@ function App() {
   const telemetryBusyRef = useRef(false);
   const flushTelemetryRef = useRef(async () => {});
   const routeListenerUnsubscribeRef = useRef(null);
-  
+  const liveNavigationRef = useRef({
+      distanceKm: 0,
+      durationMinutes: 0,
+      nextStopDistanceKm: 0,
+      nextStopDurationMinutes: 0,
+      stopIndex: 0,
+      source: 'fallback'
+  });
+  const pushCleanupRef = useRef(null);
+
   const [userLocation, setUserLocation] = useState(null);
   const [userHeading, setUserHeading] = useState(0); 
   const [isTracking, setIsTracking] = useState(true);
@@ -1449,9 +1540,17 @@ function App() {
           const pointsToFlush = pendingRoutePointsRef.current.slice(-10);
 
           try {
+              const liveNavigation = {
+                  ...liveNavigationRef.current,
+                  stopIndex: nextStopIdx,
+                  driverId: currentDriver.id,
+                  updatedAt: new Date().toISOString()
+              };
+
               const payload = {
                   currentLocation: loc,
-                  lastUpdate: new Date().toISOString()
+                  lastUpdate: liveNavigation.updatedAt,
+                  liveNavigation
               };
 
               if (distanceToFlush > 0) {
@@ -1499,7 +1598,8 @@ function App() {
       currentDriver?.id,
       currentDriver?.isOnline,
       selectedRoute?.id,
-      selectedRoute?.status
+      selectedRoute?.status,
+      nextStopIdx
   ]);
 
   const snappedLocation = useMemo(() => {
@@ -1515,7 +1615,7 @@ function App() {
       const now = Date.now();
       if (now - lastCameraMoveRef.current < 2800) return;
 
-      safeSetMapCamera(mapRef.current, snappedLocation, 0, 17);
+      safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
       lastCameraMoveRef.current = now;
   }, [snappedLocation, selectedRoute?.status]);
 
@@ -1572,6 +1672,15 @@ function App() {
           const remainingDistMeters = Math.max(0, Number(metrics.remainingDistMeters) || 0);
           const nextDurMins = Math.max(0, Number(metrics.nextDurMins) || 0);
           const totalDurMins = Math.max(0, Number(metrics.totalDurMins) || 0);
+
+          liveNavigationRef.current = {
+              distanceKm: roundMoney(remainingDistMeters / 1000),
+              durationMinutes: Math.round(totalDurMins),
+              nextStopDistanceKm: roundMoney(nextDistMeters / 1000),
+              nextStopDurationMinutes: Math.round(nextDurMins),
+              stopIndex: nextStopIdx,
+              source: geometry ? 'google-directions' : 'fallback'
+          };
 
           setLiveRouteData(prev => {
               const nextGeometry = geometry
@@ -1749,6 +1858,10 @@ function App() {
               totalDurMins
           }, routeGeometry);
 
+          // Publica en Firestore la misma distancia y ETA mostradas al conductor.
+          // La app de cliente leerá route.liveNavigation para evitar diferencias.
+          flushTelemetryRef.current(true).catch(() => {});
+
           navigationStepIndexRef.current = 0;
           const nextStep = getNextNavigationStep(loc, steps, navigationStepIndexRef.current);
           if (nextStep) {
@@ -1817,7 +1930,7 @@ function App() {
   const centerOnUser = () => {
       setIsTracking(true);
       if (mapRef.current && snappedLocation) {
-          safeSetMapCamera(mapRef.current, snappedLocation, 0, 17);
+          safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
       }
   };
 
@@ -1849,6 +1962,7 @@ function App() {
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
+      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'fallback' };
 
       if ('speechSynthesis' in window) {
           window.speechSynthesis.cancel();
@@ -2001,6 +2115,79 @@ function App() {
     setIsReady(true);
   }, []);
 
+  useEffect(() => {
+      if (!currentDriver?.id) return undefined;
+
+      let cancelled = false;
+
+      const configurePush = async () => {
+          try {
+              if (pushCleanupRef.current) {
+                  await pushCleanupRef.current();
+                  pushCleanupRef.current = null;
+              }
+
+              const cleanup = await setupPushNotifications({
+                  onToken: async (token) => {
+                      if (!token || cancelled) return;
+                      await updateDoc(doc(db, 'conductores', currentDriver.id), {
+                          pushToken: token,
+                          pushPlatform: 'android',
+                          pushUpdatedAt: new Date().toISOString()
+                      });
+                  },
+                  onNotification: (notification) => {
+                      if (cancelled) return;
+                      playAlertSound();
+                      if ('vibrate' in navigator) {
+                          navigator.vibrate([500, 180, 500]);
+                      }
+                      setMainTab('Pendientes');
+                  },
+                  onAction: async (action) => {
+                      if (cancelled) return;
+
+                      const routeId =
+                          action?.notification?.data?.routeId ||
+                          action?.notification?.data?.tripId;
+
+                      if (!routeId) {
+                          setMainTab('Pendientes');
+                          return;
+                      }
+
+                      try {
+                          const routeSnapshot = await getDoc(doc(db, 'rutas', routeId));
+                          if (routeSnapshot.exists()) {
+                              handleSelectRoute({
+                                  id: routeSnapshot.id,
+                                  ...routeSnapshot.data()
+                              });
+                          }
+                      } catch (pushOpenError) {
+                          console.error('No se pudo abrir el viaje de la notificación:', pushOpenError);
+                          setMainTab('Pendientes');
+                      }
+                  }
+              });
+
+              if (!cancelled) pushCleanupRef.current = cleanup;
+          } catch (pushError) {
+              console.error('No se pudieron configurar las notificaciones push:', pushError);
+          }
+      };
+
+      configurePush();
+
+      return () => {
+          cancelled = true;
+          if (pushCleanupRef.current) {
+              Promise.resolve(pushCleanupRef.current()).catch(() => {});
+              pushCleanupRef.current = null;
+          }
+      };
+  }, [currentDriver?.id]);
+
   const cargarDatosEnFormulario = (data) => {
     setName(data.name || ''); setPhone(data.phone || ''); setAddress(data.address || ''); setRfc(data.rfc || ''); setBloodType(data.bloodType || ''); setEmergencyContact(data.emergencyContact || ''); setLicenseNumber(data.licenseNumber || ''); setLicenseType(data.licenseType || ''); setLicenseExp(data.licenseExp || ''); setVehicleModel(data.vehicleModel || ''); setVehiclePlate(data.vehiclePlate || ''); setVehicleType(data.vehicleType || ''); setPassword(data.password || '');
   };
@@ -2105,6 +2292,7 @@ function App() {
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
+      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'fallback' };
       setRouteUpdateTick(t => t + 1);
 
       // Saludo inicial de voz
@@ -2251,7 +2439,7 @@ function App() {
 
               const loc = normalizePoint(latestLocRef.current);
               if (loc && isTrackingRef.current) {
-                  safeSetMapCamera(mapRef.current, loc, 0, 17);
+                  safeSetMapCamera(mapRef.current, loc, userHeading, 17);
               }
           } catch (e) {
               console.warn('No se pudo redimensionar el mapa:', e);
@@ -2703,6 +2891,14 @@ function App() {
                 </div>
             </div>
 
+            <div className="mb-4 rounded-2xl p-4 bg-green-50 border border-green-200 text-green-800 shadow-sm flex items-center justify-between">
+                <div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-green-600">Valor del servicio</p>
+                    <p className="text-[9px] font-bold uppercase text-green-600 mt-1">{getTripDisplayedPricing(selectedRoute).source}</p>
+                </div>
+                <p className="text-2xl font-black">{formatTripLogixMoney(getTripDisplayedPricing(selectedRoute).total)}</p>
+            </div>
+
             <div className="mb-5 rounded-2xl p-4 bg-orange-500 text-white shadow-xl shadow-orange-500/30 flex items-center gap-4">
                 <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
                     <Clock className="w-6 h-6 text-white" />
@@ -2816,6 +3012,15 @@ function App() {
                             <p className="text-xl font-black text-white flex items-center justify-center gap-2">
                                 <Clock className="w-5 h-5 text-orange-400" />
                                 {getPickupScheduleText(incomingOffer)}
+                            </p>
+                        </div>
+                        <div className="bg-green-50 p-4 rounded-2xl border border-green-200 shadow-sm text-center">
+                            <p className="text-[10px] font-black text-green-600 uppercase tracking-widest">Valor del servicio</p>
+                            <p className="text-2xl font-black text-green-700 mt-1">
+                                {formatTripLogixMoney(getTripDisplayedPricing(incomingOffer).total)}
+                            </p>
+                            <p className="text-[9px] font-bold text-green-600 mt-1 uppercase">
+                                {getTripDisplayedPricing(incomingOffer).source}
                             </p>
                         </div>
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-orange-500"></div><p className="text-[10px] font-black text-orange-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p></div>
