@@ -8,6 +8,9 @@ import {
 } from 'lucide-react';
 import { db, requestForToken, setupPushNotifications } from './firebase';
 import { collection, query, where, getDocs, getDoc, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
+import { Capacitor } from '@capacitor/core';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
@@ -218,6 +221,49 @@ const calculateTripLogixFare = (route, overrides = {}) => {
     };
 };
 
+const calculateDriverProjectedPricing = ({
+    route,
+    remainingDistanceMeters,
+    remainingDurationMinutes,
+    drivenDistanceKm = 0,
+    source = 'driver-live-route'
+}) => {
+    const remainingKm = Math.max(0, Number(remainingDistanceMeters) || 0) / 1000;
+    const committedKm = Math.max(0, Number(drivenDistanceKm) || 0);
+
+    const actualStartMs = getTimestampMs(
+        route?.actualStartTimestamp ||
+        route?.navigationStartedAt ||
+        route?.startedAt
+    );
+
+    const elapsedMinutes = actualStartMs
+        ? Math.max(0, Math.round((Date.now() - actualStartMs) / 60000))
+        : 0;
+
+    const projectedDistanceKm = roundMoney(committedKm + remainingKm);
+    const projectedDurationMinutes = Math.max(
+        0,
+        elapsedMinutes + Math.round(Number(remainingDurationMinutes) || 0)
+    );
+
+    const pricing = calculateTripLogixFare(route, {
+        distanceKm: projectedDistanceKm,
+        durationMinutes: projectedDurationMinutes
+    });
+
+    return {
+        ...pricing,
+        projectedDistanceKm,
+        projectedDurationMinutes,
+        drivenDistanceKm: roundMoney(committedKm),
+        remainingDistanceKm: roundMoney(remainingKm),
+        remainingDurationMinutes: Math.max(0, Math.round(Number(remainingDurationMinutes) || 0)),
+        source,
+        updatedAt: new Date().toISOString(),
+        model: 'TripLogix conductor: distancia recorrida + ruta restante + tiempo proyectado'
+    };
+};
 const makeTripLogixFolio = (route, issuedAt) => {
     if (route?.receipt?.folio) return String(route.receipt.folio);
     const datePart = new Date(issuedAt).toISOString().slice(0, 10).replace(/-/g, '');
@@ -300,6 +346,87 @@ const formatTripLogixMoney = (value, currency = 'MXN') => {
     }
 };
 
+const isDispatcherScheduledTrip = (route) => {
+    if (!route) return false;
+
+    return Boolean(
+        route?.pricingVisibility === 'hidden_during_trip' ||
+        route?.showPricingDuringTrip === false ||
+        route?.tripSource === 'dispatcher' ||
+        route?.createdBy === 'dispatcher' ||
+        route?.pricingPolicy === 'dispatcher_hidden_during_trip' ||
+        route?.officialScheduledTime ||
+        route?.technicalData?.carpool
+    );
+};
+
+const shouldHideTripPricingDuringActive = (route) => {
+    return isDispatcherScheduledTrip(route) && route?.status !== 'Finalizado';
+};
+
+const normalizeWhatsAppPhone = (...values) => {
+    for (const value of values) {
+        const digits = String(value || '').replace(/\D/g, '');
+        if (!digits) continue;
+
+        if (digits.length === 10) return `52${digits}`;
+        if (digits.length === 12 && digits.startsWith('52')) return digits;
+        if (digits.length >= 11 && digits.length <= 15) return digits;
+    }
+
+    return '';
+};
+
+const getRoutePassengerPhone = (route, target, stopIndex = 0) => {
+    const waypointIndex = Math.max(0, Number(stopIndex) - 1);
+    const waypoint = route?.waypointsData?.[waypointIndex];
+    const passengerSchedule = Array.isArray(route?.passengerSchedule)
+        ? route.passengerSchedule
+        : [];
+
+    const targetName = String(
+        target?.passengerName ||
+        target?.contact ||
+        target?.label ||
+        ''
+    ).trim().toLowerCase();
+
+    const scheduleMatch = passengerSchedule.find(item => {
+        const itemName = String(
+            item?.passengerName ||
+            item?.name ||
+            ''
+        ).trim().toLowerCase();
+
+        return targetName && itemName && targetName === itemName;
+    });
+
+    const finalStopIndex = (route?.waypointsData?.length || 0) + 1;
+
+    return normalizeWhatsAppPhone(
+        target?.phone,
+        target?.contactPhone,
+        target?.whatsapp,
+        scheduleMatch?.phone,
+        scheduleMatch?.contactPhone,
+        stopIndex === 0 ? route?.startCoords?.phone : '',
+        stopIndex === 0 ? route?.startCoords?.contactPhone : '',
+        waypoint?.phone,
+        waypoint?.contactPhone,
+        stopIndex >= finalStopIndex ? route?.endCoords?.phone : '',
+        stopIndex >= finalStopIndex ? route?.endCoords?.contactPhone : '',
+        ...(stopIndex === 0 && Array.isArray(route?.startCoords?.passengersSchedule)
+            ? route.startCoords.passengersSchedule.flatMap(item => [item?.phone, item?.contactPhone])
+            : []),
+        ...(stopIndex >= finalStopIndex && Array.isArray(route?.endCoords?.passengersSchedule)
+            ? route.endCoords.passengersSchedule.flatMap(item => [item?.phone, item?.contactPhone])
+            : []),
+        route?.clientPhone,
+        route?.requestUserPhone,
+        route?.requestUser
+    );
+};
+
 const getTripDisplayedPricing = (route) => {
     if (!route) {
         return {
@@ -363,6 +490,36 @@ const formatTripLogixDateTime = (value) => {
         dateStyle: 'medium',
         timeStyle: 'short'
     });
+};
+
+const getCompletedTripSortTimestamp = (route) => {
+    const directCandidates = [
+        route?.actualEndTimestamp,
+        route?.finishedAt,
+        route?.completedAt,
+        route?.endTimestamp,
+        route?.receipt?.actualEndTimestamp,
+        route?.updatedAt
+    ];
+
+    for (const candidate of directCandidates) {
+        const value = getTimestampMs(candidate);
+        if (value) return value;
+    }
+
+    const dateKey = String(route?.finalDate || route?.scheduledDate || '').trim();
+    const endTime = String(route?.endTime || route?.actualEndTime || '').trim();
+
+    if (dateKey && endTime) {
+        const combined = getTimestampMs(`${dateKey} ${endTime}`);
+        if (combined) return combined;
+    }
+
+    return (
+        getTimestampMs(route?.createdDate) ||
+        getTimestampMs(route?.scheduledDate) ||
+        0
+    );
 };
 
 const createTripLogixReceiptPdf = (route) => {
@@ -511,39 +668,101 @@ const createTripLogixReceiptPdf = (route) => {
     return { pdf, receipt };
 };
 
-const downloadTripLogixReceiptPdf = (route) => {
-    const { pdf, receipt } = createTripLogixReceiptPdf(route);
-    pdf.save(`TripLogix_Recibo_${receipt.folio}.pdf`);
+const writeTripLogixPdfToNativeCache = async (pdf, filename) => {
+    const dataUri = String(pdf.output('datauristring') || '');
+    const base64Data = dataUri.includes(',') ? dataUri.split(',')[1] : '';
+
+    if (!base64Data) {
+        throw new Error('No fue posible convertir el recibo PDF.');
+    }
+
+    await Filesystem.writeFile({
+        path: filename,
+        data: base64Data,
+        directory: Directory.Cache,
+        recursive: true
+    });
+
+    const uriResult = await Filesystem.getUri({
+        path: filename,
+        directory: Directory.Cache
+    });
+
+    return uriResult.uri;
 };
 
-const shareTripLogixReceiptPdf = async (route) => {
-    const { pdf, receipt } = createTripLogixReceiptPdf(route);
-    const blob = pdf.output('blob');
-    const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
-
+const downloadTripLogixReceiptPdf = async (route) => {
     try {
-        const file = new File([blob], filename, { type: 'application/pdf' });
-        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({
+        const { pdf, receipt } = createTripLogixReceiptPdf(route);
+        const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
+
+        if (Capacitor.isNativePlatform()) {
+            const fileUri = await writeTripLogixPdfToNativeCache(pdf, filename);
+
+            await Share.share({
                 title: `Recibo TripLogix ${receipt.folio}`,
-                text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
-                files: [file]
+                text: 'Abre, guarda o envía tu comprobante oficial de viaje.',
+                files: [fileUri],
+                dialogTitle: 'Guardar recibo PDF'
             });
             return;
         }
+
+        pdf.save(filename);
     } catch (error) {
         if (error?.name === 'AbortError') return;
-        console.warn('No se pudo compartir directamente el PDF:', error);
+        console.error('No se pudo generar el recibo PDF:', error);
+        alert('No se pudo generar el recibo PDF. Vuelve a intentarlo.');
     }
+};
 
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+const shareTripLogixReceiptPdf = async (route) => {
+    try {
+        const { pdf, receipt } = createTripLogixReceiptPdf(route);
+        const filename = `TripLogix_Recibo_${receipt.folio}.pdf`;
+
+        if (Capacitor.isNativePlatform()) {
+            const fileUri = await writeTripLogixPdfToNativeCache(pdf, filename);
+
+            await Share.share({
+                title: `Recibo TripLogix ${receipt.folio}`,
+                text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
+                files: [fileUri],
+                dialogTitle: 'Compartir recibo'
+            });
+            return;
+        }
+
+        const blob = pdf.output('blob');
+
+        try {
+            const file = new File([blob], filename, { type: 'application/pdf' });
+            if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    title: `Recibo TripLogix ${receipt.folio}`,
+                    text: `Comprobante oficial de viaje TripLogix ${receipt.folio}`,
+                    files: [file]
+                });
+                return;
+            }
+        } catch (webShareError) {
+            if (webShareError?.name === 'AbortError') return;
+            console.warn('No se pudo compartir directamente el PDF:', webShareError);
+        }
+
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (error) {
+        if (error?.name === 'AbortError') return;
+        console.error('No se pudo compartir el recibo PDF:', error);
+        alert('No se pudo compartir el recibo PDF. Vuelve a intentarlo.');
+    }
 };
 
 
@@ -1121,6 +1340,7 @@ function App() {
   const [isPanelExpanded, setIsPanelExpanded] = useState(true);
 
   const [isWaiting, setIsWaiting] = useState(false);
+  const [showTripChat, setShowTripChat] = useState(false);
   const [chatText, setChatText] = useState('');
   const [evidence, setEvidence] = useState(null);
   const [incomingOffer, setIncomingOffer] = useState(null);
@@ -1158,6 +1378,11 @@ function App() {
       stopIndex: 0,
       source: 'fallback'
   });
+  const liveRouteGeometryRef = useRef([]);
+  const livePricingRef = useRef(null);
+  const liveRoutePublishDirtyRef = useRef(false);
+  const committedDistanceKmRef = useRef(0);
+  const userHeadingRef = useRef(0);
   const pushCleanupRef = useRef(null);
 
   const [userLocation, setUserLocation] = useState(null);
@@ -1252,8 +1477,9 @@ function App() {
   }, []);
 
   useEffect(() => { latestLocRef.current = userLocation; }, [userLocation]);
+  useEffect(() => { userHeadingRef.current = normalizeHeadingDegrees(userHeading); }, [userHeading]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
-  useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting]);
+  useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting, showTripChat]);
 
   // === LÓGICA DEL NARRADOR (TEXT-TO-SPEECH) ===
   useEffect(() => {
@@ -1520,7 +1746,8 @@ function App() {
   }, [userLocation, selectedRoute?.currentLocation, currentDriver?.currentLocation]);
 
 
-  // Envío por lotes de ubicación, odómetro y puntos reales para evitar saturar WebView/Firestore.
+  // Envío por lotes de ubicación, ruta recalculada, rumbo, ETA y precio oficial.
+  // La geometría pesada solo se publica cuando Google recalcula la ruta.
   useEffect(() => {
       if (!currentDriver || selectedRoute?.status !== 'En Ruta' || !selectedRoute?.id) return undefined;
 
@@ -1538,20 +1765,47 @@ function App() {
 
           const distanceToFlush = pendingDistanceKmRef.current;
           const pointsToFlush = pendingRoutePointsRef.current.slice(-10);
+          const shouldPublishGeometry =
+              liveRoutePublishDirtyRef.current &&
+              normalizePath(liveRouteGeometryRef.current).length > 1;
 
           try {
+              const updatedAt = new Date().toISOString();
+              const heading = normalizeHeadingDegrees(userHeadingRef.current);
+
               const liveNavigation = {
                   ...liveNavigationRef.current,
                   stopIndex: nextStopIdx,
+                  currentStopIndex: nextStopIdx,
                   driverId: currentDriver.id,
-                  updatedAt: new Date().toISOString()
+                  heading,
+                  updatedAt
               };
 
               const payload = {
                   currentLocation: loc,
-                  lastUpdate: liveNavigation.updatedAt,
+                  currentStopIndex: nextStopIdx,
+                  nextStopIdx,
+                  liveHeading: heading,
+                  lastUpdate: updatedAt,
                   liveNavigation
               };
+
+              if (livePricingRef.current?.total !== undefined) {
+                  payload.pricing = {
+                      ...livePricingRef.current,
+                      updatedAt
+                  };
+                  payload.pricingStatus = 'Calculada por conductor';
+              }
+
+              if (shouldPublishGeometry) {
+                  payload.liveRouteGeometry = downsamplePath(
+                      liveRouteGeometryRef.current,
+                      260
+                  );
+                  payload.liveRouteUpdatedAt = updatedAt;
+              }
 
               if (distanceToFlush > 0) {
                   payload.realDistanceDriven = increment(distanceToFlush);
@@ -1564,6 +1818,9 @@ function App() {
               await updateDoc(doc(db, 'rutas', selectedRoute.id), payload);
 
               if (distanceToFlush > 0) {
+                  committedDistanceKmRef.current = roundMoney(
+                      committedDistanceKmRef.current + distanceToFlush
+                  );
                   pendingDistanceKmRef.current = Math.max(
                       0,
                       pendingDistanceKmRef.current - distanceToFlush
@@ -1574,10 +1831,15 @@ function App() {
                   pendingRoutePointsRef.current = [];
               }
 
+              if (shouldPublishGeometry) {
+                  liveRoutePublishDirtyRef.current = false;
+              }
+
               if (currentDriver.isOnline) {
                   updateDoc(doc(db, 'conductores', currentDriver.id), {
                       currentLocation: loc,
-                      lastLocationUpdate: new Date().toISOString()
+                      heading,
+                      lastLocationUpdate: updatedAt
                   }).catch(() => {});
               }
           } catch (e) {
@@ -1590,6 +1852,7 @@ function App() {
       flushTelemetryRef.current = flushTelemetry;
       flushTelemetry();
       const interval = setInterval(flushTelemetry, 12000);
+
       return () => {
           clearInterval(interval);
           flushTelemetryRef.current = async () => {};
@@ -1634,7 +1897,45 @@ function App() {
 
   const aceptarViaje = async () => {
       if (!incomingOffer || !currentDriver) return;
-      try { await updateDoc(doc(db, "rutas", incomingOffer.id), { driver: currentDriver.name, driverId: currentDriver.id, ofertaEstado: 'Aceptada', status: 'Aceptada' }); setIncomingOffer(null); setMainTab('Pendientes'); } catch (e) { alert("Error al aceptar viaje"); }
+
+      try {
+          const distanceKm = Number(incomingOffer?.technicalData?.totalDistance) || 0;
+          const durationMinutes = Number(incomingOffer?.technicalData?.totalDuration) || 0;
+          const acceptedAt = new Date().toISOString();
+
+          const officialPricing = {
+              ...calculateTripLogixFare(incomingOffer, {
+                  distanceKm,
+                  durationMinutes
+              }),
+              source: 'driver-planned-route',
+              updatedAt: acceptedAt,
+              model: 'TripLogix calculado por la app del conductor'
+          };
+
+          await updateDoc(doc(db, "rutas", incomingOffer.id), {
+              driver: currentDriver.name,
+              driverId: currentDriver.id,
+              driverPhone: currentDriver.phone || '',
+              driverVehicle: currentDriver.vehicle || '',
+              vehicleModel: currentDriver.vehicleModel || '',
+              vehicleType: currentDriver.vehicleType || '',
+              vehiclePlate: currentDriver.vehiclePlate || '',
+              driverPhoto: currentDriver.fotoPerfil || '',
+              driverRating: Number(currentDriver.rating) || 5,
+              ofertaEstado: 'Aceptada',
+              status: 'Aceptada',
+              acceptedAt,
+              pricing: officialPricing,
+              pricingStatus: 'Calculada por conductor'
+          });
+
+          setIncomingOffer(null);
+          setMainTab('Pendientes');
+      } catch (e) {
+          console.error('Error al aceptar viaje:', e);
+          alert("Error al aceptar viaje");
+      }
   };
   const rechazarViaje = async () => {
       if (!incomingOffer || !currentDriver) return;
@@ -1672,15 +1973,52 @@ function App() {
           const remainingDistMeters = Math.max(0, Number(metrics.remainingDistMeters) || 0);
           const nextDurMins = Math.max(0, Number(metrics.nextDurMins) || 0);
           const totalDurMins = Math.max(0, Number(metrics.totalDurMins) || 0);
+          const source = geometry
+              ? 'driver-google-directions'
+              : 'driver-fallback';
+
+          const heading = normalizeHeadingDegrees(userHeadingRef.current);
+          const updatedAt = new Date().toISOString();
 
           liveNavigationRef.current = {
               distanceKm: roundMoney(remainingDistMeters / 1000),
               durationMinutes: Math.round(totalDurMins),
               nextStopDistanceKm: roundMoney(nextDistMeters / 1000),
               nextStopDurationMinutes: Math.round(nextDurMins),
+              distanceMeters: Math.round(remainingDistMeters),
+              durationSeconds: Math.round(totalDurMins * 60),
+              totalDistanceMeters: Math.round(remainingDistMeters),
+              totalDurationSeconds: Math.round(totalDurMins * 60),
+              nextStopDistanceMeters: Math.round(nextDistMeters),
+              nextStopDurationSeconds: Math.round(nextDurMins * 60),
               stopIndex: nextStopIdx,
-              source: geometry ? 'google-directions' : 'fallback'
+              currentStopIndex: nextStopIdx,
+              heading,
+              source,
+              updatedAt
           };
+
+          const drivenDistanceKm =
+              committedDistanceKmRef.current +
+              pendingDistanceKmRef.current;
+
+          livePricingRef.current = calculateDriverProjectedPricing({
+              route: selectedRoute,
+              remainingDistanceMeters: remainingDistMeters,
+              remainingDurationMinutes: totalDurMins,
+              drivenDistanceKm,
+              source: geometry
+                  ? 'driver-live-route'
+                  : 'driver-live-fallback'
+          });
+
+          if (geometry) {
+              const normalizedGeometry = downsamplePath(geometry, 260);
+              if (normalizedGeometry.length > 1) {
+                  liveRouteGeometryRef.current = normalizedGeometry;
+                  liveRoutePublishDirtyRef.current = true;
+              }
+          }
 
           setLiveRouteData(prev => {
               const nextGeometry = geometry
@@ -1718,7 +2056,7 @@ function App() {
                       stopIndex: nextStopIdx,
                       passenger: allTargets[nextStopIdx]?.contact || 'Pasajero',
                       etaMins: nextDurMins,
-                      timestamp: new Date().toISOString()
+                      timestamp: updatedAt
                   }
               }).catch(e => console.error('Error enviando alerta de proximidad:', e));
           }
@@ -1738,8 +2076,8 @@ function App() {
           : Infinity;
 
       const stopChanged = lastDirectionsStopRef.current !== nextStopIdx;
-      const routeExpired = now - lastDirectionsRequestRef.current >= 60000;
-      const driverLeftRouteArea = movedSinceLastRoute >= 180;
+      const routeExpired = now - lastDirectionsRequestRef.current >= 30000;
+      const driverLeftRouteArea = movedSinceLastRoute >= 90;
 
       if (!stopChanged && !routeExpired && !driverLeftRouteArea) return;
 
@@ -1774,7 +2112,14 @@ function App() {
           waypoints,
           optimizeWaypoints: false,
           travelMode: window.google.maps.TravelMode.DRIVING,
-          provideRouteAlternatives: false
+          provideRouteAlternatives: false,
+          avoidFerries: true,
+          avoidHighways: false,
+          avoidTolls: false,
+          drivingOptions: {
+              departureTime: new Date(),
+              trafficModel: window.google.maps.TrafficModel?.BEST_GUESS || 'bestguess'
+          }
       }, (result, status) => {
           if (requestId !== directionsRequestIdRef.current) return;
           directionsBusyRef.current = false;
@@ -1938,6 +2283,7 @@ function App() {
 
   const cerrarRuta = () => {
       localStorage.removeItem('active_trip_id');
+      setShowTripChat(false);
       setSelectedRoute(null);
       setNextStopIdx(0);
       setAlertedStops([]);
@@ -1962,7 +2308,11 @@ function App() {
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
-      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'fallback' };
+      committedDistanceKmRef.current = 0;
+      liveRouteGeometryRef.current = [];
+      livePricingRef.current = null;
+      liveRoutePublishDirtyRef.current = false;
+      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'driver-fallback' };
 
       if ('speechSynthesis' in window) {
           window.speechSynthesis.cancel();
@@ -2039,6 +2389,33 @@ function App() {
       try { await updateDoc(doc(db, "rutas", selectedRoute.id), { chat: arrayUnion(msg) }); setChatText(''); } catch(e) {}
   };
 
+  const abrirWhatsAppPasajero = (route = selectedRoute, target = null, stopIndex = nextStopIdx) => {
+      const phoneNumber = getRoutePassengerPhone(route, target, stopIndex);
+
+      if (!phoneNumber) {
+          alert('Este pasajero no tiene un número de WhatsApp registrado. Agrégalo desde el despachador para habilitar este botón.');
+          return;
+      }
+
+      const passengerName = String(
+          target?.passengerName ||
+          target?.contact ||
+          route?.client ||
+          'pasajero'
+      ).trim();
+
+      const message = encodeURIComponent(
+          `Hola ${passengerName}, soy tu conductor de TripLogix. Estoy en ruta y te contacto sobre tu servicio.`
+      );
+
+      const url = `https://wa.me/${phoneNumber}?text=${message}`;
+      const opened = window.open(url, '_blank', 'noopener,noreferrer');
+
+      if (!opened) {
+          window.location.href = url;
+      }
+  };
+
   const handlePhoto = (e) => {
       const file = e.target.files[0];
       if(file) {
@@ -2097,8 +2474,23 @@ function App() {
   };
 
   const handleSelectRoute = (ruta) => {
-      setSelectedRoute(ruta); setAlertedStops([]); setIsApproaching(false); setIsWaiting(false);
-      if (ruta.status === 'En Ruta') { localStorage.setItem('active_trip_id', ruta.id); const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`); if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10)); } else { setNextStopIdx(0); }
+      committedDistanceKmRef.current = Math.max(0, Number(ruta?.realDistanceDriven) || 0);
+      liveRouteGeometryRef.current = normalizePath(ruta?.liveRouteGeometry);
+      livePricingRef.current = ruta?.pricing?.total !== undefined ? { ...ruta.pricing } : null;
+      liveRoutePublishDirtyRef.current = false;
+
+      setSelectedRoute(ruta);
+      setAlertedStops([]);
+      setIsApproaching(false);
+      setIsWaiting(false);
+
+      if (ruta.status === 'En Ruta') {
+          localStorage.setItem('active_trip_id', ruta.id);
+          const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`);
+          if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10));
+      } else {
+          setNextStopIdx(0);
+      }
   };
 
   const [password, setPassword] = useState('');
@@ -2250,11 +2642,26 @@ function App() {
 
     try {
       const actualStartTime = getMexicoTime();
+      const navigationStartedAt = new Date().toISOString();
+      const plannedDistanceKm = Number(routeToStart?.technicalData?.totalDistance) || 0;
+      const plannedDurationMinutes = Number(routeToStart?.technicalData?.totalDuration) || 0;
+      const plannedPricing = {
+          ...calculateTripLogixFare(routeToStart, {
+              distanceKm: plannedDistanceKm,
+              durationMinutes: plannedDurationMinutes
+          }),
+          source: 'driver-planned-route',
+          updatedAt: navigationStartedAt,
+          model: 'TripLogix calculado por la app del conductor'
+      };
+
       const updateData = {
           status: 'En Ruta',
           actualStartTime,
-          actualStartTimestamp: new Date().toISOString(),
-          navigationStartedAt: new Date().toISOString(),
+          actualStartTimestamp: navigationStartedAt,
+          navigationStartedAt,
+          pricing: plannedPricing,
+          pricingStatus: 'Calculada por conductor',
           "proximityAlert.active": false
       };
 
@@ -2292,7 +2699,11 @@ function App() {
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
-      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'fallback' };
+      committedDistanceKmRef.current = Math.max(0, Number(routeToStart?.realDistanceDriven) || 0);
+      liveRouteGeometryRef.current = [];
+      liveRoutePublishDirtyRef.current = false;
+      livePricingRef.current = plannedPricing;
+      liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'driver-fallback' };
       setRouteUpdateTick(t => t + 1);
 
       // Saludo inicial de voz
@@ -2352,6 +2763,13 @@ function App() {
           actualEndTime
       });
 
+      const finalPricing = {
+          ...receipt.pricing,
+          source: 'driver-final',
+          updatedAt: actualEndTimestamp,
+          model: 'TripLogix costo final calculado por la app del conductor'
+      };
+
       const finalUpdate = {
           status: 'Finalizado',
           endTime: actualEndTime,
@@ -2359,10 +2777,16 @@ function App() {
           actualEndTimestamp,
           finishedAt: actualEndTimestamp,
           finalDate: getMexicoDate(),
-          receipt,
-          finalFare: receipt.pricing.total,
+          receipt: {
+              ...receipt,
+              pricing: finalPricing
+          },
+          pricing: finalPricing,
+          pricingStatus: 'Final calculada por conductor',
+          finalFare: finalPricing.total,
           finalDistanceKm: receipt.distanceKm,
           finalDurationMinutes: receipt.durationMinutes,
+          liveHeading: normalizeHeadingDegrees(userHeadingRef.current),
           "proximityAlert.active": false
       };
 
@@ -2450,14 +2874,19 @@ function App() {
   }, [isPanelExpanded, selectedRoute?.status]);
 
   const navigationRenderGeometry = useMemo(() => {
-      const liveGeometry = normalizePath(liveRouteData.geometry);
-      const plannedGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
+      const localGoogleGeometry = normalizePath(liveRouteData.geometry);
+      const publishedGoogleGeometry = normalizePath(selectedRoute?.liveRouteGeometry);
 
+      // Durante el recorrido solo se dibuja una ruta confirmada por Google Directions.
+      // La geometría OSRM del despachador es únicamente para planeación y no se usa
+      // como navegación activa, evitando líneas visuales por zonas sin calles.
       return downsamplePath(
-          liveGeometry.length > 0 ? liveGeometry : plannedGeometry,
+          localGoogleGeometry.length > 1
+              ? localGoogleGeometry
+              : publishedGoogleGeometry,
           260
       );
-  }, [liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
+  }, [liveRouteData.geometry, selectedRoute?.liveRouteGeometry]);
 
   if (!isReady) return null;
 
@@ -2483,9 +2912,107 @@ function App() {
       const firstPointArrivalTime = getFirstPointArrivalText(selectedRoute);
       const currentEstimatedArrivalTime = getEstimatedArrivalTimeFromMinutes(liveRouteData.nextStopDuration);
       const isHeadingToFirstPoint = nextStopIdx === 0;
+      const currentPassengerPhone = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
+
+              {showTripChat && (
+                  <div
+                      className="fixed inset-0 z-[10040] bg-slate-950/85 backdrop-blur-sm flex flex-col"
+                      style={{
+                          paddingTop: 'env(safe-area-inset-top)',
+                          paddingBottom: 'env(safe-area-inset-bottom)'
+                      }}
+                  >
+                      <div className="bg-slate-900 text-white px-4 py-4 flex items-center gap-3 shadow-lg shrink-0">
+                          <button
+                              type="button"
+                              onClick={() => setShowTripChat(false)}
+                              className="p-2 rounded-full bg-white/10 active:scale-95 transition"
+                          >
+                              <ChevronLeft className="w-5 h-5" />
+                          </button>
+                          <div className="flex-1 min-w-0">
+                              <p className="text-[10px] font-black uppercase tracking-widest text-orange-400">Chat del viaje</p>
+                              <p className="font-black truncate">{currentTarget?.contact || selectedRoute.client || 'Pasajero'}</p>
+                          </div>
+                          <button
+                              type="button"
+                              onClick={() => abrirWhatsAppPasajero(selectedRoute, currentTarget, nextStopIdx)}
+                              disabled={!currentPassengerPhone}
+                              className={`px-3 py-2 rounded-xl text-[10px] font-black flex items-center gap-1.5 ${
+                                  currentPassengerPhone
+                                      ? 'bg-green-500 text-white active:scale-95'
+                                      : 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                              }`}
+                          >
+                              <Phone className="w-4 h-4" /> WHATSAPP
+                          </button>
+                      </div>
+
+                      <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-100">
+                          {(selectedRoute.chat || []).length === 0 && (
+                              <div className="h-full flex items-center justify-center text-center p-8">
+                                  <div>
+                                      <MessageSquare className="w-10 h-10 text-slate-300 mx-auto mb-3" />
+                                      <p className="font-black text-slate-500">Aún no hay mensajes</p>
+                                      <p className="text-xs text-slate-400 mt-1">Escribe al cliente sin salir de la navegación.</p>
+                                  </div>
+                              </div>
+                          )}
+
+                          {(selectedRoute.chat || []).map((msg, index) => {
+                              if (msg.sender === 'Sistema') {
+                                  return (
+                                      <div key={index} className="text-center">
+                                          <span className="inline-block bg-red-100 text-red-700 px-3 py-1 rounded-full text-[10px] font-bold">
+                                              {msg.text}
+                                          </span>
+                                      </div>
+                                  );
+                              }
+
+                              const isDriverMessage = msg.sender === 'Conductor';
+
+                              return (
+                                  <div key={index} className={`flex ${isDriverMessage ? 'justify-end' : 'justify-start'}`}>
+                                      <div className={`max-w-[82%] p-3 rounded-2xl shadow-sm ${
+                                          isDriverMessage
+                                              ? 'bg-orange-500 text-white rounded-tr-sm'
+                                              : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'
+                                      }`}>
+                                          <p className="text-sm leading-snug">{msg.text}</p>
+                                          <p className={`text-[9px] font-bold text-right mt-1 ${
+                                              isDriverMessage ? 'text-orange-100' : 'text-slate-400'
+                                          }`}>
+                                              {msg.time}
+                                          </p>
+                                      </div>
+                                  </div>
+                              );
+                          })}
+                      </div>
+
+                      <div className="bg-white border-t border-slate-200 p-3 flex items-center gap-2 shrink-0">
+                          <input
+                              type="text"
+                              value={chatText}
+                              onChange={(event) => setChatText(event.target.value)}
+                              onKeyDown={(event) => event.key === 'Enter' && enviarMensaje()}
+                              placeholder="Escribe un mensaje al cliente..."
+                              className="flex-1 min-w-0 bg-slate-100 border border-slate-200 rounded-full px-4 py-3 text-sm outline-none focus:border-orange-500"
+                          />
+                          <button
+                              type="button"
+                              onClick={enviarMensaje}
+                              className="p-3 bg-orange-500 text-white rounded-full shadow-lg active:scale-95 transition"
+                          >
+                              <Send className="w-5 h-5" />
+                          </button>
+                      </div>
+                  </div>
+              )}
 
               {completedTripNotice && (
                   <div className="fixed inset-0 z-[10020] bg-slate-900/85 backdrop-blur-md flex items-center justify-center p-5">
@@ -2601,7 +3128,18 @@ function App() {
 
                       <div className="bg-white p-4 border-t border-slate-200 shadow-[0_-10px_20px_rgba(0,0,0,0.05)] shrink-0 space-y-3">
                           <div className="flex gap-2">
-                              <a href={`https://wa.me/52${selectedRoute.clientPhone || '1234567890'}?text=Hola,%20soy%20tu%20conductor.%20Ya%20me%20encuentro%20afuera.`} target="_blank" rel="noreferrer" className="flex-1 bg-green-500 hover:bg-green-600 text-white p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition-colors shadow-sm"><Phone className="w-5 h-5"/> WHATSAPP</a>
+                              <button
+                                  type="button"
+                                  onClick={() => abrirWhatsAppPasajero(selectedRoute, currentTarget, nextStopIdx)}
+                                  disabled={!currentPassengerPhone}
+                                  className={`flex-1 p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs transition shadow-sm ${
+                                      currentPassengerPhone
+                                          ? 'bg-green-500 hover:bg-green-600 text-white active:scale-95'
+                                          : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                                  }`}
+                              >
+                                  <Phone className="w-5 h-5"/> WHATSAPP
+                              </button>
                               <label className={`flex-1 p-3 rounded-xl flex flex-col items-center justify-center gap-1 font-black text-xs cursor-pointer transition-colors shadow-sm ${evidence ? 'bg-green-100 text-green-700 border-2 border-green-500' : 'bg-slate-800 text-white hover:bg-slate-900'}`}>
                                   {evidence ? <CheckCircle2 className="w-5 h-5"/> : <Camera className="w-5 h-5"/>} {evidence ? 'FOTO LISTA' : 'TOMAR FOTO'}
                                   <input type="file" accept="image/*" capture="environment" hidden onChange={handlePhoto} />
@@ -2693,7 +3231,41 @@ function App() {
                                 <p className="text-xs font-bold text-slate-600 mt-1">Activa ubicación precisa y permisos de localización para ver el carrito en el mapa.</p>
                             </div>
                         )}
-                        
+
+                        {snappedLocation && currentGeometry.length === 0 && (
+                            <div className="absolute top-4 left-4 right-4 z-20 bg-white/95 border border-blue-200 rounded-2xl px-4 py-3 shadow-lg text-center">
+                                <p className="text-[10px] font-black text-blue-600 uppercase tracking-widest">Calculando ruta por calles</p>
+                                <p className="text-xs font-bold text-slate-600 mt-1">La línea aparecerá cuando Google confirme la ruta vehicular.</p>
+                            </div>
+                        )}
+
+                        <div className="absolute right-4 top-[150px] z-30 flex flex-col gap-3">
+                            <button
+                                type="button"
+                                onClick={() => setShowTripChat(true)}
+                                className="w-14 h-14 rounded-2xl bg-slate-900 text-white shadow-2xl border border-slate-700 flex flex-col items-center justify-center active:scale-95 transition"
+                                title="Abrir chat"
+                            >
+                                <MessageSquare className="w-5 h-5" />
+                                <span className="text-[8px] font-black mt-1">CHAT</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => abrirWhatsAppPasajero(selectedRoute, currentTarget, nextStopIdx)}
+                                disabled={!currentPassengerPhone}
+                                className={`w-14 h-14 rounded-2xl shadow-2xl flex flex-col items-center justify-center transition ${
+                                    currentPassengerPhone
+                                        ? 'bg-green-500 text-white active:scale-95'
+                                        : 'bg-slate-300 text-slate-500 cursor-not-allowed'
+                                }`}
+                                title={currentPassengerPhone ? 'Enviar WhatsApp al pasajero' : 'Pasajero sin WhatsApp registrado'}
+                            >
+                                <Phone className="w-5 h-5" />
+                                <span className="text-[8px] font-black mt-1">WHATSAPP</span>
+                            </button>
+                        </div>
+
                         {snappedLocation && (
                             <button onClick={centerOnUser} style={{ bottom: isPanelExpanded ? '340px' : '100px' }} className={`absolute left-4 p-3 rounded-full shadow-[0_4px_15px_rgba(0,0,0,0.2)] border transition-all duration-300 z-10 ${isTracking ? 'bg-orange-500 text-white border-orange-600' : 'bg-white text-orange-500 border-slate-200 active:bg-orange-50'}`}>
                                 {isTracking ? <Navigation2 className="w-6 h-6" /> : <LocateFixed className="w-6 h-6" />}
@@ -2891,13 +3463,20 @@ function App() {
                 </div>
             </div>
 
-            <div className="mb-4 rounded-2xl p-4 bg-green-50 border border-green-200 text-green-800 shadow-sm flex items-center justify-between">
-                <div>
-                    <p className="text-[10px] font-black uppercase tracking-widest text-green-600">Valor del servicio</p>
-                    <p className="text-[9px] font-bold uppercase text-green-600 mt-1">{getTripDisplayedPricing(selectedRoute).source}</p>
+            {!shouldHideTripPricingDuringActive(selectedRoute) ? (
+                <div className="mb-4 rounded-2xl p-4 bg-green-50 border border-green-200 text-green-800 shadow-sm flex items-center justify-between">
+                    <div>
+                        <p className="text-[10px] font-black uppercase tracking-widest text-green-600">Valor del servicio</p>
+                        <p className="text-[9px] font-bold uppercase text-green-600 mt-1">{getTripDisplayedPricing(selectedRoute).source}</p>
+                    </div>
+                    <p className="text-2xl font-black">{formatTripLogixMoney(getTripDisplayedPricing(selectedRoute).total)}</p>
                 </div>
-                <p className="text-2xl font-black">{formatTripLogixMoney(getTripDisplayedPricing(selectedRoute).total)}</p>
-            </div>
+            ) : (
+                <div className="mb-4 rounded-2xl p-4 bg-blue-50 border border-blue-200 text-blue-800 shadow-sm">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-blue-600">Servicio corporativo programado</p>
+                    <p className="text-sm font-black mt-1">La tarifa no se muestra durante el recorrido.</p>
+                </div>
+            )}
 
             <div className="mb-5 rounded-2xl p-4 bg-orange-500 text-white shadow-xl shadow-orange-500/30 flex items-center gap-4">
                 <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center shrink-0">
@@ -2986,9 +3565,13 @@ function App() {
             return true; // 'Todos' y 'Próximo' pasan este primer filtro
         })
         .sort((a,b) => {
+            if (mainTab === 'Finalizados') {
+                return getCompletedTripSortTimestamp(b) - getCompletedTripSortTimestamp(a);
+            }
+
             if (a.status === 'En Ruta' && b.status !== 'En Ruta') return -1;
             if (b.status === 'En Ruta' && a.status !== 'En Ruta') return 1;
-            
+
             const dateA = getPickupSortableDateTime(a);
             const dateB = getPickupSortableDateTime(b);
             return dateA - dateB;
@@ -3002,10 +3585,10 @@ function App() {
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
         {incomingOffer && (
-            <div className="absolute inset-0 z-[9999] flex items-center justify-center p-6 bg-slate-900/90 backdrop-blur-md animate-in fade-in zoom-in duration-300">
-                <div className="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl border-4 border-yellow-400 flex flex-col">
+            <div className="fixed inset-0 z-[9999] flex items-center justify-center p-3 sm:p-6 bg-slate-900/90 backdrop-blur-md animate-in fade-in zoom-in duration-300" style={{ paddingTop: "max(12px, env(safe-area-inset-top))", paddingBottom: "max(12px, env(safe-area-inset-bottom))" }}>
+                <div className="bg-white rounded-[2rem] w-full max-w-sm max-h-[calc(100dvh-24px)] overflow-hidden shadow-2xl border-4 border-yellow-400 flex flex-col">
                     <div className="bg-yellow-400 p-6 text-center shrink-0 relative overflow-hidden"><div className="absolute inset-0 bg-yellow-500/20 animate-pulse"></div><div className="relative z-10 flex flex-col items-center"><div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg mb-3"><Zap className="w-8 h-8 text-yellow-500" /></div><h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">¡NUEVO VIAJE!</h2><p className="text-xs font-bold text-yellow-900 mt-1 uppercase tracking-widest">A unos kilómetros de ti</p></div></div>
-                    <div className="p-6 bg-slate-50 space-y-4">
+                    <div className="p-5 bg-slate-50 space-y-3 overflow-y-auto">
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Cliente Solicitante</p><p className="text-lg font-black text-slate-800">{incomingOffer.client}</p></div>
                         <div className="bg-slate-900 p-4 rounded-2xl shadow-sm text-center border border-slate-800">
                             <p className="text-[10px] font-black text-orange-300 uppercase tracking-widest mb-1">Hora de recogida</p>
@@ -3014,19 +3597,26 @@ function App() {
                                 {getPickupScheduleText(incomingOffer)}
                             </p>
                         </div>
-                        <div className="bg-green-50 p-4 rounded-2xl border border-green-200 shadow-sm text-center">
-                            <p className="text-[10px] font-black text-green-600 uppercase tracking-widest">Valor del servicio</p>
-                            <p className="text-2xl font-black text-green-700 mt-1">
-                                {formatTripLogixMoney(getTripDisplayedPricing(incomingOffer).total)}
-                            </p>
-                            <p className="text-[9px] font-bold text-green-600 mt-1 uppercase">
-                                {getTripDisplayedPricing(incomingOffer).source}
-                            </p>
-                        </div>
+                        {!shouldHideTripPricingDuringActive(incomingOffer) ? (
+                            <div className="bg-green-50 p-4 rounded-2xl border border-green-200 shadow-sm text-center">
+                                <p className="text-[10px] font-black text-green-600 uppercase tracking-widest">Valor del servicio</p>
+                                <p className="text-2xl font-black text-green-700 mt-1">
+                                    {formatTripLogixMoney(getTripDisplayedPricing(incomingOffer).total)}
+                                </p>
+                                <p className="text-[9px] font-bold text-green-600 mt-1 uppercase">
+                                    {getTripDisplayedPricing(incomingOffer).source}
+                                </p>
+                            </div>
+                        ) : (
+                            <div className="bg-blue-50 p-4 rounded-2xl border border-blue-200 shadow-sm text-center">
+                                <p className="text-[10px] font-black text-blue-600 uppercase tracking-widest">Servicio corporativo programado</p>
+                                <p className="text-sm font-black text-blue-800 mt-1">Tarifa administrada por despacho</p>
+                            </div>
+                        )}
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-orange-500"></div><p className="text-[10px] font-black text-orange-500 uppercase tracking-widest mb-1 pl-2">Recoger en:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.start}</p></div>
                         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden"><div className="absolute left-0 top-0 bottom-0 w-1.5 bg-red-500"></div><p className="text-[10px] font-black text-red-500 uppercase tracking-widest mb-1 pl-2">Llevar a:</p><p className="text-sm font-medium text-slate-700 line-clamp-2 pl-2">{incomingOffer.end}</p></div>
                     </div>
-                    <div className="p-6 bg-white border-t border-slate-100 flex gap-3 shrink-0"><button onClick={rechazarViaje} className="w-1/3 py-4 rounded-2xl bg-red-50 text-red-600 font-bold text-xs uppercase tracking-widest border border-red-200 hover:bg-red-100 transition active:scale-95">Rechazar</button><button onClick={aceptarViaje} className="w-2/3 py-4 rounded-2xl bg-green-500 text-white font-black text-sm uppercase tracking-widest shadow-xl shadow-green-500/30 hover:bg-green-600 transition active:scale-95 flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> Aceptar Viaje</button></div>
+                    <div className="p-4 bg-white border-t border-slate-100 flex gap-3 shrink-0 sticky bottom-0"><button onClick={rechazarViaje} className="w-1/3 py-4 rounded-2xl bg-red-50 text-red-600 font-bold text-xs uppercase tracking-widest border border-red-200 hover:bg-red-100 transition active:scale-95">Rechazar</button><button onClick={aceptarViaje} className="w-2/3 py-4 rounded-2xl bg-green-500 text-white font-black text-sm uppercase tracking-widest shadow-xl shadow-green-500/30 hover:bg-green-600 transition active:scale-95 flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5"/> Aceptar Viaje</button></div>
                 </div>
             </div>
         )}
