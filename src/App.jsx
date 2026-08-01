@@ -11,6 +11,7 @@ import { collection, query, where, getDocs, getDoc, addDoc, onSnapshot, updateDo
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
+import { TextToSpeech } from '@capacitor-community/text-to-speech';
 
 // --- GOOGLE MAPS ---
 import { GoogleMap, useJsApiLoader, Marker, Polyline } from '@react-google-maps/api';
@@ -378,53 +379,135 @@ const normalizeWhatsAppPhone = (...values) => {
 };
 
 const getRoutePassengerPhone = (route, target, stopIndex = 0) => {
-    const waypointIndex = Math.max(0, Number(stopIndex) - 1);
-    const waypoint = route?.waypointsData?.[waypointIndex];
+    const safeStopIndex = Math.max(0, Number(stopIndex) || 0);
+    const waypoints = Array.isArray(route?.waypointsData) ? route.waypointsData : [];
+    const finalStopIndex = waypoints.length + 1;
     const passengerSchedule = Array.isArray(route?.passengerSchedule)
         ? route.passengerSchedule
         : [];
 
+    const exactPoint = safeStopIndex === 0
+        ? route?.startCoords
+        : safeStopIndex >= finalStopIndex
+            ? route?.endCoords
+            : waypoints[safeStopIndex - 1];
+
     const targetName = String(
         target?.passengerName ||
         target?.contact ||
-        target?.label ||
+        exactPoint?.passengerName ||
+        exactPoint?.contact ||
         ''
     ).trim().toLowerCase();
 
     const scheduleMatch = passengerSchedule.find(item => {
+        const itemStopIndex = Number(item?.stopIndex);
+        if (Number.isFinite(itemStopIndex) && itemStopIndex === safeStopIndex) return true;
+
         const itemName = String(
             item?.passengerName ||
             item?.name ||
+            item?.contact ||
             ''
         ).trim().toLowerCase();
 
-        return targetName && itemName && targetName === itemName;
+        return Boolean(targetName && itemName && targetName === itemName);
     });
 
-    const finalStopIndex = (route?.waypointsData?.length || 0) + 1;
-
-    return normalizeWhatsAppPhone(
+    const exactPhone = normalizeWhatsAppPhone(
         target?.phone,
         target?.contactPhone,
         target?.whatsapp,
+        exactPoint?.phone,
+        exactPoint?.contactPhone,
+        exactPoint?.whatsapp,
         scheduleMatch?.phone,
         scheduleMatch?.contactPhone,
-        stopIndex === 0 ? route?.startCoords?.phone : '',
-        stopIndex === 0 ? route?.startCoords?.contactPhone : '',
-        waypoint?.phone,
-        waypoint?.contactPhone,
-        stopIndex >= finalStopIndex ? route?.endCoords?.phone : '',
-        stopIndex >= finalStopIndex ? route?.endCoords?.contactPhone : '',
-        ...(stopIndex === 0 && Array.isArray(route?.startCoords?.passengersSchedule)
-            ? route.startCoords.passengersSchedule.flatMap(item => [item?.phone, item?.contactPhone])
-            : []),
-        ...(stopIndex >= finalStopIndex && Array.isArray(route?.endCoords?.passengersSchedule)
-            ? route.endCoords.passengersSchedule.flatMap(item => [item?.phone, item?.contactPhone])
-            : []),
+        scheduleMatch?.whatsapp
+    );
+
+    // En rutas empresariales no se usa un teléfono general como respaldo,
+    // porque podría abrir el WhatsApp de otro pasajero.
+    if (exactPhone || isDispatcherScheduledTrip(route)) return exactPhone;
+
+    return normalizeWhatsAppPhone(
         route?.clientPhone,
         route?.requestUserPhone,
         route?.requestUser
     );
+};
+
+const translateNavigationInstruction = (instruction = '') => {
+    let text = stripHtml(instruction || 'Continúa por la ruta');
+    const replacements = [
+        [/^Head north(?:west)?/i, 'Dirígete hacia el norte'],
+        [/^Head south(?:west)?/i, 'Dirígete hacia el sur'],
+        [/^Head east/i, 'Dirígete hacia el este'],
+        [/^Head west/i, 'Dirígete hacia el oeste'],
+        [/Turn left/i, 'Gira a la izquierda'],
+        [/Turn right/i, 'Gira a la derecha'],
+        [/Slight left/i, 'Mantente ligeramente a la izquierda'],
+        [/Slight right/i, 'Mantente ligeramente a la derecha'],
+        [/Keep left/i, 'Mantente a la izquierda'],
+        [/Keep right/i, 'Mantente a la derecha'],
+        [/Continue straight/i, 'Continúa derecho'],
+        [/Continue to follow/i, 'Continúa por'],
+        [/Continue on/i, 'Continúa por'],
+        [/Make a U-turn/i, 'Da vuelta en U'],
+        [/At the roundabout, take the (\d+)(?:st|nd|rd|th) exit/i, 'En la glorieta, toma la salida $1'],
+        [/Destination will be on the left/i, 'El destino estará a la izquierda'],
+        [/Destination will be on the right/i, 'El destino estará a la derecha'],
+        [/toward/i, 'hacia'],
+        [/onto/i, 'en'],
+        [/and continue/i, 'y continúa']
+    ];
+
+    replacements.forEach(([pattern, replacement]) => {
+        text = text.replace(pattern, replacement);
+    });
+
+    return text.replace(/\s+/g, ' ').trim();
+};
+
+const speakNavigationText = async (text) => {
+    const cleanText = translateNavigationInstruction(text);
+    if (!cleanText) return false;
+
+    if (Capacitor.isNativePlatform()) {
+        try {
+            await TextToSpeech.stop().catch(() => {});
+            await TextToSpeech.speak({
+                text: cleanText,
+                lang: 'es-MX',
+                rate: 0.92,
+                pitch: 1.0,
+                volume: 1.0,
+                category: 'playback',
+                queueStrategy: 0
+            });
+            return true;
+        } catch (nativeVoiceError) {
+            console.warn('Voz nativa no disponible:', nativeVoiceError);
+        }
+    }
+
+    if (!('speechSynthesis' in window)) return false;
+
+    try {
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.resume?.();
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        utterance.lang = 'es-MX';
+        utterance.rate = 0.92;
+        utterance.volume = 1;
+        const voices = window.speechSynthesis.getVoices?.() || [];
+        utterance.voice = voices.find(v => /^es-MX$/i.test(v.lang)) || voices.find(v => /^es/i.test(v.lang)) || null;
+        window.speechSynthesis.speak(utterance);
+        return true;
+    } catch (webVoiceError) {
+        console.warn('Narración web no disponible:', webVoiceError);
+        return false;
+    }
 };
 
 const getTripDisplayedPricing = (route) => {
@@ -1349,7 +1432,7 @@ function App() {
   const [justificationText, setJustificationText] = useState('');
   const [distanceOff, setDistanceOff] = useState(0);
 
-  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries });
+  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es', region: 'MX' });
   const mapRef = useRef(null);
   const [mapRenderKey] = useState(0); // Se mantiene únicamente para la vista previa.
   const mapReadyRef = useRef(false);
@@ -1481,11 +1564,11 @@ function App() {
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting, showTripChat]);
 
-  // === LÓGICA DEL NARRADOR (TEXT-TO-SPEECH) ===
+  // === LÓGICA DEL NARRADOR NATIVO / WEB ===
   useEffect(() => {
-      if (!voiceEnabled || !nextManeuver.instruction || !('speechSynthesis' in window)) return;
+      if (!voiceEnabled || !nextManeuver.instruction) return;
 
-      const cleanText = stripHtml(nextManeuver.instruction);
+      const cleanText = translateNavigationInstruction(nextManeuver.instruction);
       if (!cleanText) return;
 
       const voiceKey = nextManeuver.voiceKey || `${cleanText}-${nextManeuver.distance}`;
@@ -1495,23 +1578,10 @@ function App() {
       const isUrgent = ['70', '180'].some(bucket => String(voiceKey).endsWith(`-${bucket}`));
       if (!isUrgent && lastSpokenRef.current && now - (lastSpokenRef.current.timestamp || 0) < 8000) return;
 
-      try {
-          if (window.speechSynthesis.speaking) {
-              window.speechSynthesis.cancel();
-          }
-
-          const utterance = new SpeechSynthesisUtterance(
-              `${nextManeuver.distance ? `${nextManeuver.distance}. ` : ''}${cleanText}`
-          );
-          utterance.lang = 'es-MX';
-          utterance.rate = 0.94;
-          utterance.volume = 1;
-
-          window.speechSynthesis.speak(utterance);
-          lastSpokenRef.current = { key: voiceKey, timestamp: now };
-      } catch (e) {
-          console.warn('Narración no disponible:', e);
-      }
+      speakNavigationText(`${nextManeuver.distance ? `${nextManeuver.distance}. ` : ''}${cleanText}`)
+          .then(spoken => {
+              if (spoken) lastSpokenRef.current = { key: voiceKey, timestamp: now };
+          });
   }, [nextManeuver, voiceEnabled]);
 
   useEffect(() => {
@@ -1533,28 +1603,11 @@ function App() {
       const latest = misRutas.find(route => route.id === selectedRoute.id);
       if (!latest) return;
 
-      const currentChatLength = selectedRoute.chat?.length || 0;
-      const latestChatLength = latest.chat?.length || 0;
-      const currentStatus = selectedRoute.status;
-      const latestStatus = latest.status;
-      const currentAlert = Boolean(selectedRoute.proximityAlert?.active);
-      const latestAlert = Boolean(latest.proximityAlert?.active);
-
-      if (
-          currentChatLength === latestChatLength &&
-          currentStatus === latestStatus &&
-          currentAlert === latestAlert
-      ) {
-          return;
-      }
-
-      setSelectedRoute(prev => prev ? {
-          ...prev,
-          status: latest.status,
-          chat: latest.chat || [],
-          proximityAlert: latest.proximityAlert || prev.proximityAlert
-      } : prev);
-  }, [misRutas, selectedRoute?.id, selectedRoute?.status, selectedRoute?.chat?.length, selectedRoute?.proximityAlert?.active]);
+      // Sincroniza el documento completo: paradas, teléfonos, evidencias,
+      // bitácora, alertas y geometría. Así un punto nuevo no borra ni congela
+      // la información del punto anterior en la pantalla del conductor.
+      setSelectedRoute(prev => prev ? { ...prev, ...latest } : latest);
+  }, [misRutas, selectedRoute?.id]);
 
   // --- DETECCIÓN DE VIAJES ASIGNADOS MANUALMENTE DESDE EL DESPACHO ---
   useEffect(() => {
@@ -1700,8 +1753,15 @@ function App() {
             prevLocRef.current = loc;
         }
 
-        // Telemetría local: se acumula y se envía por lotes, no dentro de cada pulso GPS.
-        if (selectedRoute?.status === 'En Ruta' && accuracy <= 40) {
+        // El kilometraje operativo comienza al confirmar el primer punto.
+        // Antes de ese momento se publica el GPS, pero no se suma distancia al servicio.
+        const serviceDistanceActive = Boolean(
+            selectedRoute?.serviceDistanceStartedAt ||
+            selectedRoute?.firstBoardingTimestamp ||
+            nextStopIdx > 0
+        );
+
+        if (selectedRoute?.status === 'En Ruta' && accuracy <= 40 && serviceDistanceActive) {
             const previousOdometerLoc = normalizePoint(odometerLocRef.current);
 
             if (!previousOdometerLoc) {
@@ -1720,6 +1780,10 @@ function App() {
                     odometerLocRef.current = loc;
                 }
             }
+        } else if (selectedRoute?.status === 'En Ruta' && !serviceDistanceActive) {
+            odometerLocRef.current = loc;
+            pendingDistanceKmRef.current = 0;
+            pendingRoutePointsRef.current = [];
         }
       },
       (gpsError) => {
@@ -2165,7 +2229,7 @@ function App() {
 
                   steps.push({
                       key: `${legIndex}-${stepIndex}`,
-                      instruction: stripHtml(step.instructions || 'Continúa por la ruta'),
+                      instruction: translateNavigationInstruction(step.instructions || 'Continúa por la ruta'),
                       distanceMeters: Number(step.distance?.value) || 0,
                       distanceText: step.distance?.text || '',
                       start: startPoint,
@@ -2453,24 +2517,163 @@ function App() {
       }
   };
 
-  const confirmarAbordaje = async (isFinalDestination) => {
-      if (evidence) {
-          const target = allTargets[nextStopIdx];
-          const llegadaData = { stopIndex: nextStopIdx, label: target?.label || (isFinalDestination ? 'Destino Final' : 'Parada'), passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: getMexicoTime(), timestamp: new Date().toISOString() };
-          try { await updateDoc(doc(db, "rutas", selectedRoute.id), { evidenciasLlegada: arrayUnion(llegadaData) }); } catch (e) {}
+  const advanceAfterStop = async (isFinalDestination) => {
+      setEvidence(null);
+      setIsWaiting(false);
+      setIsApproaching(false);
+
+      if (isFinalDestination) {
+          await handleEndTrip(selectedRoute.id);
+          return;
       }
-      if(isFinalDestination) { handleEndTrip(selectedRoute.id); setIsWaiting(false); } 
-      else { const newIdx = nextStopIdx + 1; setNextStopIdx(newIdx); localStorage.setItem(`trip_idx_${selectedRoute.id}`, newIdx); setIsWaiting(false); setRouteUpdateTick(t => t + 1); }
+
+      const newIdx = Math.min(nextStopIdx + 1, Math.max(0, allTargets.length - 1));
+      setNextStopIdx(newIdx);
+      localStorage.setItem(`trip_idx_${selectedRoute.id}`, String(newIdx));
+      setRouteUpdateTick(t => t + 1);
+
+      try {
+          await updateDoc(doc(db, 'rutas', selectedRoute.id), {
+              currentStopIndex: newIdx,
+              nextStopIdx: newIdx,
+              'proximityAlert.active': false,
+              lastUpdate: new Date().toISOString()
+          });
+      } catch (advanceError) {
+          console.warn('No se pudo publicar el siguiente punto:', advanceError);
+      }
+  };
+
+  const confirmarAbordaje = async (isFinalDestination) => {
+      const target = allTargets[nextStopIdx] || {};
+      const nowIso = new Date().toISOString();
+      const nowTime = getMexicoTime();
+      const llegadaData = {
+          eventId: `${selectedRoute.id}-boarding-${nextStopIdx}-${Date.now()}`,
+          type: isFinalDestination ? 'destination_arrival' : 'boarding',
+          status: isFinalDestination ? 'Destino confirmado' : 'Pasajero a bordo',
+          stopIndex: nextStopIdx,
+          label: target?.label || (isFinalDestination ? 'Destino Final' : `Punto ${nextStopIdx + 1}`),
+          passenger: target?.contact || target?.passengerName || 'Pasajero',
+          address: target?.address || '',
+          photo: evidence || '',
+          location: normalizePoint(userLocation),
+          time: nowTime,
+          timestamp: nowIso
+      };
+
+      const auditEntry = {
+          evento: isFinalDestination ? 'Llegada al destino final' : 'Pasajero a bordo',
+          motivo: llegadaData.passenger,
+          punto: llegadaData.label,
+          stopIndex: nextStopIdx,
+          timestamp: nowIso,
+          time: nowTime
+      };
+
+      const updates = {
+          evidenciasLlegada: arrayUnion(llegadaData),
+          stopEvents: arrayUnion(llegadaData),
+          bitacora: arrayUnion(auditEntry),
+          chat: arrayUnion({
+              sender: 'Sistema',
+              text: isFinalDestination
+                  ? `Destino final confirmado: ${llegadaData.passenger}`
+                  : `Pasajero a bordo en ${llegadaData.label}: ${llegadaData.passenger}`,
+              time: nowTime,
+              timestamp: nowIso,
+              stopIndex: nextStopIdx
+          }),
+          'proximityAlert.active': false,
+          lastUpdate: nowIso
+      };
+
+      if (nextStopIdx === 0 && !isFinalDestination) {
+          updates.firstBoardingTime = nowTime;
+          updates.firstBoardingTimestamp = nowIso;
+          updates.serviceDistanceStartedAt = nowIso;
+          updates.serviceDistanceStartLocation = normalizePoint(userLocation);
+          odometerLocRef.current = normalizePoint(userLocation);
+          pendingDistanceKmRef.current = 0;
+          pendingRoutePointsRef.current = [];
+          committedDistanceKmRef.current = 0;
+          updates.realDistanceDriven = 0;
+          updates.rutaReal = normalizePoint(userLocation) ? [normalizePoint(userLocation)] : [];
+      }
+
+      try {
+          await updateDoc(doc(db, 'rutas', selectedRoute.id), updates);
+          await advanceAfterStop(isFinalDestination);
+      } catch (boardingError) {
+          console.error('No se pudo registrar el abordaje:', boardingError);
+          alert('No se pudo guardar el abordaje. Revisa la conexión e inténtalo de nuevo.');
+      }
   };
 
   const reportarAusencia = async (isFinalDestination) => {
-      if(!evidence) return alert("⚠️ Por favor, toma una foto de evidencia del lugar antes de reportar la ausencia.");
-      const target = allTargets[nextStopIdx];
-      const noShowData = { stopIndex: nextStopIdx, passenger: target?.contact || 'Pasajero', address: target?.address || '', photo: evidence, time: getMexicoTime(), timestamp: new Date().toISOString() };
+      const target = allTargets[nextStopIdx] || {};
+      const passengerName = target?.contact || target?.passengerName || 'Pasajero';
+      const confirmed = window.confirm(`Se registrará que ${passengerName} no se presentó. ¿Deseas continuar al siguiente punto?`);
+      if (!confirmed) return;
+
+      const nowIso = new Date().toISOString();
+      const nowTime = getMexicoTime();
+      const noShowData = {
+          eventId: `${selectedRoute.id}-absence-${nextStopIdx}-${Date.now()}`,
+          type: 'absence',
+          status: 'No se presentó',
+          stopIndex: nextStopIdx,
+          label: target?.label || `Punto ${nextStopIdx + 1}`,
+          passenger: passengerName,
+          address: target?.address || '',
+          photo: evidence || '',
+          location: normalizePoint(userLocation),
+          time: nowTime,
+          timestamp: nowIso
+      };
+
+      const auditEntry = {
+          evento: 'Pasajero no se presentó',
+          motivo: passengerName,
+          punto: noShowData.label,
+          stopIndex: nextStopIdx,
+          timestamp: nowIso,
+          time: nowTime
+      };
+
       try {
-          await updateDoc(doc(db, "rutas", selectedRoute.id), { evidencias: arrayUnion(noShowData), chat: arrayUnion({ sender: 'Sistema', text: `Conductor reportó AUSENCIA en ${target?.label}. Evidencia guardada.`, time: noShowData.time, timestamp: noShowData.timestamp }) });
-          alert("✅ Evidencia guardada correctamente en el sistema."); confirmarAbordaje(isFinalDestination); 
-      } catch (e) { alert("Error al subir evidencia. Revisa tu conexión."); }
+          const absenceUpdates = {
+              evidencias: arrayUnion(noShowData),
+              stopEvents: arrayUnion(noShowData),
+              bitacora: arrayUnion(auditEntry),
+              chat: arrayUnion({
+                  sender: 'Sistema',
+                  text: `Ausencia registrada en ${noShowData.label}: ${passengerName}. El conductor continúa al siguiente punto.`,
+                  time: nowTime,
+                  timestamp: nowIso,
+                  stopIndex: nextStopIdx
+              }),
+              'proximityAlert.active': false,
+              lastUpdate: nowIso
+          };
+
+          if (nextStopIdx === 0) {
+              absenceUpdates.serviceDistanceStartedAt = nowIso;
+              absenceUpdates.serviceDistanceStartLocation = normalizePoint(userLocation);
+              absenceUpdates.realDistanceDriven = 0;
+              absenceUpdates.rutaReal = normalizePoint(userLocation) ? [normalizePoint(userLocation)] : [];
+              odometerLocRef.current = normalizePoint(userLocation);
+              pendingDistanceKmRef.current = 0;
+              pendingRoutePointsRef.current = [];
+              committedDistanceKmRef.current = 0;
+          }
+
+          await updateDoc(doc(db, 'rutas', selectedRoute.id), absenceUpdates);
+          await advanceAfterStop(isFinalDestination);
+      } catch (absenceError) {
+          console.error('No se pudo registrar la ausencia:', absenceError);
+          alert('No se pudo guardar la ausencia. Revisa la conexión e inténtalo de nuevo.');
+      }
   };
 
   const handleSelectRoute = (ruta) => {
@@ -3172,18 +3375,26 @@ function App() {
 
               {/* --- INSTRUCCIONES WAZE (TURN BY TURN) CON CONTROL DE VOZ --- */}
               {nextManeuver.instruction && (
-                  <div className="absolute top-[85px] left-4 right-4 bg-slate-900/90 backdrop-blur-md rounded-2xl p-4 shadow-2xl z-30 border border-slate-700 flex items-center gap-4 animate-[fadeIn_0.3s_ease-out]">
-                      <div className="bg-orange-500 w-12 h-12 rounded-full flex items-center justify-center shrink-0 shadow-inner">
-                          <Navigation className="w-6 h-6 text-white" />
+                  <div className="absolute top-[82px] left-3 right-3 bg-slate-900/92 backdrop-blur-md rounded-xl p-2.5 shadow-xl z-30 border border-slate-700 flex items-center gap-2.5 animate-[fadeIn_0.3s_ease-out]">
+                      <div className="bg-orange-500 w-9 h-9 rounded-full flex items-center justify-center shrink-0 shadow-inner">
+                          <Navigation className="w-4 h-4 text-white" />
                       </div>
                       <div className="flex-1 text-white">
-                          <p className="text-xl font-black">{nextManeuver.distance}</p>
-                          <p className="text-sm font-medium text-slate-300 leading-tight" dangerouslySetInnerHTML={{ __html: nextManeuver.instruction }}></p>
+                          <div className="flex items-center gap-2 min-w-0">
+                              <p className="text-base font-black whitespace-nowrap">{nextManeuver.distance}</p>
+                              <p className="text-xs font-medium text-slate-300 leading-tight line-clamp-2">{translateNavigationInstruction(nextManeuver.instruction)}</p>
+                          </div>
                       </div>
                       <button 
-                          onClick={() => {
-                              setVoiceEnabled(!voiceEnabled);
-                              if (voiceEnabled && 'speechSynthesis' in window) window.speechSynthesis.cancel();
+                          onClick={async () => {
+                              const nextValue = !voiceEnabled;
+                              setVoiceEnabled(nextValue);
+                              if (!nextValue) {
+                                  TextToSpeech.stop().catch(() => {});
+                                  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+                              } else {
+                                  await speakNavigationText('Indicaciones por voz activadas');
+                              }
                           }} 
                           className="p-2 rounded-full bg-slate-800 text-slate-300 hover:text-white transition shrink-0"
                       >

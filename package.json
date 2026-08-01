@@ -22,7 +22,8 @@
     "lucide-react": "^0.564.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-router-dom": "^7.13.0"
+    "react-router-dom": "^7.13.0",
+    "@capacitor-community/text-to-speech": "^8.0.2"
   },
   "devDependencies": {
     "@capacitor/assets": "^3.0.5",
