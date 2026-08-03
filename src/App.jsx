@@ -868,6 +868,21 @@ const getDistanceMeters = (p1, p2) => {
     return R * c;
 };
 
+const calculatePathDistanceKm = (path = []) => {
+    const points = normalizePath(path);
+    if (points.length < 2) return 0;
+
+    let meters = 0;
+    for (let index = 1; index < points.length; index += 1) {
+        const segmentMeters = getDistanceMeters(points[index - 1], points[index]);
+        if (Number.isFinite(segmentMeters) && segmentMeters >= 1 && segmentMeters <= 1000) {
+            meters += segmentMeters;
+        }
+    }
+
+    return roundMoney(meters / 1000);
+};
+
 // HELPER: ETA estable sin DirectionsService.
 // En Android WebView, recalcular DirectionsService cada pocos segundos puede volver inestable el canvas de Google Maps.
 // Usamos distancia directa para mantener la navegación estable y el trazo oficial del despachador como referencia visual.
@@ -1465,6 +1480,9 @@ function App() {
   const livePricingRef = useRef(null);
   const liveRoutePublishDirtyRef = useRef(false);
   const committedDistanceKmRef = useRef(0);
+  const serviceDistanceStartedRef = useRef(false);
+  const serviceDistanceStartedAtRef = useRef('');
+  const nextStopIdxRef = useRef(0);
   const userHeadingRef = useRef(0);
   const pushCleanupRef = useRef(null);
 
@@ -1479,7 +1497,33 @@ function App() {
   
   const [nextStopIdx, setNextStopIdx] = useState(0); 
   const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
-  
+
+  useEffect(() => {
+      nextStopIdxRef.current = nextStopIdx;
+  }, [nextStopIdx]);
+
+  useEffect(() => {
+      const startedAt =
+          selectedRoute?.serviceDistanceStartedAt ||
+          selectedRoute?.firstStopAttendedTimestamp ||
+          selectedRoute?.firstBoardingTimestamp ||
+          '';
+
+      serviceDistanceStartedAtRef.current = String(startedAt || '');
+      serviceDistanceStartedRef.current = Boolean(
+          startedAt ||
+          Number(selectedRoute?.realDistanceDriven) > 0 ||
+          nextStopIdx > 0
+      );
+  }, [
+      selectedRoute?.id,
+      selectedRoute?.serviceDistanceStartedAt,
+      selectedRoute?.firstStopAttendedTimestamp,
+      selectedRoute?.firstBoardingTimestamp,
+      selectedRoute?.realDistanceDriven,
+      nextStopIdx
+  ]);
+
   const [alertedStops, setAlertedStops] = useState([]); 
   const [isApproaching, setIsApproaching] = useState(false); 
 
@@ -1755,11 +1799,7 @@ function App() {
 
         // El kilometraje operativo comienza al confirmar el primer punto.
         // Antes de ese momento se publica el GPS, pero no se suma distancia al servicio.
-        const serviceDistanceActive = Boolean(
-            selectedRoute?.serviceDistanceStartedAt ||
-            selectedRoute?.firstBoardingTimestamp ||
-            nextStopIdx > 0
-        );
+        const serviceDistanceActive = Boolean(serviceDistanceStartedRef.current);
 
         if (selectedRoute?.status === 'En Ruta' && accuracy <= 40 && serviceDistanceActive) {
             const previousOdometerLoc = normalizePoint(odometerLocRef.current);
@@ -2349,6 +2389,9 @@ function App() {
       localStorage.removeItem('active_trip_id');
       setShowTripChat(false);
       setSelectedRoute(null);
+      nextStopIdxRef.current = 0;
+      serviceDistanceStartedRef.current = false;
+      serviceDistanceStartedAtRef.current = '';
       setNextStopIdx(0);
       setAlertedStops([]);
       setIsApproaching(false);
@@ -2528,7 +2571,14 @@ function App() {
       }
 
       const newIdx = Math.min(nextStopIdx + 1, Math.max(0, allTargets.length - 1));
+      nextStopIdxRef.current = newIdx;
       setNextStopIdx(newIdx);
+      setSelectedRoute(prev => prev ? {
+          ...prev,
+          currentStopIndex: newIdx,
+          nextStopIdx: newIdx,
+          proximityAlert: { ...(prev.proximityAlert || {}), active: false }
+      } : prev);
       localStorage.setItem(`trip_idx_${selectedRoute.id}`, String(newIdx));
       setRouteUpdateTick(t => t + 1);
 
@@ -2589,20 +2639,47 @@ function App() {
       };
 
       if (nextStopIdx === 0 && !isFinalDestination) {
+          const startLocation = normalizePoint(userLocation);
+          updates.firstStopAttendedTime = nowTime;
+          updates.firstStopAttendedTimestamp = nowIso;
+          updates.firstStopAttendedStatus = 'Pasajero a bordo';
+          updates.firstStopAttendedPassenger = llegadaData.passenger;
+          updates.firstStopAttendedLocation = startLocation;
           updates.firstBoardingTime = nowTime;
           updates.firstBoardingTimestamp = nowIso;
-          updates.serviceDistanceStartedAt = nowIso;
-          updates.serviceDistanceStartLocation = normalizePoint(userLocation);
-          odometerLocRef.current = normalizePoint(userLocation);
-          pendingDistanceKmRef.current = 0;
-          pendingRoutePointsRef.current = [];
-          committedDistanceKmRef.current = 0;
-          updates.realDistanceDriven = 0;
-          updates.rutaReal = normalizePoint(userLocation) ? [normalizePoint(userLocation)] : [];
+
+          if (!serviceDistanceStartedRef.current) {
+              updates.serviceDistanceStartedAt = nowIso;
+              updates.serviceDistanceStartLocation = startLocation;
+              updates.realDistanceDriven = 0;
+              updates.rutaReal = startLocation ? [startLocation] : [];
+
+              serviceDistanceStartedRef.current = true;
+              serviceDistanceStartedAtRef.current = nowIso;
+              odometerLocRef.current = startLocation;
+              pendingDistanceKmRef.current = 0;
+              pendingRoutePointsRef.current = [];
+              committedDistanceKmRef.current = 0;
+          }
       }
 
       try {
           await updateDoc(doc(db, 'rutas', selectedRoute.id), updates);
+          setSelectedRoute(prev => prev ? {
+              ...prev,
+              ...(nextStopIdx === 0 && !isFinalDestination ? {
+                  firstStopAttendedTime: nowTime,
+                  firstStopAttendedTimestamp: nowIso,
+                  firstStopAttendedStatus: 'Pasajero a bordo',
+                  firstStopAttendedPassenger: llegadaData.passenger,
+                  firstStopAttendedLocation: normalizePoint(userLocation),
+                  firstBoardingTime: nowTime,
+                  firstBoardingTimestamp: nowIso,
+                  serviceDistanceStartedAt: updates.serviceDistanceStartedAt || prev.serviceDistanceStartedAt,
+                  serviceDistanceStartLocation: updates.serviceDistanceStartLocation || prev.serviceDistanceStartLocation
+              } : {}),
+              proximityAlert: { ...(prev.proximityAlert || {}), active: false }
+          } : prev);
           await advanceAfterStop(isFinalDestination);
       } catch (boardingError) {
           console.error('No se pudo registrar el abordaje:', boardingError);
@@ -2613,7 +2690,19 @@ function App() {
   const reportarAusencia = async (isFinalDestination) => {
       const target = allTargets[nextStopIdx] || {};
       const passengerName = target?.contact || target?.passengerName || 'Pasajero';
-      const confirmed = window.confirm(`Se registrará que ${passengerName} no se presentó. ¿Deseas continuar al siguiente punto?`);
+      const reasonInput = window.prompt(
+          `Motivo para ${passengerName}: escribe "NO SALIÓ" o "CANCELÓ".`,
+          'NO SALIÓ'
+      );
+      if (reasonInput === null) return;
+      const normalizedReason = String(reasonInput || '').trim().toUpperCase();
+      const absenceStatus = normalizedReason.includes('CANCEL')
+          ? 'Canceló'
+          : 'No se presentó';
+
+      const confirmed = window.confirm(
+          `Se registrará "${absenceStatus}" para ${passengerName} y el viaje continuará al siguiente punto. ¿Confirmas?`
+      );
       if (!confirmed) return;
 
       const nowIso = new Date().toISOString();
@@ -2621,7 +2710,7 @@ function App() {
       const noShowData = {
           eventId: `${selectedRoute.id}-absence-${nextStopIdx}-${Date.now()}`,
           type: 'absence',
-          status: 'No se presentó',
+          status: absenceStatus,
           stopIndex: nextStopIdx,
           label: target?.label || `Punto ${nextStopIdx + 1}`,
           passenger: passengerName,
@@ -2633,7 +2722,7 @@ function App() {
       };
 
       const auditEntry = {
-          evento: 'Pasajero no se presentó',
+          evento: absenceStatus === 'Canceló' ? 'Pasajero canceló' : 'Pasajero no se presentó',
           motivo: passengerName,
           punto: noShowData.label,
           stopIndex: nextStopIdx,
@@ -2648,7 +2737,7 @@ function App() {
               bitacora: arrayUnion(auditEntry),
               chat: arrayUnion({
                   sender: 'Sistema',
-                  text: `Ausencia registrada en ${noShowData.label}: ${passengerName}. El conductor continúa al siguiente punto.`,
+                  text: `${absenceStatus} en ${noShowData.label}: ${passengerName}. El conductor continúa al siguiente punto.`,
                   time: nowTime,
                   timestamp: nowIso,
                   stopIndex: nextStopIdx
@@ -2658,17 +2747,42 @@ function App() {
           };
 
           if (nextStopIdx === 0) {
-              absenceUpdates.serviceDistanceStartedAt = nowIso;
-              absenceUpdates.serviceDistanceStartLocation = normalizePoint(userLocation);
-              absenceUpdates.realDistanceDriven = 0;
-              absenceUpdates.rutaReal = normalizePoint(userLocation) ? [normalizePoint(userLocation)] : [];
-              odometerLocRef.current = normalizePoint(userLocation);
-              pendingDistanceKmRef.current = 0;
-              pendingRoutePointsRef.current = [];
-              committedDistanceKmRef.current = 0;
+              const startLocation = normalizePoint(userLocation);
+              absenceUpdates.firstStopAttendedTime = nowTime;
+              absenceUpdates.firstStopAttendedTimestamp = nowIso;
+              absenceUpdates.firstStopAttendedStatus = absenceStatus;
+              absenceUpdates.firstStopAttendedPassenger = passengerName;
+              absenceUpdates.firstStopAttendedLocation = startLocation;
+
+              if (!serviceDistanceStartedRef.current) {
+                  absenceUpdates.serviceDistanceStartedAt = nowIso;
+                  absenceUpdates.serviceDistanceStartLocation = startLocation;
+                  absenceUpdates.realDistanceDriven = 0;
+                  absenceUpdates.rutaReal = startLocation ? [startLocation] : [];
+
+                  serviceDistanceStartedRef.current = true;
+                  serviceDistanceStartedAtRef.current = nowIso;
+                  odometerLocRef.current = startLocation;
+                  pendingDistanceKmRef.current = 0;
+                  pendingRoutePointsRef.current = [];
+                  committedDistanceKmRef.current = 0;
+              }
           }
 
           await updateDoc(doc(db, 'rutas', selectedRoute.id), absenceUpdates);
+          setSelectedRoute(prev => prev ? {
+              ...prev,
+              ...(nextStopIdx === 0 ? {
+                  firstStopAttendedTime: nowTime,
+                  firstStopAttendedTimestamp: nowIso,
+                  firstStopAttendedStatus: absenceStatus,
+                  firstStopAttendedPassenger: passengerName,
+                  firstStopAttendedLocation: normalizePoint(userLocation),
+                  serviceDistanceStartedAt: absenceUpdates.serviceDistanceStartedAt || prev.serviceDistanceStartedAt,
+                  serviceDistanceStartLocation: absenceUpdates.serviceDistanceStartLocation || prev.serviceDistanceStartLocation
+              } : {}),
+              proximityAlert: { ...(prev.proximityAlert || {}), active: false }
+          } : prev);
           await advanceAfterStop(isFinalDestination);
       } catch (absenceError) {
           console.error('No se pudo registrar la ausencia:', absenceError);
@@ -2678,6 +2792,17 @@ function App() {
 
   const handleSelectRoute = (ruta) => {
       committedDistanceKmRef.current = Math.max(0, Number(ruta?.realDistanceDriven) || 0);
+      serviceDistanceStartedAtRef.current = String(
+          ruta?.serviceDistanceStartedAt ||
+          ruta?.firstStopAttendedTimestamp ||
+          ruta?.firstBoardingTimestamp ||
+          ''
+      );
+      serviceDistanceStartedRef.current = Boolean(
+          serviceDistanceStartedAtRef.current ||
+          Number(ruta?.realDistanceDriven) > 0 ||
+          Number(ruta?.nextStopIdx ?? ruta?.currentStopIndex ?? 0) > 0
+      );
       liveRouteGeometryRef.current = normalizePath(ruta?.liveRouteGeometry);
       livePricingRef.current = ruta?.pricing?.total !== undefined ? { ...ruta.pricing } : null;
       liveRoutePublishDirtyRef.current = false;
@@ -2690,8 +2815,13 @@ function App() {
       if (ruta.status === 'En Ruta') {
           localStorage.setItem('active_trip_id', ruta.id);
           const savedIdx = localStorage.getItem(`trip_idx_${ruta.id}`);
-          if (savedIdx) setNextStopIdx(parseInt(savedIdx, 10));
+          const resolvedIdx = savedIdx
+              ? parseInt(savedIdx, 10)
+              : Number(ruta?.nextStopIdx ?? ruta?.currentStopIndex ?? 0) || 0;
+          nextStopIdxRef.current = resolvedIdx;
+          setNextStopIdx(resolvedIdx);
       } else {
+          nextStopIdxRef.current = 0;
           setNextStopIdx(0);
       }
   };
@@ -2865,6 +2995,17 @@ function App() {
           navigationStartedAt,
           pricing: plannedPricing,
           pricingStatus: 'Calculada por conductor',
+          firstStopAttendedTime: null,
+          firstStopAttendedTimestamp: null,
+          firstStopAttendedStatus: null,
+          firstStopAttendedPassenger: null,
+          firstStopAttendedLocation: null,
+          firstBoardingTime: null,
+          firstBoardingTimestamp: null,
+          serviceDistanceStartedAt: null,
+          serviceDistanceStartLocation: null,
+          realDistanceDriven: 0,
+          rutaReal: [],
           "proximityAlert.active": false
       };
 
@@ -2885,6 +3026,10 @@ function App() {
       localStorage.setItem('active_trip_id', routeId);
       localStorage.setItem(`trip_idx_${routeId}`, 0);
 
+      nextStopIdxRef.current = 0;
+      serviceDistanceStartedRef.current = false;
+      serviceDistanceStartedAtRef.current = '';
+      odometerLocRef.current = normalizePoint(userLocation);
       setNextStopIdx(0);
       setAlertedStops([]);
       setIsApproaching(false);
@@ -2948,6 +3093,17 @@ function App() {
       const actualEndTimestamp = new Date().toISOString();
       const actualEndTime = getMexicoTime();
 
+      const persistedDistanceKm = Math.max(
+          0,
+          Number(routeFromRealtime?.realDistanceDriven) || 0,
+          Number(selectedRoute?.realDistanceDriven) || 0,
+          Number(committedDistanceKmRef.current) || 0
+      );
+      const tracedDistanceKm = calculatePathDistanceKm(
+          routeFromRealtime?.rutaReal || selectedRoute?.rutaReal || []
+      );
+      const finalRealDistanceKm = roundMoney(Math.max(persistedDistanceKm, tracedDistanceKm));
+
       const routeForReceipt = {
           ...routeFromRealtime,
           ...selectedRoute,
@@ -2957,13 +3113,15 @@ function App() {
           endTime: actualEndTime,
           vehicle: routeFromRealtime?.vehicle || currentDriver?.vehicle || `${currentDriver?.vehicleModel || 'Unidad'} (${currentDriver?.vehiclePlate || 'sin placas'})`,
           vehiclePlate: routeFromRealtime?.vehiclePlate || currentDriver?.vehiclePlate || '',
-          realDistanceDriven: roundMoney(Number(routeFromRealtime?.realDistanceDriven) || 0)
+          realDistanceDriven: finalRealDistanceKm,
+          finalDistanceKm: finalRealDistanceKm
       };
 
       const receipt = buildTripLogixReceipt(routeForReceipt, {
           issuedAt: actualEndTimestamp,
           actualEndTimestamp,
-          actualEndTime
+          actualEndTime,
+          distanceKm: finalRealDistanceKm
       });
 
       const finalPricing = {
@@ -2987,7 +3145,8 @@ function App() {
           pricing: finalPricing,
           pricingStatus: 'Final calculada por conductor',
           finalFare: finalPricing.total,
-          finalDistanceKm: receipt.distanceKm,
+          realDistanceDriven: finalRealDistanceKm,
+          finalDistanceKm: finalRealDistanceKm,
           finalDurationMinutes: receipt.durationMinutes,
           liveHeading: normalizeHeadingDegrees(userHeadingRef.current),
           "proximityAlert.active": false
@@ -3006,6 +3165,8 @@ function App() {
       localStorage.removeItem('active_trip_id');
       localStorage.removeItem(`trip_idx_${routeId}`);
       odometerLocRef.current = null;
+      serviceDistanceStartedRef.current = false;
+      serviceDistanceStartedAtRef.current = '';
       pendingDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
       directionsRequestIdRef.current += 1;
@@ -3349,7 +3510,7 @@ function App() {
                               </label>
                           </div>
                           <div className="flex gap-2">
-                              <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SE PRESENTÓ</button>
+                              <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SALIÓ / CANCELÓ</button>
                               <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
                                   {isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>}
                               </button>
