@@ -569,7 +569,6 @@ const formatTripLogixDateTime = (value) => {
     const ms = getTimestampMs(value);
     if (!ms) return 'No registrado';
     return new Date(ms).toLocaleString('es-MX', {
-        timeZone: 'America/Mexico_City',
         dateStyle: 'medium',
         timeStyle: 'short'
     });
@@ -874,13 +873,40 @@ const calculatePathDistanceKm = (path = []) => {
 
     let meters = 0;
     for (let index = 1; index < points.length; index += 1) {
-        const segmentMeters = getDistanceMeters(points[index - 1], points[index]);
-        if (Number.isFinite(segmentMeters) && segmentMeters >= 1 && segmentMeters <= 1000) {
+        const previous = points[index - 1];
+        const current = points[index];
+        const segmentMeters = getDistanceMeters(previous, current);
+        const previousTime = new Date(previous.recordedAt || previous.timestamp || 0).getTime();
+        const currentTime = new Date(current.recordedAt || current.timestamp || 0).getTime();
+        const elapsedSeconds = previousTime && currentTime && currentTime > previousTime
+            ? (currentTime - previousTime) / 1000
+            : null;
+        const maxPlausibleMeters = elapsedSeconds ? Math.max(180, elapsedSeconds * 55) : 350;
+        const accuracyNoise = Math.max(Number(previous.accuracy) || 0, Number(current.accuracy) || 0) * 0.45;
+        const minimumMovement = Math.max(7, accuracyNoise);
+
+        if (
+            Number.isFinite(segmentMeters) &&
+            segmentMeters >= minimumMovement &&
+            segmentMeters <= maxPlausibleMeters
+        ) {
             meters += segmentMeters;
         }
     }
 
     return roundMoney(meters / 1000);
+};
+
+const chooseReliableDistanceKm = (route, persistedDistanceKm, tracedDistanceKm) => {
+    const persisted = Math.max(0, Number(persistedDistanceKm) || 0);
+    const traced = Math.max(0, Number(tracedDistanceKm) || 0);
+    if (!persisted) return traced;
+    if (!traced) return persisted;
+
+    const larger = Math.max(persisted, traced);
+    const smaller = Math.min(persisted, traced);
+    if (smaller > 0 && larger / smaller > 1.35) return roundMoney(smaller);
+    return roundMoney((persisted + traced) / 2);
 };
 
 // HELPER: ETA estable sin DirectionsService.
@@ -1075,8 +1101,8 @@ const getNextNavigationStep = (location, steps, startIndex = 0) => {
 };
 
 // === NUEVOS HELPERS: FORZAR HORA MÉXICO CENTRAL ===
-const getMexicoTime = () => new Date().toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' });
-const getMexicoDate = () => new Date().toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' });
+const getMexicoTime = () => new Date().toLocaleTimeString('es-419', { hour: '2-digit', minute:'2-digit' });
+const getMexicoDate = () => new Date().toLocaleDateString('es-419');
 
 
 // === HELPERS: HORARIOS PROGRAMADOS DEL DESPACHADOR ===
@@ -1095,7 +1121,6 @@ const normalizeTimeString = (value) => {
         return value.toDate().toLocaleTimeString('es-MX', {
             hour: '2-digit',
             minute: '2-digit',
-            timeZone: 'America/Mexico_City'
         });
     }
 
@@ -1191,8 +1216,7 @@ const formatPickupDate = (dateValue) => {
                 weekday: 'short',
                 day: '2-digit',
                 month: 'short',
-                timeZone: 'America/Mexico_City'
-            });
+                });
         }
 
         const raw = String(dateValue).trim();
@@ -1259,7 +1283,7 @@ const getPickupDateForFilter = (route) => {
 
     try {
         if (value?.toDate) {
-            return value.toDate().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+            return value.toDate().toLocaleDateString('en-CA', {});
         }
 
         const raw = String(value).trim();
@@ -1299,7 +1323,6 @@ const getEstimatedArrivalTimeFromMinutes = (minutesToAdd) => {
         const etaDate = new Date(Date.now() + minutes * 60000);
 
         return etaDate.toLocaleTimeString('es-MX', {
-            timeZone: 'America/Mexico_City',
             hour: '2-digit',
             minute: '2-digit'
         });
@@ -1447,7 +1470,7 @@ function App() {
   const [justificationText, setJustificationText] = useState('');
   const [distanceOff, setDistanceOff] = useState(0);
 
-  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es', region: 'MX' });
+  const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es' });
   const mapRef = useRef(null);
   const [mapRenderKey] = useState(0); // Se mantiene únicamente para la vista previa.
   const mapReadyRef = useRef(false);
@@ -1493,7 +1516,9 @@ function App() {
   const isTrackingRef = useRef(true); 
   const latestLocRef = useRef(null);
   const prevLocRef = useRef(null); 
-  const odometerLocRef = useRef(null); 
+  const odometerLocRef = useRef(null);
+  const odometerMetaRef = useRef({ timestamp: 0, accuracy: Infinity });
+  const lastIncomingChatRef = useRef({ routeId: '', key: '' }); 
   
   const [nextStopIdx, setNextStopIdx] = useState(0); 
   const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
@@ -1607,6 +1632,24 @@ function App() {
   useEffect(() => { userHeadingRef.current = normalizeHeadingDegrees(userHeading); }, [userHeading]);
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting, showTripChat]);
+
+  useEffect(() => {
+      const routeId = selectedRoute?.id || '';
+      const chat = Array.isArray(selectedRoute?.chat) ? selectedRoute.chat : [];
+      const lastMessage = chat[chat.length - 1];
+      const key = lastMessage ? `${lastMessage.timestamp || lastMessage.time || ''}|${lastMessage.sender || ''}|${lastMessage.text || ''}` : '';
+
+      if (lastIncomingChatRef.current.routeId !== routeId) {
+          lastIncomingChatRef.current = { routeId, key };
+          return;
+      }
+
+      if (key && key !== lastIncomingChatRef.current.key && !['Conductor', 'Sistema'].includes(lastMessage?.sender)) {
+          if ('vibrate' in navigator) navigator.vibrate([180, 80, 180]);
+          speakNavigationText(lastMessage?.sender === 'Despacho' ? 'Nuevo mensaje de torre de control' : 'Nuevo mensaje del pasajero').catch(() => {});
+      }
+      lastIncomingChatRef.current = { routeId, key };
+  }, [selectedRoute?.id, selectedRoute?.chat]);
 
   // === LÓGICA DEL NARRADOR NATIVO / WEB ===
   useEffect(() => {
@@ -1801,27 +1844,33 @@ function App() {
         // Antes de ese momento se publica el GPS, pero no se suma distancia al servicio.
         const serviceDistanceActive = Boolean(serviceDistanceStartedRef.current);
 
-        if (selectedRoute?.status === 'En Ruta' && accuracy <= 40 && serviceDistanceActive) {
+        if (selectedRoute?.status === 'En Ruta' && accuracy <= 35 && serviceDistanceActive) {
             const previousOdometerLoc = normalizePoint(odometerLocRef.current);
+            const previousMeta = odometerMetaRef.current || { timestamp: 0, accuracy: Infinity };
 
             if (!previousOdometerLoc) {
                 odometerLocRef.current = loc;
+                odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
+                pendingRoutePointsRef.current.push({ ...loc, recordedAt: new Date(position.timestamp || now).toISOString(), accuracy });
             } else {
                 const movedMeters = getDistanceMeters(previousOdometerLoc, loc);
+                const elapsedSeconds = Math.max(0.5, ((position.timestamp || now) - (previousMeta.timestamp || now)) / 1000);
+                const maximumPlausibleMeters = Math.max(180, elapsedSeconds * 55);
+                const minimumMovement = Math.max(7, Math.max(accuracy, Number(previousMeta.accuracy) || 0) * 0.45);
 
-                if (movedMeters >= 8 && movedMeters <= 350) {
+                if (movedMeters >= minimumMovement && movedMeters <= maximumPlausibleMeters) {
                     pendingDistanceKmRef.current += movedMeters / 1000;
-                    pendingRoutePointsRef.current.push(loc);
-
-                    if (pendingRoutePointsRef.current.length > 12) {
-                        pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-12);
-                    }
-
+                    pendingRoutePointsRef.current.push({ ...loc, recordedAt: new Date(position.timestamp || now).toISOString(), accuracy });
+                    if (pendingRoutePointsRef.current.length > 20) pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-20);
                     odometerLocRef.current = loc;
+                    odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
+                } else if (movedMeters > maximumPlausibleMeters) {
+                    console.warn('Salto GPS ignorado:', { movedMeters, elapsedSeconds, accuracy });
                 }
             }
         } else if (selectedRoute?.status === 'En Ruta' && !serviceDistanceActive) {
             odometerLocRef.current = loc;
+            odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
             pendingDistanceKmRef.current = 0;
             pendingRoutePointsRef.current = [];
         }
@@ -1848,6 +1897,23 @@ function App() {
           normalizePoint(currentDriver?.currentLocation)
       );
   }, [userLocation, selectedRoute?.currentLocation, currentDriver?.currentLocation]);
+
+  // Mantiene visible al conductor en la torre incluso después de finalizar una ruta.
+  useEffect(() => {
+      if (!currentDriver?.id || !currentDriver?.isOnline) return undefined;
+      const publishIdleLocation = () => {
+          const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
+          if (!loc) return;
+          updateDoc(doc(db, 'conductores', currentDriver.id), {
+              currentLocation: loc,
+              heading: normalizeHeadingDegrees(userHeadingRef.current),
+              lastLocationUpdate: new Date().toISOString()
+          }).catch(error => console.warn('No se pudo actualizar la ubicación del conductor:', error));
+      };
+      publishIdleLocation();
+      const interval = setInterval(publishIdleLocation, 10000);
+      return () => clearInterval(interval);
+  }, [currentDriver?.id, currentDriver?.isOnline]);
 
 
   // Envío por lotes de ubicación, ruta recalculada, rumbo, ETA y precio oficial.
@@ -2401,6 +2467,7 @@ function App() {
       setIsPanelExpanded(true);
       setIsTracking(true);
       odometerLocRef.current = null;
+      odometerMetaRef.current = { timestamp: 0, accuracy: Infinity };
       prevLocRef.current = null;
       mapRef.current = null;
       mapReadyRef.current = false;
@@ -2441,7 +2508,7 @@ function App() {
                if ("geolocation" in navigator) {
                    navigator.geolocation.getCurrentPosition(
                       async (pos) => { const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude }; setUserLocation(loc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: loc }); },
-                      async (err) => { const fallbackLoc = { lat: 19.5432, lng: -96.9273 }; setUserLocation(fallbackLoc); await updateDoc(doc(db, "conductores", currentDriver.id), { currentLocation: fallbackLoc }); },
+                      (err) => { console.error('No se pudo obtener la ubicación precisa:', err); alert('Activa la ubicación precisa para aparecer correctamente en la torre de control.'); },
                       { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
                    );
                }
@@ -2657,6 +2724,7 @@ function App() {
               serviceDistanceStartedRef.current = true;
               serviceDistanceStartedAtRef.current = nowIso;
               odometerLocRef.current = startLocation;
+              odometerMetaRef.current = { timestamp: Date.now(), accuracy: 0 };
               pendingDistanceKmRef.current = 0;
               pendingRoutePointsRef.current = [];
               committedDistanceKmRef.current = 0;
@@ -2763,6 +2831,7 @@ function App() {
                   serviceDistanceStartedRef.current = true;
                   serviceDistanceStartedAtRef.current = nowIso;
                   odometerLocRef.current = startLocation;
+                  odometerMetaRef.current = { timestamp: Date.now(), accuracy: 0 };
                   pendingDistanceKmRef.current = 0;
                   pendingRoutePointsRef.current = [];
                   committedDistanceKmRef.current = 0;
@@ -3102,7 +3171,7 @@ function App() {
       const tracedDistanceKm = calculatePathDistanceKm(
           routeFromRealtime?.rutaReal || selectedRoute?.rutaReal || []
       );
-      const finalRealDistanceKm = roundMoney(Math.max(persistedDistanceKm, tracedDistanceKm));
+      const finalRealDistanceKm = chooseReliableDistanceKm(routeFromRealtime, persistedDistanceKm, tracedDistanceKm);
 
       const routeForReceipt = {
           ...routeFromRealtime,
@@ -3165,6 +3234,7 @@ function App() {
       localStorage.removeItem('active_trip_id');
       localStorage.removeItem(`trip_idx_${routeId}`);
       odometerLocRef.current = null;
+      odometerMetaRef.current = { timestamp: 0, accuracy: Infinity };
       serviceDistanceStartedRef.current = false;
       serviceDistanceStartedAtRef.current = '';
       pendingDistanceKmRef.current = 0;
@@ -3536,14 +3606,14 @@ function App() {
 
               {/* --- INSTRUCCIONES WAZE (TURN BY TURN) CON CONTROL DE VOZ --- */}
               {nextManeuver.instruction && (
-                  <div className="absolute top-[82px] left-3 right-3 bg-slate-900/92 backdrop-blur-md rounded-xl p-2.5 shadow-xl z-30 border border-slate-700 flex items-center gap-2.5 animate-[fadeIn_0.3s_ease-out]">
+                  <div className="absolute top-[78px] left-3 right-3 bg-slate-900/92 backdrop-blur-md rounded-xl p-2 shadow-xl z-30 border border-slate-700 flex items-center gap-2.5 animate-[fadeIn_0.3s_ease-out]">
                       <div className="bg-orange-500 w-9 h-9 rounded-full flex items-center justify-center shrink-0 shadow-inner">
                           <Navigation className="w-4 h-4 text-white" />
                       </div>
                       <div className="flex-1 text-white">
                           <div className="flex items-center gap-2 min-w-0">
                               <p className="text-base font-black whitespace-nowrap">{nextManeuver.distance}</p>
-                              <p className="text-xs font-medium text-slate-300 leading-tight line-clamp-2">{translateNavigationInstruction(nextManeuver.instruction)}</p>
+                              <p className="text-[11px] font-medium text-slate-300 leading-tight line-clamp-2">{translateNavigationInstruction(nextManeuver.instruction)}</p>
                           </div>
                       </div>
                       <button 
@@ -3923,7 +3993,7 @@ function App() {
   // VISTA 3: PANTALLA PRINCIPAL (ALGORITMO FILTROS MEJORADOS)
   // ==============================================================
   if (currentDriver && !isEditingProfile) {
-    const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }); // YYYY-MM-DD
+    const todayStr = new Date().toLocaleDateString('en-CA', {}); // YYYY-MM-DD
     
     let rFiltradas = misRutas
         .filter(x => {
