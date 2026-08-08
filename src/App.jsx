@@ -365,6 +365,13 @@ const shouldHideTripPricingDuringActive = (route) => {
     return isDispatcherScheduledTrip(route) && route?.status !== 'Finalizado';
 };
 
+const shouldHideDriverReceiptPricing = (route) => {
+    // Los viajes empresariales/programados desde despacho se liquidan
+    // semanalmente por kilómetros recorridos. El conductor no debe ver
+    // tarifa monetaria ni siquiera al finalizar.
+    return isDispatcherScheduledTrip(route);
+};
+
 const normalizeWhatsAppPhone = (...values) => {
     for (const value of values) {
         const digits = String(value || '').replace(/\D/g, '');
@@ -691,47 +698,56 @@ const createTripLogixReceiptPdf = (route) => {
     addLine('Distancia considerada', `${receipt.distanceKm.toFixed(2)} km`);
     addLine('Duración considerada', `${receipt.durationMinutes} min`);
 
-    addSectionTitle('Desglose del importe');
-    const pricingRows = [
-        ['Tarifa base', receipt.pricing.baseFare],
-        [`Distancia (${receipt.distanceKm.toFixed(2)} km x ${formatTripLogixMoney(receipt.pricing.perKm)})`, receipt.pricing.distanceAmount],
-        [`Tiempo (${receipt.durationMinutes} min x ${formatTripLogixMoney(receipt.pricing.perMinute)})`, receipt.pricing.timeAmount]
-    ];
+    if (shouldHideDriverReceiptPricing(route)) {
+        addSectionTitle('Liquidación empresarial');
+        addLine(
+            'Esquema de liquidación',
+            'Liquidación semanal por kilómetros recorridos. La tarifa monetaria no se muestra al conductor.'
+        );
+        addLine('Kilómetros del servicio', `${receipt.distanceKm.toFixed(2)} km`, { bold: true, valueSize: 11 });
+    } else {
+        addSectionTitle('Desglose del importe');
+        const pricingRows = [
+            ['Tarifa base', receipt.pricing.baseFare],
+            [`Distancia (${receipt.distanceKm.toFixed(2)} km x ${formatTripLogixMoney(receipt.pricing.perKm)})`, receipt.pricing.distanceAmount],
+            [`Tiempo (${receipt.durationMinutes} min x ${formatTripLogixMoney(receipt.pricing.perMinute)})`, receipt.pricing.timeAmount]
+        ];
 
-    if (receipt.pricing.demandMultiplier > 1) {
-        pricingRows.push([`Ajuste de demanda x${receipt.pricing.demandMultiplier.toFixed(2)}`, receipt.pricing.demandAdjustment]);
-    }
-    if (receipt.pricing.minimumFareApplied) {
-        pricingRows.push(['Ajuste a tarifa mínima', Math.max(0, receipt.pricing.minimumFare - (receipt.pricing.baseFare + receipt.pricing.distanceAmount + receipt.pricing.timeAmount + receipt.pricing.demandAdjustment))]);
-    }
-    pricingRows.push(['Cuota operativa y de seguridad', receipt.pricing.serviceFee]);
-    if (receipt.pricing.tolls > 0) pricingRows.push(['Peajes registrados', receipt.pricing.tolls]);
+        if (receipt.pricing.demandMultiplier > 1) {
+            pricingRows.push([`Ajuste de demanda x${receipt.pricing.demandMultiplier.toFixed(2)}`, receipt.pricing.demandAdjustment]);
+        }
+        if (receipt.pricing.minimumFareApplied) {
+            pricingRows.push(['Ajuste a tarifa mínima', Math.max(0, receipt.pricing.minimumFare - (receipt.pricing.baseFare + receipt.pricing.distanceAmount + receipt.pricing.timeAmount + receipt.pricing.demandAdjustment))]);
+        }
+        pricingRows.push(['Cuota operativa y de seguridad', receipt.pricing.serviceFee]);
+        if (receipt.pricing.tolls > 0) pricingRows.push(['Peajes registrados', receipt.pricing.tolls]);
 
-    pricingRows.forEach(([label, value]) => {
-        ensureSpace(8);
-        pdf.setFont('helvetica', 'normal');
-        pdf.setFontSize(9);
-        pdf.setTextColor(71, 85, 105);
-        pdf.text(String(label), margin, y);
+        pricingRows.forEach(([label, value]) => {
+            ensureSpace(8);
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(9);
+            pdf.setTextColor(71, 85, 105);
+            pdf.text(String(label), margin, y);
+            pdf.setFont('helvetica', 'bold');
+            pdf.setTextColor(15, 23, 42);
+            pdf.text(formatTripLogixMoney(value, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
+            y += 7;
+        });
+
+        ensureSpace(22);
+        pdf.setDrawColor(226, 232, 240);
+        pdf.line(margin, y, pageWidth - margin, y);
+        y += 8;
         pdf.setFont('helvetica', 'bold');
-        pdf.setTextColor(15, 23, 42);
-        pdf.text(formatTripLogixMoney(value, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
-        y += 7;
-    });
+        pdf.setFontSize(14);
+        pdf.setTextColor(249, 115, 22);
+        pdf.text('TOTAL', margin, y);
+        pdf.text(formatTripLogixMoney(receipt.pricing.total, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
+        y += 10;
 
-    ensureSpace(22);
-    pdf.setDrawColor(226, 232, 240);
-    pdf.line(margin, y, pageWidth - margin, y);
-    y += 8;
-    pdf.setFont('helvetica', 'bold');
-    pdf.setFontSize(14);
-    pdf.setTextColor(249, 115, 22);
-    pdf.text('TOTAL', margin, y);
-    pdf.text(formatTripLogixMoney(receipt.pricing.total, receipt.pricing.currency), pageWidth - margin, y, { align: 'right' });
-    y += 10;
-
-    addLine('Método de pago', receipt.paymentMethod);
-    addLine('Estado del pago', receipt.paymentStatus);
+        addLine('Método de pago', receipt.paymentMethod);
+        addLine('Estado del pago', receipt.paymentStatus);
+    }
 
     pdf.setFont('helvetica', 'normal');
     pdf.setFontSize(6.8);
@@ -3347,6 +3363,7 @@ function App() {
       const currentEstimatedArrivalTime = getEstimatedArrivalTimeFromMinutes(liveRouteData.nextStopDuration);
       const isHeadingToFirstPoint = nextStopIdx === 0;
       const currentPassengerPhone = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
+      const travelledGeometry = downsamplePath(selectedRoute?.rutaReal, 260);
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
@@ -3463,16 +3480,24 @@ function App() {
                               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 mb-4">
                                   <p className="text-[10px] font-black uppercase text-slate-400">Folio</p>
                                   <p className="font-black text-slate-800 mt-1">{buildTripLogixReceipt(completedTripNotice).folio}</p>
-                                  <div className="grid grid-cols-2 gap-3 mt-4">
+                                  <div className={`grid ${shouldHideDriverReceiptPricing(completedTripNotice) ? 'grid-cols-1' : 'grid-cols-2'} gap-3 mt-4`}>
                                       <div>
                                           <p className="text-[10px] font-black uppercase text-slate-400">Distancia</p>
                                           <p className="text-lg font-black">{buildTripLogixReceipt(completedTripNotice).distanceKm.toFixed(2)} km</p>
                                       </div>
-                                      <div className="text-right">
-                                          <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
-                                          <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
-                                      </div>
+                                      {!shouldHideDriverReceiptPricing(completedTripNotice) && (
+                                          <div className="text-right">
+                                              <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
+                                              <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                          </div>
+                                      )}
                                   </div>
+                                  {shouldHideDriverReceiptPricing(completedTripNotice) && (
+                                      <div className="mt-3 rounded-xl bg-blue-50 border border-blue-200 px-3 py-2">
+                                          <p className="text-[10px] font-black uppercase tracking-widest text-blue-700">Ruta empresarial</p>
+                                          <p className="text-xs font-bold text-blue-900 mt-1">Liquidación semanal por kilómetros recorridos. Sin tarifa final para conductor.</p>
+                                      </div>
+                                  )}
                               </div>
                               <div className="grid grid-cols-2 gap-3">
                                   <button
@@ -3650,13 +3675,37 @@ function App() {
                             onDragStart={handleMapDrag}
                             options={NAV_MAP_OPTIONS}
                         >
-                            {currentGeometry.length > 0 && <Polyline path={currentGeometry} options={NAV_POLYLINE_OPTIONS} />}
-                            {allTargets.map((target, idx) => {
-                                if (idx < nextStopIdx) return null;
-                                const safeTarget = normalizePoint(target);
-                                if (!safeTarget) return null;
-                                return <Marker key={idx} position={{lat: safeTarget.lat, lng: safeTarget.lng}} icon={target.icon} />;
-                            })}
+                            {travelledGeometry.length > 1 && (
+                                <Polyline
+                                    path={travelledGeometry}
+                                    options={{
+                                        strokeColor: '#2563eb',
+                                        strokeOpacity: 0.72,
+                                        strokeWeight: 4,
+                                        zIndex: 2
+                                    }}
+                                />
+                            )}
+                            {currentGeometry.length > 0 && (
+                                <Polyline
+                                    path={currentGeometry}
+                                    options={{
+                                        ...NAV_POLYLINE_OPTIONS,
+                                        strokeColor: '#f97316',
+                                        strokeOpacity: 1,
+                                        strokeWeight: 6,
+                                        zIndex: 4
+                                    }}
+                                />
+                            )}
+                            {currentTarget && normalizePoint(currentTarget) && (
+                                <Marker
+                                    position={normalizePoint(currentTarget)}
+                                    icon={currentTarget.icon}
+                                    title={`Siguiente punto: ${currentTarget.contact || currentTarget.label || 'Parada'}`}
+                                    zIndex={9000}
+                                />
+                            )}
                             {snappedLocation && (
                                 <Marker
                                     position={snappedLocation}
@@ -3666,6 +3715,18 @@ function App() {
                                 />
                             )}
                         </GoogleMap>
+
+                        <div className="absolute left-4 top-[150px] z-30 bg-white/95 backdrop-blur border border-slate-200 rounded-xl px-3 py-2 shadow-lg">
+                            <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Lectura de ruta</p>
+                            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-700">
+                                <span className="w-6 h-1 rounded-full bg-blue-600"></span>
+                                <span>Recorrido</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-700 mt-1">
+                                <span className="w-6 h-1.5 rounded-full bg-orange-500"></span>
+                                <span>Por recorrer</span>
+                            </div>
+                        </div>
 
                         {!snappedLocation && (
                             <div className="absolute top-4 left-4 right-4 z-20 bg-white/95 border border-orange-200 rounded-2xl px-4 py-3 shadow-lg text-center">
@@ -3814,16 +3875,24 @@ function App() {
                         <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 mb-4">
                             <p className="text-[10px] font-black uppercase text-slate-400">Folio</p>
                             <p className="font-black text-slate-800 mt-1">{buildTripLogixReceipt(completedTripNotice).folio}</p>
-                            <div className="grid grid-cols-2 gap-3 mt-4">
+                            <div className={`grid ${shouldHideDriverReceiptPricing(completedTripNotice) ? 'grid-cols-1' : 'grid-cols-2'} gap-3 mt-4`}>
                                 <div>
                                     <p className="text-[10px] font-black uppercase text-slate-400">Distancia</p>
                                     <p className="text-lg font-black">{buildTripLogixReceipt(completedTripNotice).distanceKm.toFixed(2)} km</p>
                                 </div>
-                                <div className="text-right">
-                                    <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
-                                    <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
-                                </div>
+                                {!shouldHideDriverReceiptPricing(completedTripNotice) && (
+                                    <div className="text-right">
+                                        <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
+                                        <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                    </div>
+                                )}
                             </div>
+                            {shouldHideDriverReceiptPricing(completedTripNotice) && (
+                                <div className="mt-3 rounded-xl bg-blue-50 border border-blue-200 px-3 py-2">
+                                    <p className="text-[10px] font-black uppercase tracking-widest text-blue-700">Ruta empresarial</p>
+                                    <p className="text-xs font-bold text-blue-900 mt-1">Liquidación semanal por kilómetros recorridos. Sin tarifa final para conductor.</p>
+                                </div>
+                            )}
                         </div>
                         <div className="grid grid-cols-2 gap-3">
                             <button
