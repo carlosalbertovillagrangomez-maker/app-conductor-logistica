@@ -1569,6 +1569,7 @@ function App() {
   const [isApproaching, setIsApproaching] = useState(false); 
 
   const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
+  const [resolvedNextStopLocation, setResolvedNextStopLocation] = useState(null);
 
   // === ESTADOS PARA EL ASISTENTE DE NAVEGACIÓN Y VOZ ===
   const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
@@ -1662,7 +1663,7 @@ function App() {
 
       if (key && key !== lastIncomingChatRef.current.key && !['Conductor', 'Sistema'].includes(lastMessage?.sender)) {
           if ('vibrate' in navigator) navigator.vibrate([180, 80, 180]);
-          speakNavigationText(lastMessage?.sender === 'Despacho' ? 'Nuevo mensaje de torre de control' : 'Nuevo mensaje del pasajero').catch(() => {});
+          speakNavigationText(lastMessage?.sender === 'Despacho' ? 'Mensaje de torre de control' : 'Mensaje del pasajero').catch(() => {});
       }
       lastIncomingChatRef.current = { routeId, key };
   }, [selectedRoute?.id, selectedRoute?.chat]);
@@ -1720,6 +1721,10 @@ function App() {
       }
       setPrevRutasCount(misRutas.length);
   }, [misRutas.length, prevRutasCount]);
+
+  useEffect(() => {
+      setResolvedNextStopLocation(null);
+  }, [selectedRoute?.id, nextStopIdx]);
 
   useEffect(() => {
     const requestWakeLock = async () => { if ('wakeLock' in navigator && selectedRoute?.status === 'En Ruta') { try { wakeLockRef.current = await navigator.wakeLock.request('screen'); } catch (err) {} } };
@@ -1988,7 +1993,7 @@ function App() {
               if (shouldPublishGeometry) {
                   payload.liveRouteGeometry = downsamplePath(
                       liveRouteGeometryRef.current,
-                      260
+                      600
                   );
                   payload.liveRouteUpdatedAt = updatedAt;
               }
@@ -2199,7 +2204,7 @@ function App() {
           });
 
           if (geometry) {
-              const normalizedGeometry = downsamplePath(geometry, 260);
+              const normalizedGeometry = downsamplePath(geometry, 600);
               if (normalizedGeometry.length > 1) {
                   liveRouteGeometryRef.current = normalizedGeometry;
                   liveRoutePublishDirtyRef.current = true;
@@ -2271,17 +2276,26 @@ function App() {
           directionsServiceRef.current = new window.google.maps.DirectionsService();
       }
 
-      const destinationPoint = normalizePoint(allTargets[allTargets.length - 1]);
-      if (!destinationPoint) return;
+      const getDirectionsLocation = (target) => {
+          if (!target) return null;
+          const address = String(target.address || '').trim();
+          // Preferir la dirección textual hace que Google resuelva el acceso vehicular
+          // de la calle, en lugar de terminar exactamente sobre una coordenada interna
+          // del predio que puede dibujar una línea sobre casas o lotes.
+          if (address.length >= 6) return address;
+          const point = normalizePoint(target);
+          return point ? { lat: point.lat, lng: point.lng } : null;
+      };
+
+      const destinationTarget = allTargets[allTargets.length - 1];
+      const destinationLocation = getDirectionsLocation(destinationTarget);
+      if (!destinationLocation) return;
 
       const waypoints = [];
       for (let i = nextStopIdx; i < allTargets.length - 1; i++) {
-          const point = normalizePoint(allTargets[i]);
-          if (point) {
-              waypoints.push({
-                  location: { lat: point.lat, lng: point.lng },
-                  stopover: true
-              });
+          const location = getDirectionsLocation(allTargets[i]);
+          if (location) {
+              waypoints.push({ location, stopover: true });
           }
       }
 
@@ -2294,7 +2308,7 @@ function App() {
 
       directionsServiceRef.current.route({
           origin: { lat: loc.lat, lng: loc.lng },
-          destination: { lat: destinationPoint.lat, lng: destinationPoint.lng },
+          destination: destinationLocation,
           waypoints,
           optimizeWaypoints: false,
           travelMode: window.google.maps.TravelMode.DRIVING,
@@ -2371,13 +2385,37 @@ function App() {
               Math.max(1, Math.round(remainingSeconds / 60)) ||
               fallbackMetrics.totalDurMins;
 
+          // Usar la geometría detallada de cada paso. overview_path puede simplificar
+          // curvas y aparentar que la ruta atraviesa manzanas cuando se hace zoom.
+          const detailedPath = [];
+          legs.forEach(leg => {
+              (leg.steps || []).forEach(step => {
+                  const stepPath = Array.isArray(step.path) ? step.path : [];
+                  stepPath.forEach(point => {
+                      const normalized = normalizePoint({
+                          lat: typeof point.lat === 'function' ? point.lat() : point.lat,
+                          lng: typeof point.lng === 'function' ? point.lng() : point.lng
+                      });
+                      if (normalized) detailedPath.push(normalized);
+                  });
+              });
+          });
+
+          const overviewPath = (route.overview_path || []).map(point => ({
+              lat: typeof point.lat === 'function' ? point.lat() : point.lat,
+              lng: typeof point.lng === 'function' ? point.lng() : point.lng
+          }));
+
           const routeGeometry = downsamplePath(
-              (route.overview_path || []).map(point => ({
-                  lat: typeof point.lat === 'function' ? point.lat() : point.lat,
-                  lng: typeof point.lng === 'function' ? point.lng() : point.lng
-              })),
-              260
+              detailedPath.length > 1 ? detailedPath : overviewPath,
+              800
           );
+
+          const firstLegEnd = normalizePoint({
+              lat: typeof firstLeg?.end_location?.lat === 'function' ? firstLeg.end_location.lat() : firstLeg?.end_location?.lat,
+              lng: typeof firstLeg?.end_location?.lng === 'function' ? firstLeg.end_location.lng() : firstLeg?.end_location?.lng
+          });
+          if (firstLegEnd) setResolvedNextStopLocation(firstLegEnd);
 
           navigationStepsRef.current = steps;
           navigationGeometryRef.current = routeGeometry;
@@ -3239,6 +3277,20 @@ function App() {
 
       await updateDoc(doc(db, "rutas", routeId), finalUpdate);
 
+      // El viaje termina, pero el conductor puede seguir En Línea. Publicar inmediatamente
+      // su posición actual evita que la torre se quede con el cursor en el último destino.
+      if (currentDriver?.id && currentDriver?.isOnline) {
+          const finalDriverLocation = normalizePoint(latestLocRef.current || driverLocationForMap);
+          if (finalDriverLocation) {
+              await updateDoc(doc(db, 'conductores', currentDriver.id), {
+                  currentLocation: finalDriverLocation,
+                  heading: normalizeHeadingDegrees(userHeadingRef.current),
+                  lastLocationUpdate: actualEndTimestamp,
+                  lastTripFinishedAt: actualEndTimestamp
+              }).catch(error => console.warn('No se pudo publicar la ubicación posterior al viaje:', error));
+          }
+      }
+
       const completedRoute = {
           ...routeForReceipt,
           ...finalUpdate,
@@ -3334,7 +3386,7 @@ function App() {
           localGoogleGeometry.length > 1
               ? localGoogleGeometry
               : publishedGoogleGeometry,
-          260
+          800
       );
   }, [liveRouteData.geometry, selectedRoute?.liveRouteGeometry]);
 
@@ -3698,9 +3750,9 @@ function App() {
                                     }}
                                 />
                             )}
-                            {currentTarget && normalizePoint(currentTarget) && (
+                            {currentTarget && (resolvedNextStopLocation || normalizePoint(currentTarget)) && (
                                 <Marker
-                                    position={normalizePoint(currentTarget)}
+                                    position={resolvedNextStopLocation || normalizePoint(currentTarget)}
                                     icon={currentTarget.icon}
                                     title={`Siguiente punto: ${currentTarget.contact || currentTarget.label || 'Parada'}`}
                                     zIndex={9000}
