@@ -1538,10 +1538,15 @@ function App() {
   
   const [nextStopIdx, setNextStopIdx] = useState(0); 
   const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
+  const [sharedPassengerStatuses, setSharedPassengerStatuses] = useState({});
 
   useEffect(() => {
       nextStopIdxRef.current = nextStopIdx;
   }, [nextStopIdx]);
+
+  useEffect(() => {
+      setSharedPassengerStatuses({});
+  }, [selectedRoute?.id, nextStopIdx]);
 
   useEffect(() => {
       const startedAt =
@@ -1756,7 +1761,8 @@ function App() {
               address: selectedRoute.start,
               icon: ICON_START,
               contact: selectedRoute.startCoords.passengerName || selectedRoute.startCoords.contact,
-              plannedTime: getStopPlannedTimeValue(selectedRoute, 0)
+              plannedTime: getStopPlannedTimeValue(selectedRoute, 0),
+              passengersSchedule: Array.isArray(selectedRoute.startCoords?.passengersSchedule) ? selectedRoute.startCoords.passengersSchedule : []
           });
       }
 
@@ -1767,7 +1773,8 @@ function App() {
                   address: selectedRoute.waypoints?.[idx] || wp.address,
                   icon: ICON_WAYPOINT,
                   contact: wp.passengerName || wp.contact,
-                  plannedTime: getStopPlannedTimeValue(selectedRoute, idx + 1)
+                  plannedTime: getStopPlannedTimeValue(selectedRoute, idx + 1),
+                  passengersSchedule: Array.isArray(wp?.passengersSchedule) ? wp.passengersSchedule : []
               });
           });
       }
@@ -1779,7 +1786,8 @@ function App() {
               address: selectedRoute.end,
               icon: ICON_END,
               contact: selectedRoute.endCoords.passengerName || selectedRoute.endCoords.contact,
-              plannedTime: getStopPlannedTimeValue(selectedRoute, finalIndex)
+              plannedTime: getStopPlannedTimeValue(selectedRoute, finalIndex),
+              passengersSchedule: Array.isArray(selectedRoute.endCoords?.passengersSchedule) ? selectedRoute.endCoords.passengersSchedule : []
           });
       }
 
@@ -2312,7 +2320,7 @@ function App() {
           waypoints,
           optimizeWaypoints: false,
           travelMode: window.google.maps.TravelMode.DRIVING,
-          provideRouteAlternatives: false,
+          provideRouteAlternatives: waypoints.length === 0,
           avoidFerries: true,
           avoidHighways: false,
           avoidTolls: false,
@@ -2332,7 +2340,11 @@ function App() {
               return;
           }
 
-          const route = result.routes[0];
+          const route = [...result.routes].sort((a, b) => {
+              const distanceA = (a.legs || []).reduce((sum, leg) => sum + (Number(leg.distance?.value) || 0), 0);
+              const distanceB = (b.legs || []).reduce((sum, leg) => sum + (Number(leg.distance?.value) || 0), 0);
+              return distanceA - distanceB;
+          })[0];
           const legs = Array.isArray(route.legs) ? route.legs : [];
           let remainingMeters = 0;
           let remainingSeconds = 0;
@@ -2913,6 +2925,134 @@ function App() {
       }
   };
 
+  const getSharedPassengerKey = (passenger, index = 0) => String(
+      passenger?.passengerName || passenger?.name || passenger?.contact || `Pasajero ${index + 1}`
+  ).trim().toLowerCase();
+
+  const getSharedPassengerStoredStatus = (passenger, index = 0) => {
+      const key = getSharedPassengerKey(passenger, index);
+      if (sharedPassengerStatuses[key]) return sharedPassengerStatuses[key];
+      const events = Array.isArray(selectedRoute?.stopEvents) ? selectedRoute.stopEvents : [];
+      const passengerName = String(passenger?.passengerName || passenger?.name || passenger?.contact || '').trim().toLowerCase();
+      const event = [...events].reverse().find(item =>
+          item?.sharedPassenger === true &&
+          Number(item?.stopIndex) === Number(nextStopIdx) &&
+          String(item?.passenger || '').trim().toLowerCase() === passengerName
+      );
+      return event?.status || '';
+  };
+
+  const registrarPasajeroCompartido = async (passenger, status, index = 0) => {
+      if (!selectedRoute?.id) return;
+      const target = allTargets[nextStopIdx] || {};
+      const passengerName = String(passenger?.passengerName || passenger?.name || passenger?.contact || `Pasajero ${index + 1}`).trim();
+      const normalizedStatus = status === 'A bordo' ? 'A bordo' : 'No se presentó';
+      const nowIso = new Date().toISOString();
+      const nowTime = getMexicoTime();
+      const location = normalizePoint(userLocation);
+      const eventData = {
+          eventId: `${selectedRoute.id}-shared-${nextStopIdx}-${index}-${Date.now()}`,
+          type: normalizedStatus === 'A bordo' ? 'boarding' : 'absence',
+          status: normalizedStatus,
+          sharedPassenger: true,
+          stopIndex: nextStopIdx,
+          label: target?.label || `Punto ${nextStopIdx + 1}`,
+          passenger: passengerName,
+          address: target?.address || '',
+          phone: passenger?.phone || passenger?.contactPhone || '',
+          photo: evidence || '',
+          location,
+          time: nowTime,
+          timestamp: nowIso
+      };
+      const auditEntry = {
+          evento: normalizedStatus === 'A bordo' ? 'Pasajero compartido a bordo' : 'Pasajero compartido no se presentó',
+          motivo: passengerName,
+          punto: eventData.label,
+          stopIndex: nextStopIdx,
+          timestamp: nowIso,
+          time: nowTime
+      };
+      const updates = {
+          stopEvents: arrayUnion(eventData),
+          bitacora: arrayUnion(auditEntry),
+          chat: arrayUnion({
+              sender: 'Sistema',
+              text: `${passengerName}: ${normalizedStatus}`,
+              time: nowTime,
+              timestamp: nowIso,
+              stopIndex: nextStopIdx
+          }),
+          'proximityAlert.active': false,
+          lastUpdate: nowIso
+      };
+      if (evidence) {
+          if (normalizedStatus === 'A bordo') updates.evidenciasLlegada = arrayUnion(eventData);
+          else updates.evidencias = arrayUnion(eventData);
+      }
+
+      // El primer punto físico inicia el servicio aunque alguno de los pasajeros no suba.
+      if (nextStopIdx === 0 && !selectedRoute?.firstStopAttendedTimestamp) {
+          updates.firstStopAttendedTime = nowTime;
+          updates.firstStopAttendedTimestamp = nowIso;
+          updates.firstStopAttendedStatus = `Punto compartido · ${normalizedStatus}`;
+          updates.firstStopAttendedPassenger = passengerName;
+          updates.firstStopAttendedLocation = location;
+
+          if (!serviceDistanceStartedRef.current) {
+              updates.serviceDistanceStartedAt = nowIso;
+              updates.serviceDistanceStartLocation = location;
+              updates.realDistanceDriven = 0;
+              updates.rutaReal = location ? [location] : [];
+              serviceDistanceStartedRef.current = true;
+              serviceDistanceStartedAtRef.current = nowIso;
+              odometerLocRef.current = location;
+              odometerMetaRef.current = { timestamp: Date.now(), accuracy: 0 };
+              pendingDistanceKmRef.current = 0;
+              pendingRoutePointsRef.current = [];
+              committedDistanceKmRef.current = 0;
+          }
+      }
+
+      if (normalizedStatus === 'A bordo' && !selectedRoute?.firstBoardingTimestamp) {
+          updates.firstBoardingTime = nowTime;
+          updates.firstBoardingTimestamp = nowIso;
+      }
+
+      try {
+          await updateDoc(doc(db, 'rutas', selectedRoute.id), updates);
+          const key = getSharedPassengerKey(passenger, index);
+          setSharedPassengerStatuses(prev => ({ ...prev, [key]: normalizedStatus }));
+          setSelectedRoute(prev => prev ? {
+              ...prev,
+              ...(updates.firstStopAttendedTimestamp ? {
+                  firstStopAttendedTime: updates.firstStopAttendedTime,
+                  firstStopAttendedTimestamp: updates.firstStopAttendedTimestamp,
+                  firstStopAttendedStatus: updates.firstStopAttendedStatus,
+                  firstStopAttendedPassenger: updates.firstStopAttendedPassenger,
+                  serviceDistanceStartedAt: updates.serviceDistanceStartedAt || prev.serviceDistanceStartedAt
+              } : {}),
+              ...(updates.firstBoardingTimestamp ? {
+                  firstBoardingTime: updates.firstBoardingTime,
+                  firstBoardingTimestamp: updates.firstBoardingTimestamp
+              } : {}),
+              proximityAlert: { ...(prev.proximityAlert || {}), active: false }
+          } : prev);
+      } catch (error) {
+          console.error('No se pudo registrar al pasajero del punto compartido:', error);
+          alert('No se pudo guardar el estado del pasajero. Revisa la conexión.');
+      }
+  };
+
+  const continuarPuntoCompartido = async (passengers, isFinalDestination) => {
+      const pendientes = passengers.filter((passenger, index) => !getSharedPassengerStoredStatus(passenger, index));
+      if (pendientes.length > 0) {
+          alert(`Falta registrar ${pendientes.length} pasajero${pendientes.length === 1 ? '' : 's'} antes de continuar.`);
+          return;
+      }
+      await advanceAfterStop(isFinalDestination);
+  };
+
   const handleSelectRoute = (ruta) => {
       committedDistanceKmRef.current = Math.max(0, Number(ruta?.realDistanceDriven) || 0);
       serviceDistanceStartedAtRef.current = String(
@@ -3414,8 +3554,12 @@ function App() {
       const firstPointArrivalTime = getFirstPointArrivalText(selectedRoute);
       const currentEstimatedArrivalTime = getEstimatedArrivalTimeFromMinutes(liveRouteData.nextStopDuration);
       const isHeadingToFirstPoint = nextStopIdx === 0;
-      const currentPassengerPhone = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
+      const currentPassengerPhoneRaw = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
       const travelledGeometry = downsamplePath(selectedRoute?.rutaReal, 260);
+      const sharedPassengers = Array.isArray(currentTarget?.passengersSchedule) ? currentTarget.passengersSchedule : [];
+      const isSharedPassengerStop = sharedPassengers.length > 1;
+      const currentPassengerPhone = isSharedPassengerStop ? '' : currentPassengerPhoneRaw;
+      const sharedCompletedCount = sharedPassengers.filter((passenger, index) => Boolean(getSharedPassengerStoredStatus(passenger, index))).length;
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
@@ -3656,12 +3800,72 @@ function App() {
                                   <input type="file" accept="image/*" capture="environment" hidden onChange={handlePhoto} />
                               </label>
                           </div>
-                          <div className="flex gap-2">
-                              <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SALIÓ / CANCELÓ</button>
-                              <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
-                                  {isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>}
-                              </button>
-                          </div>
+                          {isSharedPassengerStop ? (
+                              <div className="space-y-3">
+                                  <div className="rounded-xl bg-blue-50 border border-blue-200 p-3">
+                                      <div className="flex items-center justify-between gap-2 mb-2">
+                                          <div>
+                                              <p className="text-[10px] font-black uppercase tracking-widest text-blue-700">Punto compartido</p>
+                                              <p className="text-xs font-bold text-slate-600 mt-0.5">Registra a cada pasajero antes de continuar.</p>
+                                          </div>
+                                          <span className="text-[10px] font-black bg-blue-600 text-white rounded-full px-2.5 py-1">{sharedCompletedCount}/{sharedPassengers.length}</span>
+                                      </div>
+                                      <div className="max-h-[32vh] overflow-y-auto space-y-2 pr-1">
+                                          {sharedPassengers.map((passenger, passengerIndex) => {
+                                              const passengerName = passenger?.passengerName || passenger?.name || passenger?.contact || `Pasajero ${passengerIndex + 1}`;
+                                              const status = getSharedPassengerStoredStatus(passenger, passengerIndex);
+                                              const passengerPhone = normalizeWhatsAppPhone(passenger?.phone, passenger?.contactPhone, passenger?.whatsapp);
+                                              return (
+                                                  <div key={`${passengerName}-${passengerIndex}`} className="bg-white border border-blue-100 rounded-xl p-2.5 shadow-sm">
+                                                      <div className="flex items-center justify-between gap-2 mb-2">
+                                                          <div className="min-w-0">
+                                                              <p className="text-xs font-black text-slate-800 truncate">{passengerName}</p>
+                                                              <p className={`text-[9px] font-black uppercase mt-0.5 ${status === 'A bordo' ? 'text-green-600' : status ? 'text-red-600' : 'text-slate-400'}`}>{status || 'Pendiente'}</p>
+                                                          </div>
+                                                          {passengerPhone && (
+                                                              <button
+                                                                  type="button"
+                                                                  onClick={() => abrirWhatsAppPasajero(selectedRoute, { ...currentTarget, passengerName, contact: passengerName, phone: passenger?.phone, contactPhone: passenger?.contactPhone }, nextStopIdx)}
+                                                                  className="px-2.5 py-2 rounded-lg bg-green-50 text-green-600 border border-green-200 text-[9px] font-black"
+                                                              >WA</button>
+                                                          )}
+                                                      </div>
+                                                      <div className="grid grid-cols-2 gap-2">
+                                                          <button
+                                                              type="button"
+                                                              disabled={Boolean(status)}
+                                                              onClick={() => registrarPasajeroCompartido(passenger, 'A bordo', passengerIndex)}
+                                                              className={`py-2 rounded-lg text-[9px] font-black uppercase ${status === 'A bordo' ? 'bg-green-600 text-white' : status ? 'bg-slate-100 text-slate-300' : 'bg-green-50 text-green-700 border border-green-200'}`}
+                                                          >A bordo</button>
+                                                          <button
+                                                              type="button"
+                                                              disabled={Boolean(status)}
+                                                              onClick={() => registrarPasajeroCompartido(passenger, 'No se presentó', passengerIndex)}
+                                                              className={`py-2 rounded-lg text-[9px] font-black uppercase ${status === 'No se presentó' ? 'bg-red-600 text-white' : status ? 'bg-slate-100 text-slate-300' : 'bg-red-50 text-red-600 border border-red-200'}`}
+                                                          >No salió</button>
+                                                      </div>
+                                                  </div>
+                                              );
+                                          })}
+                                      </div>
+                                  </div>
+                                  <button
+                                      type="button"
+                                      onClick={() => continuarPuntoCompartido(sharedPassengers, isHeadingToDestination)}
+                                      disabled={sharedCompletedCount < sharedPassengers.length}
+                                      className={`w-full p-3 rounded-xl font-black text-sm flex items-center justify-center gap-2 ${sharedCompletedCount === sharedPassengers.length ? 'bg-orange-500 text-white active:scale-95' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+                                  >
+                                      <CheckCircle className="w-5 h-5" /> {isHeadingToDestination ? 'FINALIZAR VIAJE' : 'CONTINUAR RUTA'}
+                                  </button>
+                              </div>
+                          ) : (
+                              <div className="flex gap-2">
+                                  <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SALIÓ / CANCELÓ</button>
+                                  <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
+                                      {isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>}
+                                  </button>
+                              </div>
+                          )}
                       </div>
                   </div>
               )}
