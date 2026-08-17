@@ -171,6 +171,26 @@ const calculateTripLogixFare = (route, overrides = {}) => {
         : getTripDurationMinutesForReceipt(route, overrides.actualEndTimestamp);
 
     const configuredPricing = route?.pricing || {};
+    const pricingCurrency = String(
+        configuredPricing.currency ||
+        route?.currency ||
+        route?.serviceCurrency ||
+        TRIPLOGIX_RECEIPT_CONFIG.currency
+    ).toUpperCase();
+
+    const quotedTotal = Number(
+        configuredPricing.quotedTotal ??
+        configuredPricing.initialQuote ??
+        route?.quotedTotal ??
+        route?.initialQuotedTotal
+    );
+    const fixedQuote = Boolean(
+        configuredPricing.fixedQuote === true ||
+        configuredPricing.recalculateAtEnd === false ||
+        route?.recalculateAtEnd === false ||
+        route?.pricingMode === 'fixed_quote'
+    );
+
     const baseFare = Number(configuredPricing.baseFare ?? TRIPLOGIX_RECEIPT_CONFIG.baseFare);
     const perKm = Number(configuredPricing.perKm ?? TRIPLOGIX_RECEIPT_CONFIG.perKm);
     const perMinute = Number(configuredPricing.perMinute ?? TRIPLOGIX_RECEIPT_CONFIG.perMinute);
@@ -198,10 +218,16 @@ const calculateTripLogixFare = (route, overrides = {}) => {
 
     // Este comprobante no es CFDI, por lo que no se desglosan impuestos fiscales.
     const taxes = 0;
-    const total = roundMoney(subtotal + taxes);
+    const calculatedTotal = roundMoney(subtotal + taxes);
+    const total = fixedQuote && Number.isFinite(quotedTotal) && quotedTotal > 0
+        ? roundMoney(quotedTotal)
+        : calculatedTotal;
 
     return {
-        currency: TRIPLOGIX_RECEIPT_CONFIG.currency,
+        currency: pricingCurrency,
+        quotedTotal: Number.isFinite(quotedTotal) && quotedTotal > 0 ? roundMoney(quotedTotal) : null,
+        fixedQuote,
+        recalculateAtEnd: !fixedQuote,
         distanceKm: roundMoney(distanceKm),
         durationMinutes: Math.max(0, Math.round(durationMinutes)),
         baseFare: roundMoney(baseFare),
@@ -253,8 +279,28 @@ const calculateDriverProjectedPricing = ({
         durationMinutes: projectedDurationMinutes
     });
 
+    const quotedTotal = Number(
+        route?.pricing?.quotedTotal ??
+        route?.pricing?.initialQuote ??
+        route?.quotedTotal ??
+        route?.initialQuotedTotal
+    );
+    const keepQuoteUntilFinish = Boolean(
+        route?.serviceModel === 'walk_up' &&
+        route?.pricing?.recalculateAtEnd !== false &&
+        route?.recalculateAtEnd !== false &&
+        Number.isFinite(quotedTotal) &&
+        quotedTotal > 0
+    );
+
     return {
         ...pricing,
+        ...(keepQuoteUntilFinish ? {
+            projectedTotal: pricing.total,
+            total: roundMoney(quotedTotal),
+            quotedTotal: roundMoney(quotedTotal),
+            pricingStage: 'quote_active'
+        } : {}),
         projectedDistanceKm,
         projectedDurationMinutes,
         drivenDistanceKm: roundMoney(committedKm),
@@ -262,7 +308,9 @@ const calculateDriverProjectedPricing = ({
         remainingDurationMinutes: Math.max(0, Math.round(Number(remainingDurationMinutes) || 0)),
         source,
         updatedAt: new Date().toISOString(),
-        model: 'TripLogix conductor: distancia recorrida + ruta restante + tiempo proyectado'
+        model: keepQuoteUntilFinish
+            ? 'TripLogix: cotización acordada visible; recálculo final pendiente'
+            : 'TripLogix conductor: distancia recorrida + ruta restante + tiempo proyectado'
     };
 };
 const makeTripLogixFolio = (route, issuedAt) => {
@@ -349,6 +397,17 @@ const formatTripLogixMoney = (value, currency = 'MXN') => {
 
 const isDispatcherScheduledTrip = (route) => {
     if (!route) return false;
+
+    // Servicio ocasional/acopio sí puede mostrar la cotización acordada aunque
+    // haya sido creado por despacho.
+    if (
+        route?.serviceModel === 'walk_up' ||
+        route?.pricingVisibility === 'visible' ||
+        route?.showPricingDuringTrip === true ||
+        route?.pricingPolicy === 'dispatcher_visible_quote'
+    ) {
+        return false;
+    }
 
     return Boolean(
         route?.pricingVisibility === 'hidden_during_trip' ||
@@ -568,6 +627,7 @@ const getTripDisplayedPricing = (route) => {
     return {
         ...calculated,
         total: Number.isFinite(storedTotal) ? roundMoney(storedTotal) : calculated.total,
+        currency: String(route?.pricing?.currency || calculated.currency || 'MXN').toUpperCase(),
         source: Number.isFinite(storedTotal) ? 'Tarifa oficial del despacho' : 'Estimación TripLogix'
     };
 };
@@ -897,11 +957,18 @@ const calculatePathDistanceKm = (path = []) => {
         const elapsedSeconds = previousTime && currentTime && currentTime > previousTime
             ? (currentTime - previousTime) / 1000
             : null;
-        const maxPlausibleMeters = elapsedSeconds ? Math.max(180, elapsedSeconds * 55) : 350;
+        const maxPlausibleMeters = elapsedSeconds ? Math.max(120, elapsedSeconds * 45) : 250;
         const accuracyNoise = Math.max(Number(previous.accuracy) || 0, Number(current.accuracy) || 0) * 0.45;
         const minimumMovement = Math.max(7, accuracyNoise);
+        const isSegmentBreak = Boolean(
+            current?.segmentStart ||
+            current?.routeBreak ||
+            current?.gpsGap ||
+            (elapsedSeconds !== null && elapsedSeconds > 30)
+        );
 
         if (
+            !isSegmentBreak &&
             Number.isFinite(segmentMeters) &&
             segmentMeters >= minimumMovement &&
             segmentMeters <= maxPlausibleMeters
@@ -1880,21 +1947,50 @@ function App() {
             if (!previousOdometerLoc) {
                 odometerLocRef.current = loc;
                 odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
-                pendingRoutePointsRef.current.push({ ...loc, recordedAt: new Date(position.timestamp || now).toISOString(), accuracy });
+                pendingRoutePointsRef.current.push({
+                    ...loc,
+                    recordedAt: new Date(position.timestamp || now).toISOString(),
+                    accuracy,
+                    segmentStart: true
+                });
             } else {
                 const movedMeters = getDistanceMeters(previousOdometerLoc, loc);
                 const elapsedSeconds = Math.max(0.5, ((position.timestamp || now) - (previousMeta.timestamp || now)) / 1000);
-                const maximumPlausibleMeters = Math.max(180, elapsedSeconds * 55);
+                const maximumPlausibleMeters = Math.max(120, elapsedSeconds * 45);
                 const minimumMovement = Math.max(7, Math.max(accuracy, Number(previousMeta.accuracy) || 0) * 0.45);
+                const signalGap = elapsedSeconds > 30;
 
-                if (movedMeters >= minimumMovement && movedMeters <= maximumPlausibleMeters) {
+                if (signalGap || movedMeters > maximumPlausibleMeters) {
+                    // No unimos el último punto conocido con el primero al recuperar señal.
+                    // Se abre un segmento nuevo y se reinicia la referencia del odómetro.
+                    console.warn('Corte/reconexión GPS: se inicia un nuevo segmento.', {
+                        movedMeters,
+                        elapsedSeconds,
+                        accuracy
+                    });
+                    pendingRoutePointsRef.current.push({
+                        ...loc,
+                        recordedAt: new Date(position.timestamp || now).toISOString(),
+                        accuracy,
+                        segmentStart: true,
+                        gpsGap: signalGap,
+                        gapSeconds: Math.round(elapsedSeconds)
+                    });
+                    if (pendingRoutePointsRef.current.length > 20) {
+                        pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-20);
+                    }
+                    odometerLocRef.current = loc;
+                    odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
+                } else if (movedMeters >= minimumMovement) {
                     pendingDistanceKmRef.current += movedMeters / 1000;
-                    pendingRoutePointsRef.current.push({ ...loc, recordedAt: new Date(position.timestamp || now).toISOString(), accuracy });
+                    pendingRoutePointsRef.current.push({
+                        ...loc,
+                        recordedAt: new Date(position.timestamp || now).toISOString(),
+                        accuracy
+                    });
                     if (pendingRoutePointsRef.current.length > 20) pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-20);
                     odometerLocRef.current = loc;
                     odometerMetaRef.current = { timestamp: position.timestamp || now, accuracy };
-                } else if (movedMeters > maximumPlausibleMeters) {
-                    console.warn('Salto GPS ignorado:', { movedMeters, elapsedSeconds, accuracy });
                 }
             }
         } else if (selectedRoute?.status === 'En Ruta' && !serviceDistanceActive) {
@@ -2785,7 +2881,7 @@ function App() {
               updates.serviceDistanceStartedAt = nowIso;
               updates.serviceDistanceStartLocation = startLocation;
               updates.realDistanceDriven = 0;
-              updates.rutaReal = startLocation ? [startLocation] : [];
+              updates.rutaReal = startLocation ? [{ ...startLocation, recordedAt: nowIso, accuracy: 0, segmentStart: true }] : [];
 
               serviceDistanceStartedRef.current = true;
               serviceDistanceStartedAtRef.current = nowIso;
@@ -2892,7 +2988,7 @@ function App() {
                   absenceUpdates.serviceDistanceStartedAt = nowIso;
                   absenceUpdates.serviceDistanceStartLocation = startLocation;
                   absenceUpdates.realDistanceDriven = 0;
-                  absenceUpdates.rutaReal = startLocation ? [startLocation] : [];
+                  absenceUpdates.rutaReal = startLocation ? [{ ...startLocation, recordedAt: nowIso, accuracy: 0, segmentStart: true }] : [];
 
                   serviceDistanceStartedRef.current = true;
                   serviceDistanceStartedAtRef.current = nowIso;
@@ -3241,14 +3337,35 @@ function App() {
       const navigationStartedAt = new Date().toISOString();
       const plannedDistanceKm = Number(routeToStart?.technicalData?.totalDistance) || 0;
       const plannedDurationMinutes = Number(routeToStart?.technicalData?.totalDuration) || 0;
+      const plannedCalculatedPricing = calculateTripLogixFare(routeToStart, {
+          distanceKm: plannedDistanceKm,
+          durationMinutes: plannedDurationMinutes
+      });
+      const initialQuotedTotal = Number(
+          routeToStart?.pricing?.quotedTotal ??
+          routeToStart?.pricing?.initialQuote ??
+          routeToStart?.quotedTotal
+      );
+      const preserveWalkUpQuote = Boolean(
+          routeToStart?.serviceModel === 'walk_up' &&
+          Number.isFinite(initialQuotedTotal) &&
+          initialQuotedTotal > 0
+      );
       const plannedPricing = {
-          ...calculateTripLogixFare(routeToStart, {
-              distanceKm: plannedDistanceKm,
-              durationMinutes: plannedDurationMinutes
-          }),
-          source: 'driver-planned-route',
+          ...plannedCalculatedPricing,
+          ...(preserveWalkUpQuote ? {
+              ...routeToStart.pricing,
+              currency: routeToStart?.pricing?.currency || plannedCalculatedPricing.currency,
+              quotedTotal: initialQuotedTotal,
+              projectedTotal: plannedCalculatedPricing.total,
+              total: initialQuotedTotal,
+              pricingStage: 'quote_active'
+          } : {}),
+          source: preserveWalkUpQuote ? 'dispatcher-walk-up-quote' : 'driver-planned-route',
           updatedAt: navigationStartedAt,
-          model: 'TripLogix calculado por la app del conductor'
+          model: preserveWalkUpQuote
+              ? 'TripLogix cotización inicial del despachador; recálculo al cierre si aplica'
+              : 'TripLogix calculado por la app del conductor'
       };
 
       const updateData = {
@@ -3684,7 +3801,7 @@ function App() {
                                       {!shouldHideDriverReceiptPricing(completedTripNotice) && (
                                           <div className="text-right">
                                               <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
-                                              <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                              <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total, buildTripLogixReceipt(completedTripNotice).pricing.currency)}</p>
                                           </div>
                                       )}
                                   </div>
@@ -4139,7 +4256,7 @@ function App() {
                                 {!shouldHideDriverReceiptPricing(completedTripNotice) && (
                                     <div className="text-right">
                                         <p className="text-[10px] font-black uppercase text-slate-400">Total</p>
-                                        <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total)}</p>
+                                        <p className="text-lg font-black text-orange-600">{formatTripLogixMoney(buildTripLogixReceipt(completedTripNotice).pricing.total, buildTripLogixReceipt(completedTripNotice).pricing.currency)}</p>
                                     </div>
                                 )}
                             </div>
@@ -4236,7 +4353,7 @@ function App() {
                         <p className="text-[10px] font-black uppercase tracking-widest text-green-600">Valor del servicio</p>
                         <p className="text-[9px] font-bold uppercase text-green-600 mt-1">{getTripDisplayedPricing(selectedRoute).source}</p>
                     </div>
-                    <p className="text-2xl font-black">{formatTripLogixMoney(getTripDisplayedPricing(selectedRoute).total)}</p>
+                    <p className="text-2xl font-black">{formatTripLogixMoney(getTripDisplayedPricing(selectedRoute).total, getTripDisplayedPricing(selectedRoute).currency)}</p>
                 </div>
             ) : (
                 <div className="mb-4 rounded-2xl p-4 bg-blue-50 border border-blue-200 text-blue-800 shadow-sm">
@@ -4368,7 +4485,7 @@ function App() {
                             <div className="bg-green-50 p-4 rounded-2xl border border-green-200 shadow-sm text-center">
                                 <p className="text-[10px] font-black text-green-600 uppercase tracking-widest">Valor del servicio</p>
                                 <p className="text-2xl font-black text-green-700 mt-1">
-                                    {formatTripLogixMoney(getTripDisplayedPricing(incomingOffer).total)}
+                                    {formatTripLogixMoney(getTripDisplayedPricing(incomingOffer).total, getTripDisplayedPricing(incomingOffer).currency)}
                                 </p>
                                 <p className="text-[9px] font-bold text-green-600 mt-1 uppercase">
                                     {getTripDisplayedPricing(incomingOffer).source}
