@@ -983,8 +983,14 @@ const calculatePathDistanceKm = (path = []) => {
 const chooseReliableDistanceKm = (route, persistedDistanceKm, tracedDistanceKm) => {
     const persisted = Math.max(0, Number(persistedDistanceKm) || 0);
     const traced = Math.max(0, Number(tracedDistanceKm) || 0);
+    const estimatedGapKm = Math.max(0, Number(route?.gpsGapEstimatedDistanceKm) || 0);
     if (!persisted) return traced;
     if (!traced) return persisted;
+
+    // Cuando hubo pérdida de señal, el acumulador persistido incluye la estimación
+    // por ruta vehicular conocida. No debemos volver a escoger el trazo GPS menor,
+    // porque precisamente ese trazo contiene el hueco sin señal.
+    if (estimatedGapKm > 0) return roundMoney(persisted);
 
     const larger = Math.max(persisted, traced);
     const smaller = Math.min(persisted, traced);
@@ -1098,20 +1104,138 @@ const getFallbackRouteMetrics = (origin, targets, nextIndex, plannedGeometry) =>
     };
 };
 
+// Reduce el peso de una geometría SIN saltarse curvas de forma agresiva.
+// Para navegación preferimos conservar la geometría detallada que entrega Google.
 const downsamplePath = (path, maxPoints = 260) => {
     const valid = normalizePath(path);
     if (valid.length <= maxPoints) return valid;
 
-    const step = Math.ceil(valid.length / maxPoints);
-    const sampled = valid.filter((_, index) => index % step === 0);
-    const last = valid[valid.length - 1];
+    // Conserva puntos de giro y limita la distancia física entre puntos guardados.
+    // Esto evita el antiguo muestreo "cada N puntos", que podía dibujar cuerdas
+    // rectas atravesando casas, terrenos o manzanas.
+    const result = [valid[0]];
+    let lastKept = valid[0];
+    let previousHeading = null;
+    const targetSpacingMeters = Math.max(12, Math.min(35, (calculatePathDistanceKm(valid) * 1000) / Math.max(1, maxPoints - 1)));
 
-    if (!sampled.length || sampled[sampled.length - 1].lat !== last.lat || sampled[sampled.length - 1].lng !== last.lng) {
-        sampled.push(last);
+    for (let index = 1; index < valid.length - 1; index += 1) {
+        const point = valid[index];
+        const previous = valid[index - 1];
+        const next = valid[index + 1];
+        const distanceFromKept = getDistanceMeters(lastKept, point);
+
+        let headingA = previousHeading;
+        let headingB = null;
+        try {
+            const dy1 = point.lat - previous.lat;
+            const dx1 = point.lng - previous.lng;
+            const dy2 = next.lat - point.lat;
+            const dx2 = next.lng - point.lng;
+            headingA = Math.atan2(dy1, dx1) * 180 / Math.PI;
+            headingB = Math.atan2(dy2, dx2) * 180 / Math.PI;
+        } catch (_) {}
+        const turn = Number.isFinite(headingA) && Number.isFinite(headingB)
+            ? Math.abs(((headingB - headingA + 540) % 360) - 180)
+            : 0;
+
+        if (distanceFromKept >= targetSpacingMeters || turn >= 8) {
+            result.push(point);
+            lastKept = point;
+        }
+        previousHeading = headingB;
     }
 
-    return sampled;
+    result.push(valid[valid.length - 1]);
+    return result;
 };
+
+const splitGpsTraceSegments = (path, options = {}) => {
+    const points = normalizePath(path);
+    if (!points.length) return [];
+    const maxGapMs = Number(options.maxGapMs) || 18000;
+    const maxBridgeMeters = Number(options.maxBridgeMeters) || 120;
+    const segments = [];
+    let current = [];
+
+    const flush = () => {
+        if (current.length > 1) segments.push(current);
+        current = [];
+    };
+
+    points.forEach((point, index) => {
+        if (index === 0) {
+            current = [point];
+            return;
+        }
+        const previous = points[index - 1];
+        const previousMs = getTimestampMs(previous?.recordedAt || previous?.timestamp);
+        const currentMs = getTimestampMs(point?.recordedAt || point?.timestamp);
+        const gapMs = previousMs && currentMs && currentMs > previousMs ? currentMs - previousMs : 0;
+        const bridgeMeters = getDistanceMeters(previous, point);
+        const gapSeconds = gapMs > 0 ? gapMs / 1000 : 0;
+        const speedMps = gapSeconds > 0 ? bridgeMeters / gapSeconds : 0;
+        const explicitBreak = Boolean(point?.segmentStart || point?.routeBreak || point?.gpsGap);
+
+        if (explicitBreak || gapMs > maxGapMs || bridgeMeters > maxBridgeMeters || speedMps > 42) {
+            flush();
+            current = [point];
+            return;
+        }
+        current.push(point);
+    });
+    flush();
+    return segments;
+};
+
+const getClosestPathMatch = (point, path) => {
+    const loc = normalizePoint(point);
+    const geometry = normalizePath(path);
+    if (!loc || geometry.length < 2) return { index: -1, distanceMeters: Infinity };
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    geometry.forEach((candidate, index) => {
+        const distance = getDistanceMeters(loc, candidate);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = index;
+        }
+    });
+    return { index: bestIndex, distanceMeters: bestDistance };
+};
+
+// Cuando el GPS desaparece NO inventamos una recta entre dos posiciones.
+// Si ambos extremos están cerca de una ruta vehicular conocida, estimamos el hueco
+// recorriendo esa geometría (ruta Google viva primero; plan original después).
+const getKnownRoadGapDistanceKm = (fromPoint, toPoint, candidatePaths = []) => {
+    const from = normalizePoint(fromPoint);
+    const to = normalizePoint(toPoint);
+    if (!from || !to) return 0;
+    const directMeters = getDistanceMeters(from, to);
+
+    for (const rawPath of candidatePaths) {
+        const path = normalizePath(rawPath);
+        if (path.length < 2) continue;
+        const startMatch = getClosestPathMatch(from, path);
+        const endMatch = getClosestPathMatch(to, path);
+        if (startMatch.index < 0 || endMatch.index < 0) continue;
+        if (startMatch.distanceMeters > 260 || endMatch.distanceMeters > 260) continue;
+        if (endMatch.index < startMatch.index) continue;
+
+        const roadMeters = getDistanceAlongPathMeters(path, startMatch.index, endMatch.index);
+        if (!Number.isFinite(roadMeters) || roadMeters <= 0) continue;
+        if (directMeters > 0 && roadMeters < directMeters * 0.75) continue;
+        if (directMeters > 0 && roadMeters > Math.max(directMeters * 4, directMeters + 6000)) continue;
+        return roundMoney(roadMeters / 1000);
+    }
+    return 0;
+};
+
+const isSalidaRoute = (route) => String(
+    route?.technicalData?.carpool?.mode ||
+    route?.carpoolMode ||
+    route?.tripDirection ||
+    ''
+).toLowerCase().includes('regreso');
 
 const stripHtml = (value = '') => String(value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -1262,18 +1386,36 @@ const getStopPlannedTimeValue = (route, stopIndex) => {
 
     const waypointsCount = route?.waypointsData?.length || 0;
     const finalIndex = waypointsCount + 1;
+    const salida = isSalidaRoute(route);
 
     if (stopIndex === 0) {
-        return getPickupTimeValue(route);
+        return normalizeTimeString(
+            route?.startCoords?.departureTime ||
+            route?.startCoords?.pickupTime ||
+            route?.scheduledTime ||
+            getPickupTimeValue(route)
+        );
     }
 
     if (stopIndex > 0 && stopIndex < finalIndex) {
         const waypoint = route?.waypointsData?.[stopIndex - 1];
         return normalizeTimeString(
+            (salida ? (waypoint?.dropoffTime || waypoint?.plannedDropoffTime) : '') ||
+            waypoint?.plannedTime ||
             waypoint?.pickupTime ||
             waypoint?.plannedPickupTime ||
             waypoint?.horaRecogida ||
             waypoint?.horaPickup ||
+            ''
+        );
+    }
+
+    if (salida) {
+        return normalizeTimeString(
+            route?.endCoords?.dropoffTime ||
+            route?.endCoords?.plannedDropoffTime ||
+            route?.endCoords?.plannedTime ||
+            route?.estimatedFinalArrivalTime ||
             ''
         );
     }
@@ -1284,7 +1426,13 @@ const getStopPlannedTimeValue = (route, stopIndex) => {
 const getStopScheduleLabel = (route, stopIndex) => {
     const waypointsCount = route?.waypointsData?.length || 0;
     const finalIndex = waypointsCount + 1;
+    const salida = isSalidaRoute(route);
 
+    if (salida) {
+        if (stopIndex === 0) return 'Salida programada';
+        if (stopIndex >= finalIndex) return 'Última entrega estimada';
+        return 'Entrega estimada';
+    }
     if (stopIndex >= finalIndex) return 'Llegada final objetivo';
     if (stopIndex === 0) return 'Primer punto programado';
     return 'Recolección programada';
@@ -1533,7 +1681,8 @@ function App() {
   const [isReady, setIsReady] = useState(false);
   
   const [misRutas, setMisRutas] = useState([]);
-  const [prevRutasCount, setPrevRutasCount] = useState(0); // Para detectar si el despachador asignó algo manual
+  const assignmentTrackerInitializedRef = useRef(false);
+  const knownAssignedRouteIdsRef = useRef(new Set());
 
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Próximo');
@@ -1570,6 +1719,7 @@ function App() {
   const navigationGeometryRef = useRef([]);
   const lastUiLocationRef = useRef({ loc: null, timestamp: 0 });
   const pendingDistanceKmRef = useRef(0);
+  const pendingGapDistanceKmRef = useRef(0);
   const pendingRoutePointsRef = useRef([]);
   const telemetryBusyRef = useRef(false);
   const flushTelemetryRef = useRef(async () => {});
@@ -1747,16 +1897,22 @@ function App() {
       const cleanText = translateNavigationInstruction(nextManeuver.instruction);
       if (!cleanText) return;
 
-      const voiceKey = nextManeuver.voiceKey || `${cleanText}-${nextManeuver.distance}`;
+      const bucket = String(nextManeuver.voiceKey || '').split('-').pop() || 'far';
+      const instructionSignature = cleanText.toLowerCase().replace(/\s+/g, ' ').trim();
+      const voiceKey = `${instructionSignature}|${bucket}`;
       if (lastSpokenRef.current?.key === voiceKey) return;
 
       const now = Date.now();
-      const isUrgent = ['70', '180'].some(bucket => String(voiceKey).endsWith(`-${bucket}`));
-      if (!isUrgent && lastSpokenRef.current && now - (lastSpokenRef.current.timestamp || 0) < 8000) return;
+      const isUrgent = ['70', '180'].includes(bucket);
+      if (
+          lastSpokenRef.current?.instruction === instructionSignature &&
+          now - (lastSpokenRef.current.timestamp || 0) < (isUrgent ? 12_000 : 35_000)
+      ) return;
+      if (!isUrgent && lastSpokenRef.current && now - (lastSpokenRef.current.timestamp || 0) < 7000) return;
 
       speakNavigationText(`${nextManeuver.distance ? `${nextManeuver.distance}. ` : ''}${cleanText}`)
           .then(spoken => {
-              if (spoken) lastSpokenRef.current = { key: voiceKey, timestamp: now };
+              if (spoken) lastSpokenRef.current = { key: voiceKey, instruction: instructionSignature, timestamp: now };
           });
   }, [nextManeuver, voiceEnabled]);
 
@@ -1785,14 +1941,31 @@ function App() {
       setSelectedRoute(prev => prev ? { ...prev, ...latest } : latest);
   }, [misRutas, selectedRoute?.id]);
 
-  // --- DETECCIÓN DE VIAJES ASIGNADOS MANUALMENTE DESDE EL DESPACHO ---
+  // --- DETECCIÓN ROBUSTA DE VIAJES NUEVOS ASIGNADOS DESDE DESPACHO ---
+  // No depende de que cambie el número total de rutas: detecta IDs nuevos asignados.
   useEffect(() => {
-      if (misRutas.length > prevRutasCount && prevRutasCount !== 0) {
-          playAlertSound();
-          if ("vibrate" in navigator) navigator.vibrate([300, 100, 300, 100, 300]);
+      if (!currentDriver?.id) return;
+      const assignedActive = misRutas.filter(route =>
+          !['Finalizado', 'Completado', 'Cancelado'].includes(route?.status) &&
+          (route?.driverId === currentDriver.id || route?.ofertaPara === currentDriver.id)
+      );
+      const currentIds = new Set(assignedActive.map(route => route.id));
+
+      if (!assignmentTrackerInitializedRef.current) {
+          knownAssignedRouteIdsRef.current = currentIds;
+          assignmentTrackerInitializedRef.current = true;
+          return;
       }
-      setPrevRutasCount(misRutas.length);
-  }, [misRutas.length, prevRutasCount]);
+
+      const newlyAssigned = assignedActive.filter(route => !knownAssignedRouteIdsRef.current.has(route.id) && route?.ofertaEstado !== 'Pendiente');
+      if (newlyAssigned.length > 0) {
+          playAlertSound();
+          if ('vibrate' in navigator) navigator.vibrate([400, 120, 400, 120, 700]);
+          speakNavigationText('Nuevo viaje asignado').catch(() => {});
+          setMainTab('Pendientes');
+      }
+      knownAssignedRouteIdsRef.current = currentIds;
+  }, [misRutas, currentDriver?.id]);
 
   useEffect(() => {
       setResolvedNextStopLocation(null);
@@ -1824,7 +1997,7 @@ function App() {
 
       if (selectedRoute.startCoords) {
           addTarget(selectedRoute.startCoords, {
-              label: 'Origen',
+              label: isSalidaRoute(selectedRoute) ? 'Salida empresa' : 'Origen',
               address: selectedRoute.start,
               icon: ICON_START,
               contact: selectedRoute.startCoords.passengerName || selectedRoute.startCoords.contact,
@@ -1836,7 +2009,7 @@ function App() {
       if (selectedRoute.waypointsData) {
           selectedRoute.waypointsData.forEach((wp, idx) => {
               addTarget(wp, {
-                  label: `Parada ${String.fromCharCode(66 + idx)}`,
+                  label: isSalidaRoute(selectedRoute) ? `Entrega ${String.fromCharCode(66 + idx)}` : `Parada ${String.fromCharCode(66 + idx)}`,
                   address: selectedRoute.waypoints?.[idx] || wp.address,
                   icon: ICON_WAYPOINT,
                   contact: wp.passengerName || wp.contact,
@@ -1849,7 +2022,7 @@ function App() {
       if (selectedRoute.endCoords) {
           const finalIndex = (selectedRoute.waypointsData?.length || 0) + 1;
           addTarget(selectedRoute.endCoords, {
-              label: 'Destino Final',
+              label: isSalidaRoute(selectedRoute) ? 'Última descarga' : 'Destino Final',
               address: selectedRoute.end,
               icon: ICON_END,
               contact: selectedRoute.endCoords.passengerName || selectedRoute.endCoords.contact,
@@ -1962,11 +2135,32 @@ function App() {
 
                 if (signalGap || movedMeters > maximumPlausibleMeters) {
                     // No unimos el último punto conocido con el primero al recuperar señal.
-                    // Se abre un segmento nuevo y se reinicia la referencia del odómetro.
+                    // Para el kilometraje estimamos únicamente el hueco que pueda recorrerse
+                    // sobre una geometría vehicular conocida. Visualmente sigue siendo un corte.
+                    const gapRoadKm = getKnownRoadGapDistanceKm(
+                        previousOdometerLoc,
+                        loc,
+                        [
+                            navigationGeometryRef.current,
+                            selectedRoute?.originalPlan?.geometry,
+                            selectedRoute?.technicalData?.geometry
+                        ]
+                    );
+                    const maxGapKmByTime = Math.max(0.25, elapsedSeconds * 0.05); // hasta 180 km/h
+                    const acceptedGapKm = gapRoadKm > 0 && gapRoadKm <= maxGapKmByTime
+                        ? gapRoadKm
+                        : 0;
+
+                    if (acceptedGapKm > 0) {
+                        pendingDistanceKmRef.current += acceptedGapKm;
+                        pendingGapDistanceKmRef.current += acceptedGapKm;
+                    }
+
                     console.warn('Corte/reconexión GPS: se inicia un nuevo segmento.', {
                         movedMeters,
                         elapsedSeconds,
-                        accuracy
+                        accuracy,
+                        estimatedRoadGapKm: acceptedGapKm
                     });
                     pendingRoutePointsRef.current.push({
                         ...loc,
@@ -1974,7 +2168,9 @@ function App() {
                         accuracy,
                         segmentStart: true,
                         gpsGap: signalGap,
-                        gapSeconds: Math.round(elapsedSeconds)
+                        gapSeconds: Math.round(elapsedSeconds),
+                        gapEstimatedKm: acceptedGapKm,
+                        gapFillSource: acceptedGapKm > 0 ? 'known-road-geometry' : 'unresolved-gap'
                     });
                     if (pendingRoutePointsRef.current.length > 20) {
                         pendingRoutePointsRef.current = pendingRoutePointsRef.current.slice(-20);
@@ -2059,6 +2255,7 @@ function App() {
           lastDriverLocationWriteRef.current = now;
 
           const distanceToFlush = pendingDistanceKmRef.current;
+          const gapDistanceToFlush = pendingGapDistanceKmRef.current;
           const pointsToFlush = pendingRoutePointsRef.current.slice(-10);
           const shouldPublishGeometry =
               liveRoutePublishDirtyRef.current &&
@@ -2095,15 +2292,17 @@ function App() {
               }
 
               if (shouldPublishGeometry) {
-                  payload.liveRouteGeometry = downsamplePath(
-                      liveRouteGeometryRef.current,
-                      600
-                  );
+                  // Publicamos una geometría con suficiente detalle para que la torre no
+                  // dibuje atajos rectos entre calles. El mapa del conductor conserva aún más detalle.
+                  payload.liveRouteGeometry = downsamplePath(liveRouteGeometryRef.current, 1800);
                   payload.liveRouteUpdatedAt = updatedAt;
               }
 
               if (distanceToFlush > 0) {
                   payload.realDistanceDriven = increment(distanceToFlush);
+              }
+              if (gapDistanceToFlush > 0) {
+                  payload.gpsGapEstimatedDistanceKm = increment(gapDistanceToFlush);
               }
 
               if (pointsToFlush.length > 0) {
@@ -2119,6 +2318,12 @@ function App() {
                   pendingDistanceKmRef.current = Math.max(
                       0,
                       pendingDistanceKmRef.current - distanceToFlush
+                  );
+              }
+              if (gapDistanceToFlush > 0) {
+                  pendingGapDistanceKmRef.current = Math.max(
+                      0,
+                      pendingGapDistanceKmRef.current - gapDistanceToFlush
                   );
               }
 
@@ -2168,14 +2373,17 @@ function App() {
   }, [driverLocationForMap, liveRouteData.geometry, selectedRoute?.technicalData?.geometry]);
 
   useEffect(() => {
-      if (!isTrackingRef.current || !mapRef.current || selectedRoute?.status !== 'En Ruta' || !snappedLocation) return;
+      // La cámara sigue el GPS REAL. El marcador puede pegarse visualmente a la ruta,
+      // pero una geometría vieja nunca debe congelar el desplazamiento del mapa.
+      const cameraLocation = normalizePoint(driverLocationForMap);
+      if (!isTrackingRef.current || !mapRef.current || selectedRoute?.status !== 'En Ruta' || !cameraLocation) return;
 
       const now = Date.now();
-      if (now - lastCameraMoveRef.current < 2800) return;
+      if (now - lastCameraMoveRef.current < 1200) return;
 
-      safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
+      safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 17);
       lastCameraMoveRef.current = now;
-  }, [snappedLocation, selectedRoute?.status]);
+  }, [driverLocationForMap, selectedRoute?.status, userHeading]);
 
   useEffect(() => {
       if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
@@ -2308,7 +2516,7 @@ function App() {
           });
 
           if (geometry) {
-              const normalizedGeometry = downsamplePath(geometry, 600);
+              const normalizedGeometry = normalizePath(geometry);
               if (normalizedGeometry.length > 1) {
                   liveRouteGeometryRef.current = normalizedGeometry;
                   liveRoutePublishDirtyRef.current = true;
@@ -2317,7 +2525,7 @@ function App() {
 
           setLiveRouteData(prev => {
               const nextGeometry = geometry
-                  ? downsamplePath(geometry, 260)
+                  ? normalizePath(geometry)
                   : prev.geometry;
 
               const nextState = {
@@ -2514,9 +2722,10 @@ function App() {
               lng: typeof point.lng === 'function' ? point.lng() : point.lng
           }));
 
-          const routeGeometry = downsamplePath(
-              detailedPath.length > 1 ? detailedPath : overviewPath,
-              800
+          // Mantener el trazado detallado que Google confirma sobre calles.
+          // No hacemos muestreo uniforme: era la causa principal de los "atajos" visuales.
+          const routeGeometry = normalizePath(
+              detailedPath.length > 1 ? detailedPath : overviewPath
           );
 
           const firstLegEnd = normalizePoint({
@@ -2606,8 +2815,9 @@ function App() {
 
   const centerOnUser = () => {
       setIsTracking(true);
-      if (mapRef.current && snappedLocation) {
-          safeSetMapCamera(mapRef.current, snappedLocation, userHeading, 17);
+      const cameraLocation = normalizePoint(latestLocRef.current || driverLocationForMap || snappedLocation);
+      if (mapRef.current && cameraLocation) {
+          safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 17);
       }
   };
 
@@ -2643,6 +2853,7 @@ function App() {
       lastDirectionsRequestRef.current = 0;
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
+      pendingGapDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
       committedDistanceKmRef.current = 0;
       liveRouteGeometryRef.current = [];
@@ -2827,10 +3038,11 @@ function App() {
       const target = allTargets[nextStopIdx] || {};
       const nowIso = new Date().toISOString();
       const nowTime = getMexicoTime();
+      const isDropoff = isSalidaRoute(selectedRoute) && nextStopIdx > 0;
       const llegadaData = {
-          eventId: `${selectedRoute.id}-boarding-${nextStopIdx}-${Date.now()}`,
-          type: isFinalDestination ? 'destination_arrival' : 'boarding',
-          status: isFinalDestination ? 'Destino confirmado' : 'Pasajero a bordo',
+          eventId: `${selectedRoute.id}-${isDropoff ? 'dropoff' : 'boarding'}-${nextStopIdx}-${Date.now()}`,
+          type: isDropoff ? 'dropoff' : (isFinalDestination ? 'destination_arrival' : 'boarding'),
+          status: isDropoff ? 'Pasajero en destino' : (isFinalDestination ? 'Destino confirmado' : 'Pasajero a bordo'),
           stopIndex: nextStopIdx,
           label: target?.label || (isFinalDestination ? 'Destino Final' : `Punto ${nextStopIdx + 1}`),
           passenger: target?.contact || target?.passengerName || 'Pasajero',
@@ -2842,7 +3054,7 @@ function App() {
       };
 
       const auditEntry = {
-          evento: isFinalDestination ? 'Llegada al destino final' : 'Pasajero a bordo',
+          evento: isDropoff ? 'Pasajero descargado / en destino' : (isFinalDestination ? 'Llegada al destino final' : 'Pasajero a bordo'),
           motivo: llegadaData.passenger,
           punto: llegadaData.label,
           stopIndex: nextStopIdx,
@@ -2856,9 +3068,11 @@ function App() {
           bitacora: arrayUnion(auditEntry),
           chat: arrayUnion({
               sender: 'Sistema',
-              text: isFinalDestination
-                  ? `Destino final confirmado: ${llegadaData.passenger}`
-                  : `Pasajero a bordo en ${llegadaData.label}: ${llegadaData.passenger}`,
+              text: isDropoff
+                  ? `Pasajero en destino en ${llegadaData.label}: ${llegadaData.passenger}`
+                  : (isFinalDestination
+                      ? `Destino final confirmado: ${llegadaData.passenger}`
+                      : `Pasajero a bordo en ${llegadaData.label}: ${llegadaData.passenger}`),
               time: nowTime,
               timestamp: nowIso,
               stopIndex: nextStopIdx
@@ -2888,6 +3102,7 @@ function App() {
               odometerLocRef.current = startLocation;
               odometerMetaRef.current = { timestamp: Date.now(), accuracy: 0 };
               pendingDistanceKmRef.current = 0;
+              pendingGapDistanceKmRef.current = 0;
               pendingRoutePointsRef.current = [];
               committedDistanceKmRef.current = 0;
           }
@@ -3042,13 +3257,16 @@ function App() {
       if (!selectedRoute?.id) return;
       const target = allTargets[nextStopIdx] || {};
       const passengerName = String(passenger?.passengerName || passenger?.name || passenger?.contact || `Pasajero ${index + 1}`).trim();
-      const normalizedStatus = status === 'A bordo' ? 'A bordo' : 'No se presentó';
+      const isDropoff = isSalidaRoute(selectedRoute) && nextStopIdx > 0;
+      const normalizedStatus = status === 'A bordo'
+          ? (isDropoff ? 'En destino' : 'A bordo')
+          : (isDropoff ? 'No se entregó' : 'No se presentó');
       const nowIso = new Date().toISOString();
       const nowTime = getMexicoTime();
       const location = normalizePoint(userLocation);
       const eventData = {
           eventId: `${selectedRoute.id}-shared-${nextStopIdx}-${index}-${Date.now()}`,
-          type: normalizedStatus === 'A bordo' ? 'boarding' : 'absence',
+          type: normalizedStatus === 'A bordo' ? 'boarding' : normalizedStatus === 'En destino' ? 'dropoff' : 'absence',
           status: normalizedStatus,
           sharedPassenger: true,
           stopIndex: nextStopIdx,
@@ -3062,7 +3280,11 @@ function App() {
           timestamp: nowIso
       };
       const auditEntry = {
-          evento: normalizedStatus === 'A bordo' ? 'Pasajero compartido a bordo' : 'Pasajero compartido no se presentó',
+          evento: normalizedStatus === 'A bordo'
+              ? 'Pasajero compartido a bordo'
+              : normalizedStatus === 'En destino'
+                  ? 'Pasajero compartido descargado / en destino'
+                  : isDropoff ? 'Pasajero compartido no entregado' : 'Pasajero compartido no se presentó',
           motivo: passengerName,
           punto: eventData.label,
           stopIndex: nextStopIdx,
@@ -3083,7 +3305,7 @@ function App() {
           lastUpdate: nowIso
       };
       if (evidence) {
-          if (normalizedStatus === 'A bordo') updates.evidenciasLlegada = arrayUnion(eventData);
+          if (['A bordo', 'En destino'].includes(normalizedStatus)) updates.evidenciasLlegada = arrayUnion(eventData);
           else updates.evidencias = arrayUnion(eventData);
       }
 
@@ -3105,6 +3327,7 @@ function App() {
               odometerLocRef.current = location;
               odometerMetaRef.current = { timestamp: Date.now(), accuracy: 0 };
               pendingDistanceKmRef.current = 0;
+              pendingGapDistanceKmRef.current = 0;
               pendingRoutePointsRef.current = [];
               committedDistanceKmRef.current = 0;
           }
@@ -3368,8 +3591,23 @@ function App() {
               : 'TripLogix calculado por la app del conductor'
       };
 
+      const immutableOriginalPlan = routeToStart?.originalPlan || {
+          version: 1,
+          createdAt: routeToStart?.createdDate || navigationStartedAt,
+          geometry: normalizePath(routeToStart?.technicalData?.geometry),
+          totalDistance: routeToStart?.technicalData?.totalDistance || null,
+          totalDuration: routeToStart?.technicalData?.totalDuration || 0,
+          start: routeToStart?.start || '',
+          startCoords: normalizePoint(routeToStart?.startCoords),
+          waypoints: Array.isArray(routeToStart?.waypoints) ? [...routeToStart.waypoints] : [],
+          waypointsData: Array.isArray(routeToStart?.waypointsData) ? routeToStart.waypointsData.map(point => ({ ...point })) : [],
+          end: routeToStart?.end || '',
+          endCoords: normalizePoint(routeToStart?.endCoords)
+      };
+
       const updateData = {
           status: 'En Ruta',
+          originalPlan: immutableOriginalPlan,
           actualStartTime,
           actualStartTimestamp: navigationStartedAt,
           navigationStartedAt,
@@ -3385,6 +3623,7 @@ function App() {
           serviceDistanceStartedAt: null,
           serviceDistanceStartLocation: null,
           realDistanceDriven: 0,
+          gpsGapEstimatedDistanceKm: 0,
           rutaReal: [],
           "proximityAlert.active": false
       };
@@ -3426,6 +3665,7 @@ function App() {
       lastDirectionsRequestRef.current = 0;
       lastDirectionsStopRef.current = null;
       pendingDistanceKmRef.current = 0;
+      pendingGapDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
       committedDistanceKmRef.current = Math.max(0, Number(routeToStart?.realDistanceDriven) || 0);
       liveRouteGeometryRef.current = [];
@@ -3563,6 +3803,7 @@ function App() {
       serviceDistanceStartedRef.current = false;
       serviceDistanceStartedAtRef.current = '';
       pendingDistanceKmRef.current = 0;
+      pendingGapDistanceKmRef.current = 0;
       pendingRoutePointsRef.current = [];
       directionsRequestIdRef.current += 1;
       directionsBusyRef.current = false;
@@ -3639,12 +3880,9 @@ function App() {
       // Durante el recorrido solo se dibuja una ruta confirmada por Google Directions.
       // La geometría OSRM del despachador es únicamente para planeación y no se usa
       // como navegación activa, evitando líneas visuales por zonas sin calles.
-      return downsamplePath(
-          localGoogleGeometry.length > 1
-              ? localGoogleGeometry
-              : publishedGoogleGeometry,
-          800
-      );
+      return localGoogleGeometry.length > 1
+          ? localGoogleGeometry
+          : publishedGoogleGeometry;
   }, [liveRouteData.geometry, selectedRoute?.liveRouteGeometry]);
 
   if (!isReady) return null;
@@ -3672,7 +3910,7 @@ function App() {
       const currentEstimatedArrivalTime = getEstimatedArrivalTimeFromMinutes(liveRouteData.nextStopDuration);
       const isHeadingToFirstPoint = nextStopIdx === 0;
       const currentPassengerPhoneRaw = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
-      const travelledGeometry = downsamplePath(selectedRoute?.rutaReal, 260);
+      const travelledSegments = splitGpsTraceSegments(selectedRoute?.rutaReal);
       const sharedPassengers = Array.isArray(currentTarget?.passengersSchedule) ? currentTarget.passengersSchedule : [];
       const isSharedPassengerStop = sharedPassengers.length > 1;
       const currentPassengerPhone = isSharedPassengerStop ? '' : currentPassengerPhoneRaw;
@@ -3937,7 +4175,7 @@ function App() {
                                                       <div className="flex items-center justify-between gap-2 mb-2">
                                                           <div className="min-w-0">
                                                               <p className="text-xs font-black text-slate-800 truncate">{passengerName}</p>
-                                                              <p className={`text-[9px] font-black uppercase mt-0.5 ${status === 'A bordo' ? 'text-green-600' : status ? 'text-red-600' : 'text-slate-400'}`}>{status || 'Pendiente'}</p>
+                                                              <p className={`text-[9px] font-black uppercase mt-0.5 ${['A bordo', 'En destino'].includes(status) ? 'text-green-600' : status ? 'text-red-600' : 'text-slate-400'}`}>{status || 'Pendiente'}</p>
                                                           </div>
                                                           {passengerPhone && (
                                                               <button
@@ -3952,14 +4190,14 @@ function App() {
                                                               type="button"
                                                               disabled={Boolean(status)}
                                                               onClick={() => registrarPasajeroCompartido(passenger, 'A bordo', passengerIndex)}
-                                                              className={`py-2 rounded-lg text-[9px] font-black uppercase ${status === 'A bordo' ? 'bg-green-600 text-white' : status ? 'bg-slate-100 text-slate-300' : 'bg-green-50 text-green-700 border border-green-200'}`}
-                                                          >A bordo</button>
+                                                              className={`py-2 rounded-lg text-[9px] font-black uppercase ${['A bordo', 'En destino'].includes(status) ? 'bg-green-600 text-white' : status ? 'bg-slate-100 text-slate-300' : 'bg-green-50 text-green-700 border border-green-200'}`}
+                                                          >{isSalidaRoute(selectedRoute) && nextStopIdx > 0 ? 'En destino' : 'A bordo'}</button>
                                                           <button
                                                               type="button"
                                                               disabled={Boolean(status)}
                                                               onClick={() => registrarPasajeroCompartido(passenger, 'No se presentó', passengerIndex)}
                                                               className={`py-2 rounded-lg text-[9px] font-black uppercase ${status === 'No se presentó' ? 'bg-red-600 text-white' : status ? 'bg-slate-100 text-slate-300' : 'bg-red-50 text-red-600 border border-red-200'}`}
-                                                          >No salió</button>
+                                                          >{isSalidaRoute(selectedRoute) && nextStopIdx > 0 ? 'No entregado' : 'No salió'}</button>
                                                       </div>
                                                   </div>
                                               );
@@ -3977,9 +4215,11 @@ function App() {
                               </div>
                           ) : (
                               <div className="flex gap-2">
-                                  <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">NO SALIÓ / CANCELÓ</button>
+                                  <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">{isSalidaRoute(selectedRoute) && nextStopIdx > 0 ? 'NO ENTREGADO / CAMBIO' : 'NO SALIÓ / CANCELÓ'}</button>
                                   <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
-                                      {isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>}
+                                      {isSalidaRoute(selectedRoute) && nextStopIdx > 0
+                                          ? <><CheckCircle className="w-5 h-5"/> {isHeadingToDestination ? 'EN DESTINO Y FINALIZAR' : 'PASAJERO EN DESTINO'}</>
+                                          : (isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>)}
                                   </button>
                               </div>
                           )}
@@ -4048,17 +4288,13 @@ function App() {
                             onDragStart={handleMapDrag}
                             options={NAV_MAP_OPTIONS}
                         >
-                            {travelledGeometry.length > 1 && (
+                            {travelledSegments.map((segment, segmentIndex) => (
                                 <Polyline
-                                    path={travelledGeometry}
-                                    options={{
-                                        strokeColor: '#2563eb',
-                                        strokeOpacity: 0.72,
-                                        strokeWeight: 4,
-                                        zIndex: 2
-                                    }}
+                                    key={`driver-travelled-${segmentIndex}`}
+                                    path={segment}
+                                    options={{ strokeColor: '#2563eb', strokeOpacity: 0.95, strokeWeight: 6, zIndex: 2 }}
                                 />
-                            )}
+                            ))}
                             {currentGeometry.length > 0 && (
                                 <Polyline
                                     path={currentGeometry}
