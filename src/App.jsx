@@ -114,6 +114,8 @@ const getTimestampMs = (value) => {
 const getTripDistanceKmForReceipt = (route) => {
     const candidates = [
         route?.receipt?.distanceKm,
+        route?.officialGoogleDistanceKm,
+        route?.googleMatchedDistanceKm,
         route?.realDistanceDriven,
         route?.actualDistanceKm,
         route?.technicalData?.actualDistance,
@@ -1797,6 +1799,7 @@ function App() {
   const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const lastSpokenRef = useRef(null);
+  const lastSpokenInstructionRef = useRef({ instruction: '', bucket: '', timestamp: 0 });
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -1891,28 +1894,42 @@ function App() {
   }, [selectedRoute?.id, selectedRoute?.chat]);
 
   // === LÓGICA DEL NARRADOR NATIVO / WEB ===
+  // Estilo Google/Waze: no lee cada cambio de metros.
+  // Una maniobra se anuncia a distancia, cerca del giro y únicamente vuelve
+  // a hablar si cambió de maniobra o pasó un tiempo suficientemente largo.
   useEffect(() => {
       if (!voiceEnabled || !nextManeuver.instruction) return;
 
       const cleanText = translateNavigationInstruction(nextManeuver.instruction);
       if (!cleanText) return;
 
-      const bucket = String(nextManeuver.voiceKey || '').split('-').pop() || 'far';
-      const instructionSignature = cleanText.toLowerCase().replace(/\s+/g, ' ').trim();
-      const voiceKey = `${instructionSignature}|${bucket}`;
-      if (lastSpokenRef.current?.key === voiceKey) return;
+      const voiceKey = String(nextManeuver.voiceKey || '');
+      const bucket = voiceKey.split('-').pop() || 'far';
+      const allowedBuckets = new Set(['450', '180', '70']);
+      if (!allowedBuckets.has(bucket)) return;
 
       const now = Date.now();
-      const isUrgent = ['70', '180'].includes(bucket);
-      if (
-          lastSpokenRef.current?.instruction === instructionSignature &&
-          now - (lastSpokenRef.current.timestamp || 0) < (isUrgent ? 12_000 : 35_000)
-      ) return;
-      if (!isUrgent && lastSpokenRef.current && now - (lastSpokenRef.current.timestamp || 0) < 7000) return;
+      const previous = lastSpokenInstructionRef.current || {};
+      const sameInstruction = previous.instruction === cleanText;
+      const sameBucket = previous.bucket === bucket;
+      if (sameInstruction && sameBucket) return;
 
-      speakNavigationText(`${nextManeuver.distance ? `${nextManeuver.distance}. ` : ''}${cleanText}`)
+      // Evita una voz continua por recálculos de Google.
+      // El aviso cercano (70 m) puede romper el cooldown; los demás esperan.
+      const cooldownMs = bucket === '70' ? 12000 : 30000;
+      if (sameInstruction && now - Number(previous.timestamp || 0) < cooldownMs) return;
+
+      const spokenDistance =
+          bucket === '450' ? 'En aproximadamente 400 metros. ' :
+          bucket === '180' ? 'Más adelante. ' :
+          '';
+
+      speakNavigationText(`${spokenDistance}${cleanText}`)
           .then(spoken => {
-              if (spoken) lastSpokenRef.current = { key: voiceKey, instruction: instructionSignature, timestamp: now };
+              if (spoken) {
+                  lastSpokenRef.current = { key: `${cleanText}-${bucket}`, timestamp: now };
+                  lastSpokenInstructionRef.current = { instruction: cleanText, bucket, timestamp: now };
+              }
           });
   }, [nextManeuver, voiceEnabled]);
 
@@ -3722,7 +3739,31 @@ function App() {
       const tracedDistanceKm = calculatePathDistanceKm(
           routeFromRealtime?.rutaReal || selectedRoute?.rutaReal || []
       );
-      const finalRealDistanceKm = chooseReliableDistanceKm(routeFromRealtime, persistedDistanceKm, tracedDistanceKm);
+      const gpsMeasuredDistanceKm = chooseReliableDistanceKm(routeFromRealtime, persistedDistanceKm, tracedDistanceKm);
+      const googleReferenceDistanceKm = Math.max(
+          0,
+          Number(routeFromRealtime?.officialGoogleDistanceKm) || 0,
+          Number(routeFromRealtime?.googleMatchedDistanceKm) || 0,
+          Number(routeFromRealtime?.originalPlan?.totalDistance) || 0,
+          Number(selectedRoute?.originalPlan?.totalDistance) || 0,
+          Number(routeFromRealtime?.technicalData?.totalDistance) || 0,
+          Number(selectedRoute?.technicalData?.totalDistance) || 0
+      );
+
+      // Para liquidación usamos la distancia Google cuando coincide razonablemente
+      // con el GPS real (margen <= 5%). Así 31.6 km vs 32.0 km se homologa a
+      // la referencia vial de Google sin ocultar desvíos reales importantes.
+      const relativeDifference = googleReferenceDistanceKm > 0 && gpsMeasuredDistanceKm > 0
+          ? Math.abs(googleReferenceDistanceKm - gpsMeasuredDistanceKm) / googleReferenceDistanceKm
+          : Infinity;
+      const finalRealDistanceKm =
+          googleReferenceDistanceKm > 0 && (gpsMeasuredDistanceKm <= 0 || relativeDifference <= 0.05)
+              ? roundMoney(googleReferenceDistanceKm)
+              : gpsMeasuredDistanceKm;
+      const distanceSource =
+          finalRealDistanceKm === roundMoney(googleReferenceDistanceKm)
+              ? 'google-driving-reference'
+              : 'gps-measured';
 
       const routeForReceipt = {
           ...routeFromRealtime,
@@ -3733,6 +3774,9 @@ function App() {
           endTime: actualEndTime,
           vehicle: routeFromRealtime?.vehicle || currentDriver?.vehicle || `${currentDriver?.vehicleModel || 'Unidad'} (${currentDriver?.vehiclePlate || 'sin placas'})`,
           vehiclePlate: routeFromRealtime?.vehiclePlate || currentDriver?.vehiclePlate || '',
+          gpsMeasuredDistanceKm,
+          officialGoogleDistanceKm: finalRealDistanceKm,
+          distanceSource,
           realDistanceDriven: finalRealDistanceKm,
           finalDistanceKm: finalRealDistanceKm
       };
@@ -3765,6 +3809,9 @@ function App() {
           pricing: finalPricing,
           pricingStatus: 'Final calculada por conductor',
           finalFare: finalPricing.total,
+          gpsMeasuredDistanceKm,
+          officialGoogleDistanceKm: finalRealDistanceKm,
+          distanceSource,
           realDistanceDriven: finalRealDistanceKm,
           finalDistanceKm: finalRealDistanceKm,
           finalDurationMinutes: receipt.durationMinutes,
