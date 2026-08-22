@@ -1261,10 +1261,8 @@ const formatInstructionDistance = (meters) => {
 const getVoiceDistanceBucket = (meters) => {
     const value = Number(meters);
     if (!Number.isFinite(value)) return 'far';
-    if (value <= 70) return '70';
-    if (value <= 180) return '180';
-    if (value <= 450) return '450';
-    if (value <= 900) return '900';
+    if (value <= 90) return '90';
+    if (value <= 400) return '400';
     return 'far';
 };
 
@@ -1796,10 +1794,16 @@ function App() {
   const [resolvedNextStopLocation, setResolvedNextStopLocation] = useState(null);
 
   // === ESTADOS PARA EL ASISTENTE DE NAVEGACIÓN Y VOZ ===
-  const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '' });
+  const [nextManeuver, setNextManeuver] = useState({ instruction: '', distance: '', voiceKey: '', meters: null });
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const lastSpokenRef = useRef(null);
-  const lastSpokenInstructionRef = useRef({ instruction: '', bucket: '', timestamp: 0 });
+  const lastSpokenInstructionRef = useRef({ routeId: '', stopIndex: -1, instruction: '', bucket: '', timestamp: 0 });
+  const voiceBusyUntilRef = useRef(0);
+  const lastVoicePlayedAtRef = useRef(0);
+  const voiceCueTimesRef = useRef(new Map());
+  const approachVoiceStopsRef = useRef(new Set());
+  const arrivalVoiceStopsRef = useRef(new Set());
+  const lastRerouteVoiceRef = useRef({ routeId: '', stopIndex: -1, timestamp: 0 });
 
   const wakeLockRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -1875,6 +1879,40 @@ function App() {
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [selectedRoute?.chat, isWaiting, showTripChat]);
 
+  const speakDriverCue = useCallback(async (text, options = {}) => {
+      if (!voiceEnabled) return false;
+      const cleanText = translateNavigationInstruction(text);
+      if (!cleanText) return false;
+
+      const now = Date.now();
+      const priority = options.priority || 'normal';
+      const cueKey = String(options.key || '');
+      const minIntervalMs = Math.max(0, Number(options.minIntervalMs) || 0);
+      const previousCueAt = cueKey ? Number(voiceCueTimesRef.current.get(cueKey) || 0) : 0;
+      if (cueKey && previousCueAt && now - previousCueAt < minIntervalMs) return false;
+      if (priority !== 'critical' && now < voiceBusyUntilRef.current) return false;
+
+      const estimatedDurationMs = Math.min(8500, Math.max(2500, cleanText.split(/\s+/).length * 430));
+      if (priority === 'critical') voiceBusyUntilRef.current = 0;
+      voiceBusyUntilRef.current = now + estimatedDurationMs;
+
+      try {
+          const spoken = await speakNavigationText(cleanText);
+          if (spoken) {
+              const spokenAt = Date.now();
+              lastVoicePlayedAtRef.current = spokenAt;
+              if (cueKey) voiceCueTimesRef.current.set(cueKey, spokenAt);
+          } else {
+              voiceBusyUntilRef.current = 0;
+          }
+          return spoken;
+      } catch (voiceError) {
+          voiceBusyUntilRef.current = 0;
+          console.warn('No se pudo reproducir aviso de voz:', voiceError);
+          return false;
+      }
+  }, [voiceEnabled]);
+
   useEffect(() => {
       const routeId = selectedRoute?.id || '';
       const chat = Array.isArray(selectedRoute?.chat) ? selectedRoute.chat : [];
@@ -1888,50 +1926,66 @@ function App() {
 
       if (key && key !== lastIncomingChatRef.current.key && !['Conductor', 'Sistema'].includes(lastMessage?.sender)) {
           if ('vibrate' in navigator) navigator.vibrate([180, 80, 180]);
-          speakNavigationText(lastMessage?.sender === 'Despacho' ? 'Mensaje de torre de control' : 'Mensaje del pasajero').catch(() => {});
+          if (lastMessage?.sender === 'Despacho') {
+              speakDriverCue('Mensaje de Torre de Control', {
+                  priority: 'critical',
+                  key: `tower:${routeId}:${key}`,
+                  minIntervalMs: 60000
+              }).catch(() => {});
+          }
       }
       lastIncomingChatRef.current = { routeId, key };
-  }, [selectedRoute?.id, selectedRoute?.chat]);
+  }, [selectedRoute?.id, selectedRoute?.chat, speakDriverCue]);
 
   // === LÓGICA DEL NARRADOR NATIVO / WEB ===
-  // Estilo Google/Waze: no lee cada cambio de metros.
-  // Una maniobra se anuncia a distancia, cerca del giro y únicamente vuelve
-  // a hablar si cambió de maniobra o pasó un tiempo suficientemente largo.
+  // Política conservadora estilo Google/Waze:
+  // una maniobra a ~400 m y un segundo aviso cerca de ~90 m.
+  // No se leen cambios pequeños de metros ni se acumulan utterances.
   useEffect(() => {
-      if (!voiceEnabled || !nextManeuver.instruction) return;
+      if (!voiceEnabled || !nextManeuver.instruction || selectedRoute?.status !== 'En Ruta') return;
 
       const cleanText = translateNavigationInstruction(nextManeuver.instruction);
       if (!cleanText) return;
 
       const voiceKey = String(nextManeuver.voiceKey || '');
       const bucket = voiceKey.split('-').pop() || 'far';
-      const allowedBuckets = new Set(['450', '180', '70']);
-      if (!allowedBuckets.has(bucket)) return;
+      if (!['400', '90'].includes(bucket)) return;
 
       const now = Date.now();
+      const routeId = selectedRoute?.id || '';
       const previous = lastSpokenInstructionRef.current || {};
-      const sameInstruction = previous.instruction === cleanText;
-      const sameBucket = previous.bucket === bucket;
-      if (sameInstruction && sameBucket) return;
+      const instructionSignature = cleanText.toLocaleLowerCase('es').replace(/\s+/g, ' ').trim();
+      const sameStage =
+          previous.routeId === routeId &&
+          previous.stopIndex === nextStopIdx &&
+          previous.instruction === instructionSignature &&
+          previous.bucket === bucket;
+      if (sameStage) return;
 
-      // Evita una voz continua por recálculos de Google.
-      // El aviso cercano (70 m) puede romper el cooldown; los demás esperan.
-      const cooldownMs = bucket === '70' ? 12000 : 30000;
-      if (sameInstruction && now - Number(previous.timestamp || 0) < cooldownMs) return;
+      const isNear = bucket === '90';
+      const globalGapMs = isNear ? 9000 : 25000;
+      if (lastVoicePlayedAtRef.current && now - lastVoicePlayedAtRef.current < globalGapMs) return;
 
-      const spokenDistance =
-          bucket === '450' ? 'En aproximadamente 400 metros. ' :
-          bucket === '180' ? 'Más adelante. ' :
-          '';
+      const spokenDistance = bucket === '400' ? 'En aproximadamente 400 metros. ' : '';
+      const cueKey = `nav:${routeId}:${nextStopIdx}:${instructionSignature}:${bucket}`;
 
-      speakNavigationText(`${spokenDistance}${cleanText}`)
-          .then(spoken => {
-              if (spoken) {
-                  lastSpokenRef.current = { key: `${cleanText}-${bucket}`, timestamp: now };
-                  lastSpokenInstructionRef.current = { instruction: cleanText, bucket, timestamp: now };
-              }
-          });
-  }, [nextManeuver, voiceEnabled]);
+      speakDriverCue(`${spokenDistance}${cleanText}`, {
+          priority: 'normal',
+          key: cueKey,
+          minIntervalMs: 120000
+      }).then(spoken => {
+          if (!spoken) return;
+          const spokenAt = Date.now();
+          lastSpokenRef.current = { key: cueKey, timestamp: spokenAt };
+          lastSpokenInstructionRef.current = {
+              routeId,
+              stopIndex: nextStopIdx,
+              instruction: instructionSignature,
+              bucket,
+              timestamp: spokenAt
+          };
+      });
+  }, [nextManeuver, nextStopIdx, selectedRoute?.id, selectedRoute?.status, voiceEnabled, speakDriverCue]);
 
   useEffect(() => {
     const savedActiveId = localStorage.getItem('active_trip_id');
@@ -1978,7 +2032,6 @@ function App() {
       if (newlyAssigned.length > 0) {
           playAlertSound();
           if ('vibrate' in navigator) navigator.vibrate([400, 120, 400, 120, 700]);
-          speakNavigationText('Nuevo viaje asignado').catch(() => {});
           setMainTab('Pendientes');
       }
       knownAssignedRouteIdsRef.current = currentIds;
@@ -2580,6 +2633,24 @@ function App() {
                   }
               }).catch(e => console.error('Error enviando alerta de proximidad:', e));
           }
+
+          const approachKey = `${selectedRoute.id}:${nextStopIdx}`;
+          if ((nextDistMeters <= 250 || nextDurMins <= 1) && !approachVoiceStopsRef.current.has(approachKey)) {
+              const target = allTargets[nextStopIdx] || {};
+              const targetName = String(target.contact || target.passengerName || '').trim();
+              const isFinalTarget = nextStopIdx >= allTargets.length - 1;
+              const voiceText = isFinalTarget
+                  ? 'Próximo destino final.'
+                  : (targetName ? `Próxima llegada a ${targetName}.` : 'Próxima llegada al pasajero.');
+
+              speakDriverCue(voiceText, {
+                  priority: 'normal',
+                  key: `approach:${approachKey}`,
+                  minIntervalMs: 120000
+              }).then(spoken => {
+                  if (spoken) approachVoiceStopsRef.current.add(approachKey);
+              });
+          }
       };
 
       // La interfaz recibe datos inmediatamente sin esperar a Google.
@@ -2598,6 +2669,19 @@ function App() {
       const stopChanged = lastDirectionsStopRef.current !== nextStopIdx;
       const routeExpired = now - lastDirectionsRequestRef.current >= 30000;
       const driverLeftRouteArea = movedSinceLastRoute >= 90;
+      const knownRouteMatch = getClosestPathMatch(loc, navigationGeometryRef.current);
+      const significantRouteDeviation =
+          !stopChanged &&
+          navigationGeometryRef.current.length > 1 &&
+          Number.isFinite(knownRouteMatch.distanceMeters) &&
+          knownRouteMatch.distanceMeters >= 140;
+      const canAnnounceReroute =
+          significantRouteDeviation &&
+          (
+              lastRerouteVoiceRef.current.routeId !== selectedRoute.id ||
+              lastRerouteVoiceRef.current.stopIndex !== nextStopIdx ||
+              now - Number(lastRerouteVoiceRef.current.timestamp || 0) >= 90000
+          );
 
       if (!stopChanged && !routeExpired && !driverLeftRouteArea) return;
 
@@ -2754,6 +2838,19 @@ function App() {
           navigationStepsRef.current = steps;
           navigationGeometryRef.current = routeGeometry;
 
+          if (canAnnounceReroute && routeGeometry.length > 1) {
+              lastRerouteVoiceRef.current = {
+                  routeId: selectedRoute.id,
+                  stopIndex: nextStopIdx,
+                  timestamp: Date.now()
+              };
+              speakDriverCue('Ruta recalculada.', {
+                  priority: 'normal',
+                  key: `reroute:${selectedRoute.id}:${nextStopIdx}`,
+                  minIntervalMs: 90000
+              }).catch(() => {});
+          }
+
           applyMetricsAndProximity({
               nextDistMeters,
               remainingDistMeters: remainingMeters || fallbackMetrics.remainingDistMeters,
@@ -2776,7 +2873,8 @@ function App() {
                   const next = {
                       instruction: nextStep.instruction,
                       distance: nextStep.distanceText || formatInstructionDistance(nextStep.meters),
-                      voiceKey: nextStep.voiceKey
+                      voiceKey: nextStep.voiceKey,
+                      meters: nextStep.meters
                   };
 
                   return (
@@ -2795,7 +2893,8 @@ function App() {
       selectedRoute?.technicalData?.geometry,
       allTargets,
       alertedStops,
-      isLoaded
+      isLoaded,
+      speakDriverCue
   ]);
 
   // Actualiza el texto de la maniobra usando la ruta ya descargada.
@@ -2819,7 +2918,8 @@ function App() {
           const next = {
               instruction: nextStep.instruction,
               distance: nextStep.distanceText || formatInstructionDistance(nextStep.meters),
-              voiceKey: nextStep.voiceKey
+              voiceKey: nextStep.voiceKey,
+              meters: nextStep.meters
           };
 
           return (
@@ -2852,7 +2952,15 @@ function App() {
       setIsApproaching(false);
       setIsWaiting(false);
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
-      setNextManeuver({ instruction: '', distance: '' });
+      setNextManeuver({ instruction: '', distance: '', voiceKey: '', meters: null });
+      lastSpokenRef.current = null;
+      lastSpokenInstructionRef.current = { routeId: '', stopIndex: -1, instruction: '', bucket: '', timestamp: 0 };
+      voiceBusyUntilRef.current = 0;
+      lastVoicePlayedAtRef.current = 0;
+      voiceCueTimesRef.current.clear();
+      approachVoiceStopsRef.current.clear();
+      arrivalVoiceStopsRef.current.clear();
+      lastRerouteVoiceRef.current = { routeId: '', stopIndex: -1, timestamp: 0 };
       setIsPanelExpanded(true);
       setIsTracking(true);
       odometerLocRef.current = null;
@@ -2878,9 +2986,8 @@ function App() {
       liveRoutePublishDirtyRef.current = false;
       liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'driver-fallback' };
 
-      if ('speechSynthesis' in window) {
-          window.speechSynthesis.cancel();
-      }
+      if (Capacitor.isNativePlatform()) TextToSpeech.stop().catch(() => {});
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   };
 
   const toggleOnlineStatus = async () => {
@@ -2920,7 +3027,24 @@ function App() {
   };
 
   const proceedToLlegada = async () => {
-      setIsWaiting(true); setEvidence(null); setIsApproaching(false); 
+      setIsWaiting(true); setEvidence(null); setIsApproaching(false);
+
+      const target = allTargets[nextStopIdx] || allTargets[allTargets.length - 1] || {};
+      const arrivalKey = `${selectedRoute.id}:${nextStopIdx}`;
+      if (!arrivalVoiceStopsRef.current.has(arrivalKey)) {
+          arrivalVoiceStopsRef.current.add(arrivalKey);
+          const passengerName = String(target.contact || target.passengerName || '').trim();
+          const isFinalTarget = nextStopIdx >= allTargets.length - 1;
+          const arrivalText = isFinalTarget
+              ? 'Destino final alcanzado.'
+              : (passengerName ? `Llegada a ${passengerName}.` : 'Llegada al pasajero.');
+          speakDriverCue(arrivalText, {
+              priority: 'critical',
+              key: `arrival:${arrivalKey}`,
+              minIntervalMs: 120000
+          }).catch(() => {});
+      }
+
       try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} 
   };
 
@@ -2964,12 +3088,13 @@ function App() {
       const passengerName = String(
           target?.passengerName ||
           target?.contact ||
-          route?.client ||
-          'pasajero'
+          ''
       ).trim();
+      const driverName = String(currentDriver?.name || route?.driver || route?.driverName || 'tu chofer').trim();
+      const greeting = passengerName ? `Hola ${passengerName},` : 'Hola,';
 
       const message = encodeURIComponent(
-          `Hola ${passengerName}, soy tu conductor de TripLogix. Estoy en ruta y te contacto sobre tu servicio.`
+          `${greeting} hoy soy tu chofer. Soy ${driverName} y me encuentro afuera de tu domicilio.`
       );
 
       const url = `https://wa.me/${phoneNumber}?text=${message}`;
@@ -3671,7 +3796,15 @@ function App() {
       setIsApproaching(false);
       setIsWaiting(false);
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
-      setNextManeuver({ instruction: '', distance: '', voiceKey: '' });
+      setNextManeuver({ instruction: '', distance: '', voiceKey: '', meters: null });
+      lastSpokenRef.current = null;
+      lastSpokenInstructionRef.current = { routeId, stopIndex: 0, instruction: '', bucket: '', timestamp: 0 };
+      voiceBusyUntilRef.current = 0;
+      lastVoicePlayedAtRef.current = 0;
+      voiceCueTimesRef.current.clear();
+      approachVoiceStopsRef.current.clear();
+      arrivalVoiceStopsRef.current.clear();
+      lastRerouteVoiceRef.current = { routeId, stopIndex: 0, timestamp: 0 };
 
       directionsBusyRef.current = false;
       directionsRequestIdRef.current += 1;
@@ -3691,20 +3824,13 @@ function App() {
       liveNavigationRef.current = { distanceKm: 0, durationMinutes: 0, nextStopDistanceKm: 0, nextStopDurationMinutes: 0, stopIndex: 0, source: 'driver-fallback' };
       setRouteUpdateTick(t => t + 1);
 
-      // Saludo inicial de voz
-      if (voiceEnabled && 'speechSynthesis' in window) {
-          try {
-              window.speechSynthesis.cancel();
-              const utterance = new SpeechSynthesisUtterance(
-                  `Viaje iniciado. Respeta el horario planificado. Primer punto programado: ${formatPickupTime(getStopPlannedTimeValue(routeToStart, 0))}.`
-              );
-              utterance.lang = 'es-MX';
-              utterance.rate = 0.94;
-              window.speechSynthesis.speak(utterance);
-          } catch (voiceError) {
-              console.warn('No se pudo iniciar la voz:', voiceError);
-          }
-      }
+      // Inicio corto: evita una locución larga al arrancar y libera la voz
+      // para la primera maniobra realmente útil.
+      speakDriverCue('Navegación iniciada.', {
+          priority: 'critical',
+          key: `start:${routeId}`,
+          minIntervalMs: 120000
+      }).catch(() => {});
     } catch (e) {
         console.error(e);
         alert("Error al iniciar");
