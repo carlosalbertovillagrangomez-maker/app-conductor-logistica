@@ -47,6 +47,17 @@ const NAV_POLYLINE_OPTIONS = {
     strokeWeight: 6
 };
 
+const TRIP_CANCELLATION_REASONS = Object.freeze([
+    'Accidente',
+    'Falla mecánica',
+    'Emergencia médica',
+    'Condición insegura / riesgo',
+    'Cierre o bloqueo vial',
+    'Pasajero o cliente solicitó cancelar',
+    'Imposibilidad de continuar la ruta',
+    'Otro'
+]);
+
 
 const DRIVER_MARKER_SVG = `
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
@@ -1701,6 +1712,10 @@ function App() {
   const [showJustification, setShowJustification] = useState(false);
   const [justificationText, setJustificationText] = useState('');
   const [distanceOff, setDistanceOff] = useState(0);
+  const [showTripCancellation, setShowTripCancellation] = useState(false);
+  const [tripCancellationReason, setTripCancellationReason] = useState('');
+  const [tripCancellationDetail, setTripCancellationDetail] = useState('');
+  const [isCancellingTrip, setIsCancellingTrip] = useState(false);
 
   const { isLoaded } = useJsApiLoader({ id: 'google-map-script', googleMapsApiKey: GOOGLE_MAPS_API_KEY, libraries, language: 'es' });
   const mapRef = useRef(null);
@@ -3071,6 +3086,112 @@ function App() {
       } catch(e) { alert("Error al guardar la justificación."); }
   };
 
+  const openTripCancellation = () => {
+      if (!selectedRoute?.id || selectedRoute?.status !== 'En Ruta') return;
+      setShowJustification(false);
+      setTripCancellationReason('');
+      setTripCancellationDetail('');
+      setShowTripCancellation(true);
+  };
+
+  const submitTripCancellation = async () => {
+      if (!selectedRoute?.id || selectedRoute?.status !== 'En Ruta' || isCancellingTrip) return;
+
+      const reason = String(tripCancellationReason || '').trim();
+      const detail = String(tripCancellationDetail || '').trim();
+      if (!reason) return alert('Selecciona el motivo de cancelación.');
+      if (reason === 'Otro' && detail.length < 5) return alert('Describe brevemente el motivo de la cancelación.');
+
+      const reasonText = detail ? `${reason}: ${detail}` : reason;
+      const confirmed = window.confirm(`Se cancelará el viaje completo. Motivo: ${reasonText}. ¿Confirmas?`);
+      if (!confirmed) return;
+
+      const nowIso = new Date().toISOString();
+      const nowTime = getMexicoTime();
+      const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1] || {};
+      const location = normalizePoint(userLocation || latestLocRef.current || driverLocationForMap);
+      const targetLocation = normalizePoint(currentTarget);
+      const rawDistance = location && targetLocation ? getDistanceMeters(location, targetLocation) : null;
+      const distanceToNextStopMeters = Number.isFinite(rawDistance) ? Math.round(rawDistance) : null;
+      const driverId = String(currentDriver?.id || selectedRoute?.driverId || '');
+      const driverName = String(currentDriver?.name || selectedRoute?.driver || selectedRoute?.driverName || 'Conductor');
+      const cancellationData = {
+          reason,
+          detail,
+          reasonText,
+          cancelledBy: 'Conductor',
+          driverId,
+          driverName,
+          location: location || null,
+          nextStopIndex: Number(nextStopIdx) || 0,
+          nextStopLabel: currentTarget?.label || currentTarget?.address || 'Destino',
+          distanceToNextStopMeters,
+          timestamp: nowIso,
+          time: nowTime
+      };
+      const auditEntry = {
+          evento: 'Viaje cancelado por conductor',
+          motivo: reasonText,
+          punto: cancellationData.nextStopLabel,
+          stopIndex: cancellationData.nextStopIndex,
+          ubicacion: cancellationData.location,
+          distanciaMts: distanceToNextStopMeters,
+          timestamp: nowIso,
+          time: nowTime
+      };
+
+      setIsCancellingTrip(true);
+      try {
+          const routeRef = doc(db, 'rutas', selectedRoute.id);
+
+          // La cancelación principal no depende de la geocerca ni de la bitácora.
+          // Primero cerramos el viaje con el motivo en campos propios para que una
+          // ruta antigua con chat/bitácora mal formados no bloquee la operación.
+          await updateDoc(routeRef, {
+              status: 'Cancelado',
+              cancellation: cancellationData,
+              cancellationReason: reason,
+              cancellationDetail: detail,
+              cancellationBy: 'Conductor',
+              cancelledByDriverId: driverId,
+              cancelledByDriverName: driverName,
+              cancelledAt: nowIso,
+              cancelledTime: nowTime,
+              cancelledDate: getMexicoDate(),
+              'proximityAlert.active': false,
+              lastUpdate: nowIso
+          });
+
+          // Auditoría y mensaje son complementarios: si una ruta heredada tiene
+          // un formato incompatible, la cancelación ya quedó registrada arriba.
+          try {
+              await updateDoc(routeRef, {
+                  bitacora: arrayUnion(auditEntry),
+                  chat: arrayUnion({
+                      sender: 'Sistema',
+                      text: `🚫 Viaje cancelado por el conductor. Motivo: ${reasonText}`,
+                      time: nowTime,
+                      timestamp: nowIso
+                  })
+              });
+          } catch (auditError) {
+              console.warn('Viaje cancelado, pero no se pudo anexar bitácora/chat:', auditError);
+          }
+
+          setShowTripCancellation(false);
+          setTripCancellationReason('');
+          setTripCancellationDetail('');
+          cerrarRuta();
+          setMainTab('Pendientes');
+          alert('Viaje cancelado correctamente. El motivo quedó registrado.');
+      } catch (cancelError) {
+          console.error('No se pudo cancelar el viaje:', cancelError);
+          alert('No se pudo cancelar el viaje. Revisa la conexión e inténtalo de nuevo.');
+      } finally {
+          setIsCancellingTrip(false);
+      }
+  };
+
   const enviarMensaje = async () => {
       if(!chatText.trim()) return;
       const msg = { sender: 'Conductor', text: chatText.trim(), time: getMexicoTime(), timestamp: new Date().toISOString() };
@@ -4255,6 +4376,57 @@ function App() {
                   </div>
               )}
               
+              {/* --- CANCELACIÓN DEL VIAJE: DISPONIBLE EN CUALQUIER PUNTO DE LA RUTA --- */}
+              {showTripCancellation && (
+                  <div className="fixed inset-0 z-[10030] flex items-center justify-center p-5 bg-slate-950/85 backdrop-blur-md animate-in fade-in zoom-in duration-200">
+                      <div className="bg-white rounded-[2rem] p-6 max-w-sm w-full shadow-2xl border-4 border-red-600 text-slate-800">
+                          <div className="flex items-center gap-3 mb-3 text-red-600">
+                              <ShieldAlert className="w-8 h-8" />
+                              <div>
+                                  <p className="text-[10px] font-black uppercase tracking-widest text-red-400">Acción operativa</p>
+                                  <h3 className="text-xl font-black uppercase leading-tight">Cancelar viaje</h3>
+                              </div>
+                          </div>
+                          <p className="text-xs font-bold text-slate-500 mb-4">
+                              Puedes cancelar el viaje aunque ya estés fuera de la zona de recogida. El motivo y la ubicación actual quedarán registrados para Torre de Control.
+                          </p>
+
+                          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Motivo de cancelación</label>
+                          <select
+                              value={tripCancellationReason}
+                              onChange={(e) => setTripCancellationReason(e.target.value)}
+                              className="w-full mt-1 mb-3 bg-slate-50 border border-slate-200 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 outline-none focus:border-red-500"
+                          >
+                              <option value="">Selecciona un motivo...</option>
+                              {TRIP_CANCELLATION_REASONS.map(reason => <option key={reason} value={reason}>{reason}</option>)}
+                          </select>
+
+                          <label className="text-[10px] font-black uppercase tracking-widest text-slate-500">Detalle {tripCancellationReason === 'Otro' ? '(obligatorio)' : '(opcional)'}</label>
+                          <textarea
+                              value={tripCancellationDetail}
+                              onChange={(e) => setTripCancellationDetail(e.target.value)}
+                              placeholder="Ej: choque menor, falla de motor, cierre total de la vía, emergencia del pasajero..."
+                              className="w-full mt-1 bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm outline-none focus:border-red-500 min-h-[90px] text-slate-700"
+                          />
+
+                          <div className="grid grid-cols-2 gap-2 mt-4">
+                              <button
+                                  type="button"
+                                  disabled={isCancellingTrip}
+                                  onClick={() => setShowTripCancellation(false)}
+                                  className="py-3 bg-slate-100 text-slate-600 font-black rounded-xl active:scale-95 transition text-sm disabled:opacity-50"
+                              >Volver</button>
+                              <button
+                                  type="button"
+                                  disabled={isCancellingTrip || !tripCancellationReason}
+                                  onClick={submitTripCancellation}
+                                  className="py-3 bg-red-600 text-white font-black rounded-xl active:scale-95 transition shadow-lg shadow-red-500/30 text-sm disabled:bg-red-300 disabled:shadow-none"
+                              >{isCancellingTrip ? 'Cancelando...' : 'Confirmar cancelación'}</button>
+                          </div>
+                      </div>
+                  </div>
+              )}
+
               {/* --- MODAL GEOCERCA (FUERA DE RANGO) --- */}
               {showJustification && (
                   <div className="fixed inset-0 z-[9999] flex items-center justify-center p-6 bg-slate-900/80 backdrop-blur-md animate-in fade-in zoom-in duration-300">
@@ -4274,9 +4446,16 @@ function App() {
                               onChange={(e) => setJustificationText(e.target.value)}
                           ></textarea>
                           <div className="flex gap-2">
-                              <button onClick={() => setShowJustification(false)} className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl active:scale-95 transition-transform text-sm">Cancelar</button>
-                              <button onClick={submitJustification} className="flex-1 py-3 bg-red-600 text-white font-black rounded-xl active:scale-95 transition-transform shadow-lg shadow-red-500/30 text-sm">Registrar</button>
+                              <button onClick={() => setShowJustification(false)} className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl active:scale-95 transition-transform text-sm">Volver</button>
+                              <button onClick={submitJustification} className="flex-1 py-3 bg-red-600 text-white font-black rounded-xl active:scale-95 transition-transform shadow-lg shadow-red-500/30 text-sm">Registrar llegada</button>
                           </div>
+                          <button
+                              type="button"
+                              onClick={openTripCancellation}
+                              className="w-full mt-2 py-3 bg-red-50 text-red-700 border border-red-200 font-black rounded-xl active:scale-95 transition-transform text-xs uppercase tracking-widest"
+                          >
+                              Cancelar viaje completo
+                          </button>
                       </div>
                   </div>
               )}
@@ -4284,9 +4463,12 @@ function App() {
               {/* --- PANTALLA CÁMARA (LLEGUÉ AL PUNTO) --- */}
               {isWaiting && (
                   <div className="absolute inset-0 z-50 bg-slate-50 flex flex-col animate-[fadeIn_0.3s_ease-out]">
-                      <div className="bg-slate-800 text-white p-4 pt-8 pb-4 flex justify-between items-center shadow-md shrink-0">
-                          <div><p className="text-[10px] font-bold text-orange-300 uppercase tracking-widest">En el punto de encuentro</p><h2 className="text-lg font-black">{currentTarget?.contact || 'Pasajero'}</h2></div>
-                          <button onClick={() => setIsWaiting(false)} className="p-2 bg-slate-700 rounded-full hover:bg-slate-600 transition"><X className="w-5 h-5"/></button>
+                      <div className="bg-slate-800 text-white p-4 pt-8 pb-4 flex justify-between items-center shadow-md shrink-0 gap-2">
+                          <div className="min-w-0"><p className="text-[10px] font-bold text-orange-300 uppercase tracking-widest">En el punto de encuentro</p><h2 className="text-lg font-black truncate">{currentTarget?.contact || 'Pasajero'}</h2></div>
+                          <div className="flex items-center gap-2 shrink-0">
+                              <button type="button" onClick={openTripCancellation} className="px-3 py-2 bg-red-600 rounded-xl text-[9px] font-black uppercase tracking-wider active:scale-95 transition">Cancelar viaje</button>
+                              <button onClick={() => setIsWaiting(false)} className="p-2 bg-slate-700 rounded-full hover:bg-slate-600 transition"><X className="w-5 h-5"/></button>
+                          </div>
                       </div>
 
                       <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-100 flex flex-col">
@@ -4606,6 +4788,13 @@ function App() {
                             ) : (
                                 <button onClick={marcarLlegada} className="w-full text-white font-black p-4 rounded-2xl shadow-xl shadow-red-500/40 bg-red-600 hover:bg-red-700 flex items-center justify-center gap-2 active:scale-95 transition-all tracking-widest animate-pulse"><CheckCircle className="w-5 h-5"/> LLEGUÉ AL DESTINO (VER OPCIONES)</button>
                             )}
+                            <button
+                                type="button"
+                                onClick={openTripCancellation}
+                                className="w-full bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 font-black p-3 rounded-2xl flex items-center justify-center gap-2 active:scale-95 transition-all text-xs uppercase tracking-widest"
+                            >
+                                <X className="w-4 h-4"/> Cancelar viaje
+                            </button>
                         </div>
                       </>
                   ) : (
