@@ -434,7 +434,10 @@ const isDispatcherScheduledTrip = (route) => {
 };
 
 const shouldHideTripPricingDuringActive = (route) => {
-    return isDispatcherScheduledTrip(route) && route?.status !== 'Finalizado';
+    // En rutas corporativas/carpooling el conductor nunca ve valores monetarios,
+    // incluso cuando el viaje ya fue finalizado. Los servicios ocasionales
+    // conservan su visibilidad mediante isDispatcherScheduledTrip().
+    return isDispatcherScheduledTrip(route);
 };
 
 const shouldHideDriverReceiptPricing = (route) => {
@@ -1694,6 +1697,10 @@ function App() {
   const [misRutas, setMisRutas] = useState([]);
   const assignmentTrackerInitializedRef = useRef(false);
   const knownAssignedRouteIdsRef = useRef(new Set());
+  const [driverNotice, setDriverNotice] = useState(null);
+  const towerMessageKeysRef = useRef(new Map());
+  const towerMessageTrackerInitializedRef = useRef(false);
+  const towerMessageTrackerDriverRef = useRef('');
 
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Próximo');
@@ -1927,6 +1934,122 @@ function App() {
           return false;
       }
   }, [voiceEnabled]);
+
+  // Avisos globales de Torre de Control.
+  // Se monitorean TODAS las rutas del conductor, no solamente la ruta abierta.
+  // De esta forma un mensaje sigue siendo visible y audible aunque el conductor
+  // se encuentre en otra pantalla. Guardamos la última clave en localStorage
+  // para recuperar mensajes nuevos al volver a abrir la app.
+  useEffect(() => {
+      const driverId = String(currentDriver?.id || '').trim();
+      if (!driverId || !Array.isArray(misRutas) || misRutas.length === 0) return;
+
+      if (towerMessageTrackerDriverRef.current !== driverId) {
+          towerMessageTrackerDriverRef.current = driverId;
+          towerMessageTrackerInitializedRef.current = false;
+          towerMessageKeysRef.current = new Map();
+      }
+
+      const storageKey = 'triplogix_tower_message_keys_' + driverId;
+
+      const getLatestTowerMessage = (route) => {
+          const chat = Array.isArray(route?.chat) ? route.chat : [];
+          for (let index = chat.length - 1; index >= 0; index -= 1) {
+              if (chat[index]?.sender === 'Despacho') return chat[index];
+          }
+          return null;
+      };
+
+      const getTowerMessageKey = (message) => message
+          ? [message.timestamp || message.time || '', message.sender || '', message.text || ''].join('|')
+          : '';
+
+      if (!towerMessageTrackerInitializedRef.current) {
+          let storedKeys = null;
+          try {
+              const raw = localStorage.getItem(storageKey);
+              const parsed = raw ? JSON.parse(raw) : null;
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) storedKeys = parsed;
+          } catch (_) {}
+
+          if (storedKeys && Object.keys(storedKeys).length > 0) {
+              towerMessageKeysRef.current = new Map(Object.entries(storedKeys));
+              towerMessageTrackerInitializedRef.current = true;
+          } else {
+              const baseline = new Map();
+              misRutas.forEach(route => {
+                  const routeId = String(route?.id || '').trim();
+                  const message = getLatestTowerMessage(route);
+                  const key = getTowerMessageKey(message);
+                  if (routeId && key) baseline.set(routeId, key);
+              });
+              towerMessageKeysRef.current = baseline;
+              towerMessageTrackerInitializedRef.current = true;
+              try {
+                  localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(baseline)));
+              } catch (_) {}
+              return;
+          }
+      }
+
+      const nextKeys = new Map();
+      const newMessages = [];
+
+      misRutas.forEach(route => {
+          const routeId = String(route?.id || '').trim();
+          if (!routeId) return;
+
+          const message = getLatestTowerMessage(route);
+          const key = getTowerMessageKey(message);
+          if (!key) return;
+
+          nextKeys.set(routeId, key);
+          const previousKey = String(towerMessageKeysRef.current.get(routeId) || '');
+          if (key !== previousKey) {
+              newMessages.push({
+                  route,
+                  routeId,
+                  message,
+                  key,
+                  timestamp: getTimestampMs(message?.timestamp) || 0
+              });
+          }
+      });
+
+      towerMessageKeysRef.current = nextKeys;
+      try {
+          localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(nextKeys)));
+      } catch (_) {}
+
+      if (newMessages.length === 0) return;
+
+      newMessages.sort((a, b) => a.timestamp - b.timestamp);
+      const latest = newMessages[newMessages.length - 1];
+      const text = String(latest.message?.text || 'Nuevo mensaje de Torre de Control.').trim();
+
+      setDriverNotice({
+          source: 'tower',
+          title: newMessages.length > 1
+              ? 'Torre de Control · ' + newMessages.length + ' mensajes nuevos'
+              : 'Torre de Control',
+          text,
+          routeId: latest.routeId,
+          receivedAt: Date.now()
+      });
+
+      playAlertSound();
+      if ('vibrate' in navigator) navigator.vibrate([250, 100, 250, 100, 450]);
+
+      // Si la ruta ya está abierta, el watcher existente de selectedRoute mantiene
+      // exactamente la voz actual. Para cualquier otra ruta, la anunciamos aquí.
+      if (selectedRoute?.id !== latest.routeId) {
+          speakDriverCue('Mensaje de Torre de Control', {
+              priority: 'critical',
+              key: 'tower-global:' + latest.routeId + ':' + latest.key,
+              minIntervalMs: 60000
+          }).catch(() => {});
+      }
+  }, [misRutas, currentDriver?.id, selectedRoute?.id, speakDriverCue]);
 
   useEffect(() => {
       const routeId = selectedRoute?.id || '';
@@ -3712,6 +3835,30 @@ function App() {
                       if ('vibrate' in navigator) {
                           navigator.vibrate([500, 180, 500]);
                       }
+
+                      const pushData = notification?.data || {};
+                      const pushTitle = String(
+                          notification?.title ||
+                          notification?.notification?.title ||
+                          pushData?.title ||
+                          'TripLogix'
+                      ).trim();
+                      const pushText = String(
+                          notification?.body ||
+                          notification?.notification?.body ||
+                          pushData?.body ||
+                          pushData?.message ||
+                          'Tienes una nueva notificación.'
+                      ).trim();
+                      const pushRouteId = String(pushData?.routeId || pushData?.tripId || '').trim();
+
+                      setDriverNotice({
+                          source: 'push',
+                          title: pushTitle || 'TripLogix',
+                          text: pushText || 'Tienes una nueva notificación.',
+                          routeId: pushRouteId,
+                          receivedAt: Date.now()
+                      });
                       setMainTab('Pendientes');
                   },
                   onAction: async (action) => {
@@ -5066,6 +5213,48 @@ function App() {
 
     return (
       <div className={`min-h-screen transition-colors duration-300 flex flex-col font-sans relative ${theme.bg} ${theme.text}`}>
+        {driverNotice && (
+            <div className="fixed left-3 right-3 top-3 z-[10060] mx-auto max-w-md rounded-2xl border border-orange-300 bg-slate-950/95 text-white shadow-2xl backdrop-blur-md overflow-hidden" style={{ marginTop: 'env(safe-area-inset-top)' }}>
+                <div className="flex items-start gap-3 p-4">
+                    <div className="mt-0.5 w-10 h-10 rounded-xl bg-orange-500 flex items-center justify-center shrink-0 shadow-lg shadow-orange-500/30">
+                        <BellRing className="w-5 h-5 text-white" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                        <p className="text-[10px] font-black uppercase tracking-[0.18em] text-orange-300">{driverNotice.title || 'TripLogix'}</p>
+                        <p className="text-sm font-bold leading-snug mt-1 break-words">{driverNotice.text || 'Tienes una nueva notificación.'}</p>
+                        <div className="flex items-center gap-2 mt-3">
+                            {driverNotice.routeId && (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        const noticeRoute = misRutas.find(route => route.id === driverNotice.routeId);
+                                        if (noticeRoute) {
+                                            setSelectedRoute(noticeRoute);
+                                            setMainTab('Pendientes');
+                                            setShowTripChat(true);
+                                        }
+                                        setDriverNotice(null);
+                                    }}
+                                    className="px-3 py-2 rounded-lg bg-orange-500 text-white text-[10px] font-black uppercase tracking-wider active:scale-95"
+                                >
+                                    Abrir mensaje
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                onClick={() => setDriverNotice(null)}
+                                className="px-3 py-2 rounded-lg bg-white/10 text-white text-[10px] font-black uppercase tracking-wider active:scale-95"
+                            >
+                                Cerrar
+                            </button>
+                        </div>
+                    </div>
+                    <button type="button" onClick={() => setDriverNotice(null)} className="p-1 rounded-lg hover:bg-white/10" aria-label="Cerrar notificación">
+                        <X className="w-4 h-4" />
+                    </button>
+                </div>
+            </div>
+        )}
         {incomingOffer && (
             <div className="fixed inset-0 z-[9999] flex items-center justify-center p-3 sm:p-6 bg-slate-900/90 backdrop-blur-md animate-in fade-in zoom-in duration-300" style={{ paddingTop: "max(12px, env(safe-area-inset-top))", paddingBottom: "max(12px, env(safe-area-inset-bottom))" }}>
                 <div className="bg-white rounded-[2rem] w-full max-w-sm max-h-[calc(100dvh-24px)] overflow-hidden shadow-2xl border-4 border-yellow-400 flex flex-col">
