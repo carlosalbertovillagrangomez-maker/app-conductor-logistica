@@ -1547,6 +1547,33 @@ const getPickupSortableDateTime = (route) => {
     return isNaN(parsed.getTime()) ? new Date('2099-12-31T00:00') : parsed;
 };
 
+const MAX_NAVIGATION_MINUTES = 720;
+
+const sanitizeNavigationMinutes = (value) => {
+    const minutes = Number(value);
+    if (!Number.isFinite(minutes) || minutes < 0 || minutes > MAX_NAVIGATION_MINUTES) return 0;
+    return Math.round(minutes);
+};
+
+const getDriverRouteFingerprint = (route) => {
+    const passengerKey = (Array.isArray(route?.passengerSchedule) ? route.passengerSchedule : [])
+        .map(item => String(item?.passengerName || item?.name || '').trim().toLocaleLowerCase('es'))
+        .filter(Boolean)
+        .sort()
+        .join('|');
+
+    return [
+        route?.client,
+        getPickupDateForFilter(route),
+        normalizeTimeString(getPickupTimeValue(route)),
+        route?.start,
+        route?.end,
+        passengerKey
+    ]
+        .map(value => String(value || '').trim().toLocaleLowerCase('es'))
+        .join('||');
+};
+
 const getPlannedStartDateTime = (route) => {
     const dateValue = getPickupDateForFilter(route);
     const timeValue = getPickupTimeValue(route);
@@ -1560,7 +1587,7 @@ const getPlannedStartDateTime = (route) => {
 const getEstimatedArrivalTimeFromMinutes = (minutesToAdd) => {
     const minutes = Number(minutesToAdd);
 
-    if (!Number.isFinite(minutes) || minutes < 0) {
+    if (!Number.isFinite(minutes) || minutes < 0 || minutes > MAX_NAVIGATION_MINUTES) {
         return 'Calculando...';
     }
 
@@ -1609,7 +1636,7 @@ const getHeadingDifference = (from, to) => {
     return Math.abs(((b - a + 540) % 360) - 180);
 };
 
-const safeSetMapCamera = (map, loc, heading = 0, zoom = 17) => {
+const safeSetMapCamera = (map, loc, heading = 0, zoom = 16) => {
     const validLoc = normalizePoint(loc);
     if (!map || !validLoc) return;
 
@@ -1715,6 +1742,9 @@ function App() {
   const [chatText, setChatText] = useState('');
   const [evidence, setEvidence] = useState(null);
   const [incomingOffer, setIncomingOffer] = useState(null);
+  const lastIncomingOfferIdRef = useRef('');
+  const [isSavingStop, setIsSavingStop] = useState(false);
+  const stopSaveBusyRef = useRef(false);
 
   const [showJustification, setShowJustification] = useState(false);
   const [justificationText, setJustificationText] = useState('');
@@ -1844,8 +1874,33 @@ function App() {
                       window.google.maps.event.trigger(map, 'resize');
                   }
 
-                  const loc = normalizePoint(latestLocRef.current);
-                  if (loc) safeSetMapCamera(map, loc, 0, 17);
+                  if (selectedRoute?.status === 'En Ruta') {
+                      const loc =
+                          normalizePoint(latestLocRef.current) ||
+                          normalizePoint(selectedRoute?.currentLocation) ||
+                          normalizePoint(selectedRoute?.startCoords);
+
+                      if (loc) safeSetMapCamera(map, loc, userHeadingRef.current, 16);
+                      return;
+                  }
+
+                  const previewGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
+                  if (previewGeometry.length > 1 && window.google?.maps?.LatLngBounds) {
+                      const bounds = new window.google.maps.LatLngBounds();
+                      previewGeometry.forEach(point => bounds.extend(point));
+                      map.fitBounds(bounds, 50);
+
+                      if (window.google.maps.event?.addListenerOnce) {
+                          window.google.maps.event.addListenerOnce(map, 'idle', () => {
+                              const zoom = Number(map.getZoom?.());
+                              if (Number.isFinite(zoom) && zoom > 15) map.setZoom(15);
+                          });
+                      }
+                      return;
+                  }
+
+                  const start = normalizePoint(selectedRoute?.startCoords);
+                  if (start) safeSetMapCamera(map, start, 0, 14);
               } catch (e) {
                   console.warn('No se pudo refrescar el mapa al cargar:', e);
               }
@@ -1853,7 +1908,7 @@ function App() {
       } catch (e) {
           console.error('Error inicializando mapa:', e);
       }
-  }, []);
+  }, [selectedRoute?.id, selectedRoute?.status, selectedRoute?.technicalData?.geometry]);
 
   const handleMapUnmount = useCallback((map) => {
       if (mapRef.current === map) {
@@ -1878,7 +1933,7 @@ function App() {
                   }
 
                   const loc = normalizePoint(latestLocRef.current);
-                  if (loc) safeSetMapCamera(map, loc, 0, 17);
+                  if (loc) safeSetMapCamera(map, loc, 0, 16);
               } catch (e) {
                   console.warn('No se pudo recuperar el mapa:', e);
               }
@@ -2040,15 +2095,13 @@ function App() {
       playAlertSound();
       if ('vibrate' in navigator) navigator.vibrate([250, 100, 250, 100, 450]);
 
-      // Si la ruta ya está abierta, el watcher existente de selectedRoute mantiene
-      // exactamente la voz actual. Para cualquier otra ruta, la anunciamos aquí.
-      if (selectedRoute?.id !== latest.routeId) {
-          speakDriverCue('Mensaje de Torre de Control', {
-              priority: 'critical',
-              key: 'tower-global:' + latest.routeId + ':' + latest.key,
-              minIntervalMs: 60000
-          }).catch(() => {});
-      }
+      // La voz de Torre se resuelve aquí para TODAS las rutas.
+      // El watcher de la ruta abierta conserva vibración/actualización visual, pero no duplica locución.
+      speakDriverCue('Mensaje de Torre de Control', {
+          priority: 'critical',
+          key: 'tower-global:' + latest.routeId + ':' + latest.key,
+          minIntervalMs: 60000
+      }).catch(() => {});
   }, [misRutas, currentDriver?.id, selectedRoute?.id, speakDriverCue]);
 
   useEffect(() => {
@@ -2064,13 +2117,6 @@ function App() {
 
       if (key && key !== lastIncomingChatRef.current.key && !['Conductor', 'Sistema'].includes(lastMessage?.sender)) {
           if ('vibrate' in navigator) navigator.vibrate([180, 80, 180]);
-          if (lastMessage?.sender === 'Despacho') {
-              speakDriverCue('Mensaje de Torre de Control', {
-                  priority: 'critical',
-                  key: `tower:${routeId}:${key}`,
-                  minIntervalMs: 60000
-              }).catch(() => {});
-          }
       }
       lastIncomingChatRef.current = { routeId, key };
   }, [selectedRoute?.id, selectedRoute?.chat, speakDriverCue]);
@@ -2249,7 +2295,16 @@ function App() {
               try {
                   const bounds = new window.google.maps.LatLngBounds();
                   geometry.forEach(coord => bounds.extend(coord));
-                  mapRef.current.fitBounds(bounds);
+                  mapRef.current.fitBounds(bounds, 50);
+
+                  if (window.google?.maps?.event?.addListenerOnce) {
+                      window.google.maps.event.addListenerOnce(mapRef.current, 'idle', () => {
+                          const zoom = Number(mapRef.current?.getZoom?.());
+                          if (Number.isFinite(zoom) && zoom > 15) {
+                              mapRef.current.setZoom(15);
+                          }
+                      });
+                  }
               } catch (e) {
                   console.error('No se pudo ajustar ruta en mapa:', e);
               }
@@ -2589,22 +2644,71 @@ function App() {
       const now = Date.now();
       if (now - lastCameraMoveRef.current < 1200) return;
 
-      safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 17);
+      safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 16);
       lastCameraMoveRef.current = now;
   }, [driverLocationForMap, selectedRoute?.status, userHeading]);
 
   useEffect(() => {
-      if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') return;
-      const q = query(collection(db, "rutas"), where("ofertaPara", "==", currentDriver.id), where("ofertaEstado", "==", "Pendiente"));
+      if (!currentDriver || !currentDriver.isOnline || selectedRoute?.status === 'En Ruta') {
+          setIncomingOffer(null);
+          lastIncomingOfferIdRef.current = '';
+          return undefined;
+      }
+
+      const q = query(
+          collection(db, "rutas"),
+          where("ofertaPara", "==", currentDriver.id),
+          where("ofertaEstado", "==", "Pendiente")
+      );
+
       const unsubscribe = onSnapshot(q, (snapshot) => {
-          if (!snapshot.empty) {
-              setIncomingOffer({ id: snapshot.docs[0].id, ...snapshot.docs[0].data() });
-              playAlertSound(); // SONIDO AL RECIBIR VIAJE
-              if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]); 
-          } else { setIncomingOffer(null); }
+          const completedFingerprints = new Set(
+              misRutas
+                  .filter(route => ['Finalizado', 'Completado'].includes(route?.status))
+                  .map(getDriverRouteFingerprint)
+          );
+
+          const candidates = snapshot.docs
+              .map(routeDoc => ({ id: routeDoc.id, ...routeDoc.data() }))
+              .filter(route => !['Finalizado', 'Completado', 'Cancelado'].includes(route?.status))
+              .filter(route => !completedFingerprints.has(getDriverRouteFingerprint(route)))
+              .sort((a, b) => getPickupSortableDateTime(a) - getPickupSortableDateTime(b));
+
+          const nextOffer = candidates[0] || null;
+
+          if (!nextOffer) {
+              setIncomingOffer(null);
+              lastIncomingOfferIdRef.current = '';
+              return;
+          }
+
+          const nextOfferMs = getPickupSortableDateTime(nextOffer).getTime();
+          const hasEarlierCommittedTrip = misRutas.some(route => {
+              if (route?.id === nextOffer.id) return false;
+              if (['Finalizado', 'Completado', 'Cancelado'].includes(route?.status)) return false;
+              if (!['Aceptada', 'En Ruta'].includes(route?.status)) return false;
+              if (route?.ofertaEstado === 'Pendiente') return false;
+              return getPickupSortableDateTime(route).getTime() <= nextOfferMs;
+          });
+
+          // Si ya existe un viaje aceptado más temprano, la oferta futura queda en cola.
+          if (hasEarlierCommittedTrip) {
+              setIncomingOffer(null);
+              lastIncomingOfferIdRef.current = '';
+              return;
+          }
+
+          setIncomingOffer(nextOffer);
+
+          if (lastIncomingOfferIdRef.current !== nextOffer.id) {
+              lastIncomingOfferIdRef.current = nextOffer.id;
+              playAlertSound();
+              if ("vibrate" in navigator) navigator.vibrate([500, 200, 500, 200, 1000]);
+          }
       });
+
       return () => unsubscribe();
-  }, [currentDriver, selectedRoute]);
+  }, [currentDriver?.id, currentDriver?.isOnline, selectedRoute?.status, misRutas]);
 
   const aceptarViaje = async () => {
       if (!incomingOffer || !currentDriver) return;
@@ -2682,8 +2786,8 @@ function App() {
       const applyMetricsAndProximity = (metrics, geometry = null) => {
           const nextDistMeters = Math.max(0, Number(metrics.nextDistMeters) || 0);
           const remainingDistMeters = Math.max(0, Number(metrics.remainingDistMeters) || 0);
-          const nextDurMins = Math.max(0, Number(metrics.nextDurMins) || 0);
-          const totalDurMins = Math.max(0, Number(metrics.totalDurMins) || 0);
+          const nextDurMins = sanitizeNavigationMinutes(metrics.nextDurMins);
+          const totalDurMins = sanitizeNavigationMinutes(metrics.totalDurMins);
           const source = geometry
               ? 'driver-google-directions'
               : 'driver-fallback';
@@ -3072,7 +3176,7 @@ function App() {
       setIsTracking(true);
       const cameraLocation = normalizePoint(latestLocRef.current || driverLocationForMap || snappedLocation);
       if (mapRef.current && cameraLocation) {
-          safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 17);
+          safeSetMapCamera(mapRef.current, cameraLocation, userHeading, 16);
       }
   };
 
@@ -3420,7 +3524,33 @@ function App() {
       }
   };
 
+  const updateRouteWithRetry = async (routeId, payload, attempts = 3) => {
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          try {
+              await updateDoc(doc(db, 'rutas', routeId), payload);
+              return;
+          } catch (error) {
+              lastError = error;
+              const code = String(error?.code || '').toLowerCase();
+              const nonRetryable =
+                  code.includes('permission-denied') ||
+                  code.includes('invalid-argument') ||
+                  code.includes('not-found');
+
+              if (nonRetryable || attempt >= attempts) break;
+              await new Promise(resolve => setTimeout(resolve, 450 * attempt));
+          }
+      }
+
+      throw lastError || new Error('No fue posible actualizar el viaje.');
+  };
+
   const confirmarAbordaje = async (isFinalDestination) => {
+      if (stopSaveBusyRef.current) return;
+      stopSaveBusyRef.current = true;
+      setIsSavingStop(true);
       const target = allTargets[nextStopIdx] || {};
       const nowIso = new Date().toISOString();
       const nowTime = getMexicoTime();
@@ -3495,7 +3625,7 @@ function App() {
       }
 
       try {
-          await updateDoc(doc(db, 'rutas', selectedRoute.id), updates);
+          await updateRouteWithRetry(selectedRoute.id, updates, 3);
           setSelectedRoute(prev => prev ? {
               ...prev,
               ...(nextStopIdx === 0 && !isFinalDestination ? {
@@ -3514,7 +3644,10 @@ function App() {
           await advanceAfterStop(isFinalDestination);
       } catch (boardingError) {
           console.error('No se pudo registrar el abordaje:', boardingError);
-          alert('No se pudo guardar el abordaje. Revisa la conexión e inténtalo de nuevo.');
+          alert('No se pudo guardar el abordaje después de varios intentos. Revisa la conexión y vuelve a intentarlo.');
+      } finally {
+          stopSaveBusyRef.current = false;
+          setIsSavingStop(false);
       }
   };
 
@@ -3921,10 +4054,11 @@ function App() {
     routeListenerUnsubscribeRef.current = onSnapshot(
         q,
         (snapshot) => {
-            setMisRutas(snapshot.docs.map(routeDoc => ({
+            const nextRoutes = snapshot.docs.map(routeDoc => ({
                 id: routeDoc.id,
                 ...routeDoc.data()
-            })));
+            })).sort((a, b) => getPickupSortableDateTime(a) - getPickupSortableDateTime(b));
+            setMisRutas(nextRoutes);
         },
         (listenerError) => {
             console.error('Error escuchando rutas:', listenerError);
@@ -4063,6 +4197,8 @@ function App() {
       setAlertedStops([]);
       setIsApproaching(false);
       setIsWaiting(false);
+      setIsTracking(true);
+      isTrackingRef.current = true;
       setLiveRouteData({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
       setNextManeuver({ instruction: '', distance: '', voiceKey: '', meters: null });
       lastSpokenRef.current = null;
@@ -4191,6 +4327,8 @@ function App() {
 
       const finalUpdate = {
           status: 'Finalizado',
+          ofertaEstado: 'Finalizada',
+          ofertaPara: '',
           endTime: actualEndTime,
           actualEndTime,
           actualEndTimestamp,
@@ -4304,7 +4442,7 @@ function App() {
 
               const loc = normalizePoint(latestLocRef.current);
               if (loc && isTrackingRef.current) {
-                  safeSetMapCamera(mapRef.current, loc, userHeading, 17);
+                  safeSetMapCamera(mapRef.current, loc, userHeading, 16);
               }
           } catch (e) {
               console.warn('No se pudo redimensionar el mapa:', e);
@@ -4317,14 +4455,33 @@ function App() {
   const navigationRenderGeometry = useMemo(() => {
       const localGoogleGeometry = normalizePath(liveRouteData.geometry);
       const publishedGoogleGeometry = normalizePath(selectedRoute?.liveRouteGeometry);
+      const plannedGoogleGeometry = normalizePath(selectedRoute?.technicalData?.geometry);
+      const plannedProvider = String(selectedRoute?.technicalData?.routingProvider || '').toLowerCase();
 
-      // Durante el recorrido solo se dibuja una ruta confirmada por Google Directions.
-      // La geometría OSRM del despachador es únicamente para planeación y no se usa
-      // como navegación activa, evitando líneas visuales por zonas sin calles.
-      return localGoogleGeometry.length > 1
-          ? localGoogleGeometry
-          : publishedGoogleGeometry;
-  }, [liveRouteData.geometry, selectedRoute?.liveRouteGeometry]);
+      if (localGoogleGeometry.length > 1) return localGoogleGeometry;
+      if (publishedGoogleGeometry.length > 1) return publishedGoogleGeometry;
+
+      // Respaldo visual únicamente para rutas que el despachador ya confirmó con Google Directions.
+      // No se recalcula ni simplifica la geometría: conserva el trazo detallado existente.
+      if (plannedGoogleGeometry.length > 1 && plannedProvider === 'google-directions') {
+          const loc = normalizePoint(driverLocationForMap);
+          if (loc) {
+              const match = getClosestPathMatch(loc, plannedGoogleGeometry);
+              if (match.index >= 0 && match.distanceMeters <= 1200) {
+                  return plannedGoogleGeometry.slice(Math.max(0, match.index - 1));
+              }
+          }
+          return plannedGoogleGeometry;
+      }
+
+      return [];
+  }, [
+      liveRouteData.geometry,
+      selectedRoute?.liveRouteGeometry,
+      selectedRoute?.technicalData?.geometry,
+      selectedRoute?.technicalData?.routingProvider,
+      driverLocationForMap
+  ]);
 
   if (!isReady) return null;
 
@@ -4338,6 +4495,7 @@ function App() {
       const isHeadingToDestination = nextStopIdx >= allTargets.length - 1;
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       const safeMapCenter =
+          normalizePoint(driverLocationForMap) ||
           normalizePoint(selectedRoute.startCoords) ||
           currentGeometry[0] ||
           normalizePoint(currentTarget) ||
@@ -4718,7 +4876,7 @@ function App() {
                           ) : (
                               <div className="flex gap-2">
                                   <button onClick={() => reportarAusencia(isHeadingToDestination)} className="w-1/3 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 p-3 rounded-xl font-bold text-[10px] leading-tight active:scale-95 transition-transform">{isSalidaRoute(selectedRoute) && nextStopIdx > 0 ? 'NO ENTREGADO / CAMBIO' : 'NO SALIÓ / CANCELÓ'}</button>
-                                  <button onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2">
+                                  <button disabled={isSavingStop} onClick={() => confirmarAbordaje(isHeadingToDestination)} className="w-2/3 bg-orange-500 hover:bg-orange-600 text-white p-3 rounded-xl font-black text-sm active:scale-95 transition-transform flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-wait">
                                       {isSalidaRoute(selectedRoute) && nextStopIdx > 0
                                           ? <><CheckCircle className="w-5 h-5"/> {isHeadingToDestination ? 'EN DESTINO Y FINALIZAR' : 'PASAJERO EN DESTINO'}</>
                                           : (isHeadingToDestination ? <><CheckCircle className="w-5 h-5"/> FINALIZAR VIAJE</> : <><User className="w-5 h-5"/> PASAJERO A BORDO</>)}
@@ -4783,7 +4941,7 @@ function App() {
                         <GoogleMap
                             key={`nav-map-${selectedRoute.id}`}
                             mapContainerStyle={containerStyle}
-                            center={centerMX}
+                            center={safeMapCenter}
                             zoom={16}
                             onLoad={handleMapLoad}
                             onUnmount={handleMapUnmount}
@@ -5181,12 +5339,26 @@ function App() {
   // ==============================================================
   if (currentDriver && !isEditingProfile) {
     const todayStr = new Date().toLocaleDateString('en-CA', {}); // YYYY-MM-DD
-    
+    const completedFingerprints = new Set(
+        misRutas
+            .filter(route => ['Finalizado', 'Completado'].includes(route?.status))
+            .map(getDriverRouteFingerprint)
+    );
+
     let rFiltradas = misRutas
         .filter(x => {
-            if (mainTab === 'Finalizados') return x.status === 'Finalizado';
-            if (x.status === 'Finalizado') return false;
-            
+            if (mainTab === 'Finalizados') {
+                return ['Finalizado', 'Completado'].includes(x.status);
+            }
+
+            if (['Finalizado', 'Completado', 'Cancelado'].includes(x.status)) {
+                return false;
+            }
+
+            if (completedFingerprints.has(getDriverRouteFingerprint(x))) {
+                return false;
+            }
+
             // --- NUEVOS FILTROS LÓGICOS ---
             if (filterType === 'Hoy') {
                 return getPickupDateForFilter(x) === todayStr || x.serviceType === 'Prioritario';
