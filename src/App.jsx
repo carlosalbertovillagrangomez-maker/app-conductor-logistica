@@ -4,7 +4,7 @@ import {
   AlertCircle, LogOut, MapPin, User, Phone, 
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
-  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX, Download, Share2
+  Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX, Download, Share2, RefreshCw
 } from 'lucide-react';
 import { db, requestForToken, setupPushNotifications } from './firebase';
 import { collection, query, where, getDocs, getDoc, addDoc, onSnapshot, updateDoc, doc, arrayUnion, increment } from 'firebase/firestore';
@@ -1574,6 +1574,213 @@ const getDriverRouteFingerprint = (route) => {
         .join('||');
 };
 
+const DRIVER_ROUTE_CACHE_LIMIT = 50;
+const DRIVER_COMPLETION_GUARD_TTL_MS = 48 * 60 * 60 * 1000;
+
+const getDriverRouteDirectionLabel = (route) => {
+    const raw = String(
+        route?.technicalData?.carpool?.mode ||
+        route?.carpoolMode ||
+        route?.tripDirection ||
+        ''
+    ).toLocaleLowerCase('es');
+
+    if (raw.includes('regreso') || raw.includes('salida')) return 'SALIDA';
+    if (raw.includes('ida') || raw.includes('entrada')) return 'ENTRADA';
+    return 'RUTA';
+};
+
+const getDriverRouteSequence = (route) => {
+    const candidates = [
+        route?.aiOrder,
+        route?.routeOrder,
+        route?.routeSequence,
+        route?.sequence,
+        route?.order,
+        route?.technicalData?.carpool?.aiOrder,
+        route?.technicalData?.carpool?.routeOrder,
+        route?.technicalData?.carpool?.sequence
+    ];
+
+    for (const candidate of candidates) {
+        const value = Number(candidate);
+        if (Number.isFinite(value)) return value;
+    }
+
+    return Number.MAX_SAFE_INTEGER;
+};
+
+const compareDriverRoutesChronologically = (a, b) => {
+    const aMs = getPickupSortableDateTime(a).getTime();
+    const bMs = getPickupSortableDateTime(b).getTime();
+    if (aMs !== bMs) return aMs - bMs;
+
+    const sequenceDiff = getDriverRouteSequence(a) - getDriverRouteSequence(b);
+    if (Number.isFinite(sequenceDiff) && sequenceDiff !== 0) return sequenceDiff;
+
+    const createdA = getTimestampMs(a?.createdDate) || 0;
+    const createdB = getTimestampMs(b?.createdDate) || 0;
+    if (createdA !== createdB) return createdA - createdB;
+
+    const directionDiff = getDriverRouteDirectionLabel(a).localeCompare(
+        getDriverRouteDirectionLabel(b),
+        'es'
+    );
+    if (directionDiff !== 0) return directionDiff;
+
+    return String(a?.id || '').localeCompare(String(b?.id || ''), 'es');
+};
+
+const hasDriverFinalEvidence = (route) => {
+    if (!route) return false;
+    if (['Finalizado', 'Completado'].includes(route?.status)) return true;
+
+    if (
+        route?.actualEndTimestamp ||
+        route?.finishedAt ||
+        route?.completedAt ||
+        route?.receipt?.actualEndTimestamp
+    ) {
+        return true;
+    }
+
+    const finalStopIndex = (Array.isArray(route?.waypointsData) ? route.waypointsData.length : 0) + 1;
+    const events = [
+        ...(Array.isArray(route?.stopEvents) ? route.stopEvents : []),
+        ...(Array.isArray(route?.evidenciasLlegada) ? route.evidenciasLlegada : [])
+    ];
+
+    return events.some(event => {
+        const stopIndex = Number(event?.stopIndex);
+        if (!Number.isFinite(stopIndex) || stopIndex < finalStopIndex) return false;
+
+        const type = String(event?.type || '').toLowerCase();
+        const status = String(event?.status || '').toLowerCase();
+
+        return (
+            ['destination_arrival', 'dropoff', 'absence'].includes(type) ||
+            status.includes('destino confirmado') ||
+            status.includes('en destino') ||
+            status.includes('pasajero en destino')
+        );
+    });
+};
+
+const getDriverEffectiveStatus = (route) => {
+    if (['Finalizado', 'Completado', 'Cancelado'].includes(route?.status)) return route.status;
+    return hasDriverFinalEvidence(route) ? 'Finalizado' : route?.status;
+};
+
+const readDriverLocalJson = (key, fallback = null) => {
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return fallback;
+        return JSON.parse(raw);
+    } catch (_) {
+        return fallback;
+    }
+};
+
+const writeDriverLocalJson = (key, value) => {
+    try {
+        localStorage.setItem(
+            key,
+            JSON.stringify(value, (_key, item) => {
+                if (item && typeof item?.toDate === 'function') {
+                    try { return item.toDate().toISOString(); } catch (_) {}
+                }
+                return item;
+            })
+        );
+        return true;
+    } catch (error) {
+        console.warn('No se pudo guardar caché local de TripLogix:', error);
+        return false;
+    }
+};
+
+const getDriverRoutesCacheKey = (driverId) => `triplogix_driver_routes_cache_${driverId}`;
+const getDriverActiveCacheKey = (driverId) => `triplogix_driver_active_route_${driverId}`;
+const getDriverCompletionGuardKey = (driverId) => `triplogix_driver_completed_guard_${driverId}`;
+
+const compactDriverEventsForCache = (events, limit = 40) => (
+    Array.isArray(events)
+        ? events.slice(-limit).map(event => ({ ...event, photo: '' }))
+        : []
+);
+
+const buildDriverRouteListCacheItem = (route) => ({
+    _cacheOnly: true,
+    id: route?.id || '',
+    client: route?.client || '',
+    driver: route?.driver || '',
+    driverId: route?.driverId || '',
+    status: getDriverEffectiveStatus(route) || '',
+    ofertaEstado: route?.ofertaEstado || '',
+    ofertaPara: route?.ofertaPara || '',
+    serviceType: route?.serviceType || '',
+    pickupDate: route?.pickupDate || '',
+    scheduledDate: route?.scheduledDate || '',
+    fechaServicio: route?.fechaServicio || '',
+    pickupTime: route?.pickupTime || '',
+    startTime: route?.startTime || '',
+    scheduledTime: route?.scheduledTime || '',
+    officialScheduledTime: route?.officialScheduledTime || '',
+    createdDate: route?.createdDate || '',
+    actualEndTimestamp: route?.actualEndTimestamp || '',
+    finishedAt: route?.finishedAt || '',
+    start: route?.start || route?.origin || '',
+    end: route?.end || route?.destination || route?.destino || '',
+    startCoords: route?.startCoords ? {
+        lat: route.startCoords.lat,
+        lng: route.startCoords.lng ?? route.startCoords.lon,
+        pickupTime: route.startCoords.pickupTime || '',
+        passengerName: route.startCoords.passengerName || '',
+        contact: route.startCoords.contact || ''
+    } : null,
+    endCoords: route?.endCoords ? {
+        lat: route.endCoords.lat,
+        lng: route.endCoords.lng ?? route.endCoords.lon,
+        passengerName: route.endCoords.passengerName || '',
+        contact: route.endCoords.contact || ''
+    } : null,
+    passengerSchedule: (Array.isArray(route?.passengerSchedule) ? route.passengerSchedule : []).map(item => ({
+        passengerName: item?.passengerName || item?.name || '',
+        name: item?.name || ''
+    })),
+    aiOrder: route?.aiOrder,
+    routeOrder: route?.routeOrder,
+    routeSequence: route?.routeSequence,
+    sequence: route?.sequence,
+    technicalData: {
+        carpool: {
+            mode: route?.technicalData?.carpool?.mode || '',
+            startTime: route?.technicalData?.carpool?.startTime || '',
+            officialScheduledTime: route?.technicalData?.carpool?.officialScheduledTime || '',
+            targetArrivalTime: route?.technicalData?.carpool?.targetArrivalTime || '',
+            aiOrder: route?.technicalData?.carpool?.aiOrder,
+            routeOrder: route?.technicalData?.carpool?.routeOrder,
+            sequence: route?.technicalData?.carpool?.sequence
+        }
+    }
+});
+
+const buildDriverActiveRouteCacheSnapshot = (route) => {
+    if (!route) return null;
+
+    return {
+        ...route,
+        _cacheOnly: false,
+        chat: Array.isArray(route?.chat) ? route.chat.slice(-15) : [],
+        evidencias: [],
+        evidenciasLlegada: compactDriverEventsForCache(route?.evidenciasLlegada, 25),
+        stopEvents: compactDriverEventsForCache(route?.stopEvents, 40),
+        bitacora: Array.isArray(route?.bitacora) ? route.bitacora.slice(-40) : [],
+        rutaReal: Array.isArray(route?.rutaReal) ? route.rutaReal.slice(-120) : []
+    };
+};
+
+
 const getPlannedStartDateTime = (route) => {
     const dateValue = getPickupDateForFilter(route);
     const timeValue = getPickupTimeValue(route);
@@ -1722,6 +1929,9 @@ function App() {
   const [isReady, setIsReady] = useState(false);
   
   const [misRutas, setMisRutas] = useState([]);
+  const [routeSyncing, setRouteSyncing] = useState(false);
+  const routeSyncBusyRef = useRef(false);
+  const routeSyncLastAtRef = useRef(0);
   const assignmentTrackerInitializedRef = useRef(false);
   const knownAssignedRouteIdsRef = useRef(new Set());
   const [driverNotice, setDriverNotice] = useState(null);
@@ -1776,6 +1986,7 @@ function App() {
   const telemetryBusyRef = useRef(false);
   const flushTelemetryRef = useRef(async () => {});
   const routeListenerUnsubscribeRef = useRef(null);
+  const refreshDriverRoutesRef = useRef(async () => {});
   const liveNavigationRef = useRef({
       distanceKm: 0,
       durationMinutes: 0,
@@ -3496,7 +3707,7 @@ function App() {
       setIsApproaching(false);
 
       if (isFinalDestination) {
-          await handleEndTrip(selectedRoute.id);
+          await handleEndTrip(selectedRoute.id, true);
           return;
       }
 
@@ -3509,7 +3720,13 @@ function App() {
           nextStopIdx: newIdx,
           proximityAlert: { ...(prev.proximityAlert || {}), active: false }
       } : prev);
-      localStorage.setItem(`trip_idx_${selectedRoute.id}`, String(newIdx));
+      localStorage.setItem(`trip_idx_${selectedRoute.id}`, String(newIdx));persistDriverActiveRouteCache(currentDriver?.id, {
+    ...selectedRoute,
+    currentStopIndex: newIdx,
+    nextStopIdx: newIdx,
+    proximityAlert: { ...(selectedRoute?.proximityAlert || {}), active: false }
+});
+
       setRouteUpdateTick(t => t + 1);
 
       try {
@@ -3891,7 +4108,202 @@ function App() {
       await advanceAfterStop(isFinalDestination);
   };
 
+const applyDriverLocalCompletionState = (driverId, routes) => {
+    const now = Date.now();
+    const guardKey = getDriverCompletionGuardKey(driverId);
+    const rawGuards = readDriverLocalJson(guardKey, {});
+    const guards = rawGuards && typeof rawGuards === 'object' && !Array.isArray(rawGuards)
+        ? { ...rawGuards }
+        : {};
+
+    let guardsChanged = false;
+    Object.entries(guards).forEach(([routeId, guard]) => {
+        const recordedAt = Number(guard?.recordedAt || 0);
+        if (!recordedAt || now - recordedAt > DRIVER_COMPLETION_GUARD_TTL_MS) {
+            delete guards[routeId];
+            guardsChanged = true;
+        }
+    });
+
+    if (guardsChanged) writeDriverLocalJson(guardKey, guards);
+
+    return (Array.isArray(routes) ? routes : [])
+        .map(route => {
+            let normalized = route;
+            const effectiveStatus = getDriverEffectiveStatus(route);
+
+            if (effectiveStatus === 'Finalizado' && route?.status !== 'Finalizado') {
+                normalized = {
+                    ...route,
+                    status: 'Finalizado',
+                    _completionDerivedFromEvidence: true
+                };
+            }
+
+            const guard = guards[route?.id];
+            if (
+                guard &&
+                !['Finalizado', 'Completado', 'Cancelado'].includes(normalized?.status)
+            ) {
+                normalized = {
+                    ...normalized,
+                    ...guard.finalState,
+                    status: 'Finalizado',
+                    _localCompletionGuard: true
+                };
+            }
+
+            return normalized;
+        })
+        .sort(compareDriverRoutesChronologically);
+};
+
+const persistDriverRoutesCache = (driverId, routes) => {
+    if (!driverId) return;
+
+    const active = [];
+    const closed = [];
+
+    (Array.isArray(routes) ? routes : []).forEach(route => {
+        if (['Finalizado', 'Completado', 'Cancelado'].includes(getDriverEffectiveStatus(route))) {
+            closed.push(route);
+        } else {
+            active.push(route);
+        }
+    });
+
+    active.sort(compareDriverRoutesChronologically);
+    closed.sort((a, b) => getCompletedTripSortTimestamp(b) - getCompletedTripSortTimestamp(a));
+
+    const cacheItems = [...active, ...closed]
+        .slice(0, DRIVER_ROUTE_CACHE_LIMIT)
+        .map(buildDriverRouteListCacheItem);
+
+    writeDriverLocalJson(getDriverRoutesCacheKey(driverId), cacheItems);
+};
+
+const persistDriverActiveRouteCache = (driverId, route) => {
+    if (!driverId || !route?.id) return;
+    if (getDriverEffectiveStatus(route) !== 'En Ruta') return;
+    const cached = buildDriverActiveRouteCacheSnapshot(route);
+    if (cached) writeDriverLocalJson(getDriverActiveCacheKey(driverId), cached);
+};
+
+const refreshDriverRoutes = async (driverId, options = {}) => {
+    const cleanDriverId = String(driverId || '').trim();
+    if (!cleanDriverId || routeSyncBusyRef.current) return;
+
+    const force = Boolean(options?.force);
+    const now = Date.now();
+    if (!force && now - routeSyncLastAtRef.current < 1500) return;
+
+    routeSyncBusyRef.current = true;
+    routeSyncLastAtRef.current = now;
+    setRouteSyncing(true);
+
+    try {
+        const activeTripId = String(localStorage.getItem('active_trip_id') || '').trim();
+
+        if (activeTripId) {
+            try {
+                const activeSnapshot = await getDoc(doc(db, 'rutas', activeTripId));
+
+                if (activeSnapshot.exists()) {
+                    let activeRoute = {
+                        id: activeSnapshot.id,
+                        ...activeSnapshot.data()
+                    };
+                    activeRoute = applyDriverLocalCompletionState(cleanDriverId, [activeRoute])[0] || activeRoute;
+
+                    if (['Finalizado', 'Completado', 'Cancelado'].includes(activeRoute?.status)) {
+                        localStorage.removeItem('active_trip_id');
+                        localStorage.removeItem(`trip_idx_${activeTripId}`);
+                        localStorage.removeItem(getDriverActiveCacheKey(cleanDriverId));
+
+                        setSelectedRoute(prev => (
+                            prev?.id === activeTripId
+                                ? { ...prev, ...activeRoute }
+                                : prev
+                        ));
+                    } else if (activeRoute?.status === 'En Ruta') {
+                        const localIdx = Math.max(
+                            0,
+                            Number(localStorage.getItem(`trip_idx_${activeTripId}`)) || 0
+                        );
+                        const serverIdx = Math.max(
+                            0,
+                            Number(activeRoute?.nextStopIdx ?? activeRoute?.currentStopIndex ?? 0) || 0
+                        );
+                        const resolvedIdx = Math.max(localIdx, serverIdx);
+
+                        activeRoute = {
+                            ...activeRoute,
+                            currentStopIndex: resolvedIdx,
+                            nextStopIdx: resolvedIdx
+                        };
+
+                        localStorage.setItem(`trip_idx_${activeTripId}`, String(resolvedIdx));
+                        nextStopIdxRef.current = resolvedIdx;
+                        setNextStopIdx(resolvedIdx);
+
+                        setSelectedRoute(prev => {
+                            if (prev && prev.id !== activeTripId) return prev;
+                            return { ...(prev || {}), ...activeRoute };
+                        });
+
+                        persistDriverActiveRouteCache(cleanDriverId, activeRoute);
+                    }
+                }
+            } catch (activeRefreshError) {
+                console.warn('No se pudo refrescar el viaje activo; se conserva la copia local:', activeRefreshError);
+            }
+        }
+
+        const routesQuery = query(
+            collection(db, 'rutas'),
+            where('driverId', '==', cleanDriverId)
+        );
+        const routesSnapshot = await getDocs(routesQuery);
+
+        const refreshedRoutes = applyDriverLocalCompletionState(
+            cleanDriverId,
+            routesSnapshot.docs.map(routeDoc => ({
+                id: routeDoc.id,
+                ...routeDoc.data()
+            }))
+        );
+
+        setMisRutas(refreshedRoutes);
+        persistDriverRoutesCache(cleanDriverId, refreshedRoutes);
+    } catch (refreshError) {
+        console.warn('No se pudieron actualizar los viajes; se conserva la lista local:', refreshError);
+    } finally {
+        routeSyncBusyRef.current = false;
+        setRouteSyncing(false);
+    }
+};
+
+refreshDriverRoutesRef.current = refreshDriverRoutes;
+
   const handleSelectRoute = (ruta) => {
+if (ruta?._cacheOnly && ruta?.id) {
+    setRouteSyncing(true);
+    getDoc(doc(db, 'rutas', ruta.id))
+        .then(snapshot => {
+            if (snapshot.exists()) {
+                handleSelectRoute({
+                    id: snapshot.id,
+                    ...snapshot.data()
+                });
+            }
+        })
+        .catch(error => {
+            console.warn('No se pudo abrir el viaje todavía. Se conservará en la lista:', error);
+        })
+        .finally(() => setRouteSyncing(false));
+    return;
+}
+
       committedDistanceKmRef.current = Math.max(0, Number(ruta?.realDistanceDriven) || 0);
       serviceDistanceStartedAtRef.current = String(
           ruta?.serviceDistanceStartedAt ||
@@ -3920,7 +4332,12 @@ function App() {
               ? parseInt(savedIdx, 10)
               : Number(ruta?.nextStopIdx ?? ruta?.currentStopIndex ?? 0) || 0;
           nextStopIdxRef.current = resolvedIdx;
-          setNextStopIdx(resolvedIdx);
+          setNextStopIdx(resolvedIdx);persistDriverActiveRouteCache(currentDriver?.id, {
+    ...ruta,
+    currentStopIndex: resolvedIdx,
+    nextStopIdx: resolvedIdx
+});
+
       } else {
           nextStopIdxRef.current = 0;
           setNextStopIdx(0);
@@ -3935,11 +4352,65 @@ function App() {
   const [licenseExp, setLicenseExp] = useState(''); const [vehicleModel, setVehicleModel] = useState('');
   const [vehiclePlate, setVehiclePlate] = useState(''); const [vehicleType, setVehicleType] = useState('');
 
-  useEffect(() => {
-    const savedDriver = localStorage.getItem('driver_session');
-    if (savedDriver) { const driverData = JSON.parse(savedDriver); setCurrentDriver(driverData); cargarDatosEnFormulario(driverData); escucharRutas(driverData.id); }
-    setIsReady(true);
-  }, []);
+useEffect(() => {
+  const savedDriver = localStorage.getItem('driver_session');
+
+  if (savedDriver) {
+      try {
+          const driverData = JSON.parse(savedDriver);
+          setCurrentDriver(driverData);
+          cargarDatosEnFormulario(driverData);
+
+          const cachedRoutes = readDriverLocalJson(
+              getDriverRoutesCacheKey(driverData.id),
+              []
+          );
+          if (Array.isArray(cachedRoutes) && cachedRoutes.length > 0) {
+              setMisRutas(applyDriverLocalCompletionState(driverData.id, cachedRoutes));
+          }
+
+          const savedActiveId = String(localStorage.getItem('active_trip_id') || '').trim();
+          const cachedActive = readDriverLocalJson(
+              getDriverActiveCacheKey(driverData.id),
+              null
+          );
+
+          if (
+              savedActiveId &&
+              cachedActive?.id === savedActiveId &&
+              getDriverEffectiveStatus(cachedActive) === 'En Ruta'
+          ) {
+              const localIdx = Math.max(
+                  0,
+                  Number(localStorage.getItem(`trip_idx_${savedActiveId}`)) || 0,
+                  Number(cachedActive?.nextStopIdx ?? cachedActive?.currentStopIndex ?? 0) || 0
+              );
+
+              const resumedRoute = {
+                  ...cachedActive,
+                  currentStopIndex: localIdx,
+                  nextStopIdx: localIdx
+              };
+
+              nextStopIdxRef.current = localIdx;
+              setNextStopIdx(localIdx);
+              setSelectedRoute(resumedRoute);
+          }
+
+          escucharRutas(driverData.id);
+
+          setTimeout(() => {
+              refreshDriverRoutesRef.current?.(driverData.id, { force: true });
+          }, 50);
+      } catch (restoreError) {
+          console.warn('No se pudo restaurar la sesión del conductor:', restoreError);
+          localStorage.removeItem('driver_session');
+      }
+  }
+
+  setIsReady(true);
+}, []);
+
 
   useEffect(() => {
       if (!currentDriver?.id) return undefined;
@@ -4054,11 +4525,16 @@ function App() {
     routeListenerUnsubscribeRef.current = onSnapshot(
         q,
         (snapshot) => {
-            const nextRoutes = snapshot.docs.map(routeDoc => ({
-                id: routeDoc.id,
-                ...routeDoc.data()
-            })).sort((a, b) => getPickupSortableDateTime(a) - getPickupSortableDateTime(b));
+            const nextRoutes = applyDriverLocalCompletionState(
+                driverId,
+                snapshot.docs.map(routeDoc => ({
+                    id: routeDoc.id,
+                    ...routeDoc.data()
+                }))
+            );
             setMisRutas(nextRoutes);
+            persistDriverRoutesCache(driverId, nextRoutes);
+            setRouteSyncing(false);
         },
         (listenerError) => {
             console.error('Error escuchando rutas:', listenerError);
@@ -4077,25 +4553,54 @@ function App() {
       };
   }, []);
 
+useEffect(() => {
+    const driverId = String(currentDriver?.id || '').trim();
+    if (!driverId) return undefined;
+
+    const refreshWhenVisible = () => {
+        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        refreshDriverRoutesRef.current?.(driverId);
+    };
+
+    const handleVisibilityRefresh = () => refreshWhenVisible();
+
+    document.addEventListener('visibilitychange', handleVisibilityRefresh);
+    window.addEventListener('pageshow', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenVisible);
+
+    const interval = setInterval(refreshWhenVisible, 45000);
+
+    return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityRefresh);
+        window.removeEventListener('pageshow', refreshWhenVisible);
+        window.removeEventListener('focus', refreshWhenVisible);
+        clearInterval(interval);
+    };
+}, [currentDriver?.id]);
+
   const handleStartTrip = async (routeId) => {
     const routeToStart = selectedRoute?.id === routeId
         ? selectedRoute
         : misRutas.find(r => r.id === routeId);
 
     const plannedStartDateTime = getPlannedStartDateTime(routeToStart);
-    const plannedStartLabel = getPickupScheduleText(routeToStart);
+    const plannedStartLabel = getPickupScheduleText(routeToStart);const routeDirectionLabel = getDriverRouteDirectionLabel(routeToStart);
+const routeOriginLabel = String(routeToStart?.start || routeToStart?.origin || 'Origen no registrado');
+const routeDestinationLabel = String(routeToStart?.end || routeToStart?.destination || 'Destino no registrado');
+const routeConfirmationSummary = `${routeDirectionLabel}\n${routeOriginLabel}\n→ ${routeDestinationLabel}`;
+
 
     if (plannedStartDateTime) {
         const now = new Date();
         const diffMins = Math.round((plannedStartDateTime.getTime() - now.getTime()) / 60000);
 
         if (diffMins > 15) {
-            const confirmar = confirm(`Este viaje está planificado para iniciar/recoger en ${plannedStartLabel}. Todavía faltan aproximadamente ${diffMins} minutos. ¿Deseas iniciarlo de todas formas?`);
+            const confirmar = confirm(`Este viaje está planificado para iniciar/recoger en ${plannedStartLabel}. Todavía faltan aproximadamente ${diffMins} minutos.\n\n${routeConfirmationSummary}\n\n¿Deseas iniciarlo de todas formas?`);
             if (!confirmar) return;
-        } else if (!confirm(`¿Deseas iniciar este viaje ahora?\nHorario planificado: ${plannedStartLabel}`)) {
+        } else if (!confirm(`¿Deseas iniciar este viaje ahora?\nHorario planificado: ${plannedStartLabel}\n\n${routeConfirmationSummary}`)) {
             return;
         }
-    } else if (!confirm("¿Deseas iniciar este viaje ahora?")) {
+    } else if (!confirm(`¿Deseas iniciar este viaje ahora?\n\n${routeConfirmationSummary}`)) {
         return;
     }
 
@@ -4187,7 +4692,22 @@ function App() {
       }));
 
       localStorage.setItem('active_trip_id', routeId);
-      localStorage.setItem(`trip_idx_${routeId}`, 0);
+      localStorage.setItem(`trip_idx_${routeId}`, 0);const startedRouteForCache = {
+    ...routeToStart,
+    ...updateData,
+    id: routeId,
+    status: 'En Ruta'
+};
+persistDriverActiveRouteCache(currentDriver?.id, startedRouteForCache);
+setMisRutas(prev => {
+    const nextRoutes = applyDriverLocalCompletionState(
+        currentDriver?.id,
+        prev.map(route => route.id === routeId ? { ...route, ...startedRouteForCache } : route)
+    );
+    persistDriverRoutesCache(currentDriver?.id, nextRoutes);
+    return nextRoutes;
+});
+
 
       nextStopIdxRef.current = 0;
       serviceDistanceStartedRef.current = false;
@@ -4241,8 +4761,8 @@ function App() {
     }
   };
 
-  const handleEndTrip = async (routeId) => {
-    if (!confirm("¿Has completado el viaje por completo?")) return;
+  const handleEndTrip = async (routeId, skipConfirm = false) => {
+    if (!skipConfirm && !confirm("¿Has completado el viaje por completo?")) return;
 
     try {
       // Vaciar primero la telemetría acumulada para que el recibo use la distancia real más reciente.
@@ -4351,7 +4871,7 @@ function App() {
           "proximityAlert.active": false
       };
 
-      await updateDoc(doc(db, "rutas", routeId), finalUpdate);
+      await updateRouteWithRetry(routeId, finalUpdate, 4);
 
       // El viaje termina, pero el conductor puede seguir En Línea. Publicar inmediatamente
       // su posición actual evita que la torre se quede con el cursor en el último destino.
@@ -4372,11 +4892,42 @@ function App() {
           ...finalUpdate,
           id: routeId
       };
+if (currentDriver?.id) {
+    const guardKey = getDriverCompletionGuardKey(currentDriver.id);
+    const guards = readDriverLocalJson(guardKey, {}) || {};
+    guards[routeId] = {
+        recordedAt: Date.now(),
+        finalState: {
+            status: 'Finalizado',
+            ofertaEstado: 'Finalizada',
+            ofertaPara: '',
+            actualEndTime,
+            actualEndTimestamp,
+            finishedAt: actualEndTimestamp,
+            finalDate: getMexicoDate(),
+            finalDistanceKm: finalRealDistanceKm,
+            realDistanceDriven: finalRealDistanceKm
+        }
+    };
+    writeDriverLocalJson(guardKey, guards);
+
+    setMisRutas(prev => {
+        const nextRoutes = applyDriverLocalCompletionState(
+            currentDriver.id,
+            prev.map(route => route.id === routeId ? completedRoute : route)
+        );
+        persistDriverRoutesCache(currentDriver.id, nextRoutes);
+        return nextRoutes;
+    });
+}
 
       setSelectedRoute(completedRoute);
       setCompletedTripNotice(completedRoute);
       localStorage.removeItem('active_trip_id');
-      localStorage.removeItem(`trip_idx_${routeId}`);
+      localStorage.removeItem(`trip_idx_${routeId}`);if (currentDriver?.id) {
+    localStorage.removeItem(getDriverActiveCacheKey(currentDriver.id));
+}
+
       odometerLocRef.current = null;
       odometerMetaRef.current = { timestamp: 0, accuracy: Infinity };
       serviceDistanceStartedRef.current = false;
@@ -5288,7 +5839,7 @@ function App() {
             <div className="space-y-4 mb-4">
                 <div className="flex items-start gap-3">
                     <div className="w-3 h-3 rounded-full bg-green-500 mt-1"></div>
-                    <div><p className="text-[10px] font-black uppercase text-slate-400">Origen • {selectedRoute.startCoords?.passengerName || 'Pasajero'} • {formatPickupTime(getStopPlannedTimeValue(selectedRoute, 0))}</p><p className="text-xs font-medium">{selectedRoute.start}</p></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Origen • {selectedRoute.startCoords?.passengerName || 'Pasajero'} • {formatPickupTime(getStopPlannedTimeValue(selectedRoute, 0))}</p><p className="text-sm font-black leading-snug mt-1">{selectedRoute.start}</p></div>
                 </div>
                 {selectedRoute.waypointsData && selectedRoute.waypointsData.map((wp, idx) => (
                     <div key={idx} className="flex items-start gap-3">
@@ -5298,7 +5849,7 @@ function App() {
                 ))}
                 <div className="flex items-start gap-3">
                     <div className="w-3 h-3 rounded-full bg-red-500 mt-1"></div>
-                    <div><p className="text-[10px] font-black uppercase text-slate-400">Destino • {selectedRoute.endCoords?.passengerName || 'Pasajero'} • {previewTargetArrival}</p><p className="text-xs font-medium">{selectedRoute.end}</p></div>
+                    <div><p className="text-[10px] font-black uppercase text-slate-400">Destino • {selectedRoute.endCoords?.passengerName || 'Pasajero'} • {previewTargetArrival}</p><p className="text-sm font-black leading-snug mt-1">{selectedRoute.end}</p></div>
                 </div>
             </div>
 
@@ -5373,9 +5924,7 @@ function App() {
             if (a.status === 'En Ruta' && b.status !== 'En Ruta') return -1;
             if (b.status === 'En Ruta' && a.status !== 'En Ruta') return 1;
 
-            const dateA = getPickupSortableDateTime(a);
-            const dateB = getPickupSortableDateTime(b);
-            return dateA - dateB;
+            return compareDriverRoutesChronologically(a, b);
         });
 
     // Si seleccionó "Próximo", solo le mostramos LA PRIMERA carta de la lista ordenada
@@ -5484,42 +6033,102 @@ function App() {
                     ))}
                 </div>
             )}
+{mainTab === 'Pendientes' && (
+    <div className="flex items-center justify-between gap-3 mt-2">
+        <p className="text-[9px] font-bold text-slate-400">
+            {routeSyncing
+                ? 'Actualizando viajes y recuperando tu avance...'
+                : 'Los viajes se actualizan automáticamente al volver a la app.'}
+        </p>
+        <button
+            type="button"
+            disabled={routeSyncing}
+            onClick={() => refreshDriverRoutesRef.current?.(currentDriver.id, { force: true })}
+            className="shrink-0 px-3 py-2 rounded-xl bg-orange-50 text-orange-600 border border-orange-200 text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5 disabled:opacity-50"
+        >
+            <RefreshCw className={`w-3.5 h-3.5 ${routeSyncing ? 'animate-spin' : ''}`} />
+            {routeSyncing ? 'Actualizando' : 'Actualizar'}
+        </button>
+    </div>
+)}
         </div>
 
         <div className="flex-1 p-6 space-y-4 overflow-y-auto">
-            {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados para este filtro'}</div> : rFiltradas.map(ruta => (
-                <div key={ruta.id} onClick={() => handleSelectRoute(ruta)} className={`p-5 rounded-[2rem] border transition-all flex items-center justify-between active:scale-95 shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}>
-                    <div className="flex items-center gap-4">
-                        <div className={`w-12 h-12 rounded-2xl flex items-center justify-center ${ruta.status === 'Finalizado' ? 'bg-slate-100 text-slate-600' : ruta.status === 'En Ruta' ? 'bg-green-100 text-green-600 animate-pulse' : ruta.serviceType === 'Prioritario' ? 'bg-yellow-100 text-yellow-600' : 'bg-orange-50 text-orange-500'}`}>
-                            {ruta.status === 'Finalizado' ? <CheckCircle2 className="w-6 h-6"/> : ruta.status === 'En Ruta' ? <Play className="w-6 h-6 fill-current"/> : ruta.serviceType === 'Prioritario' ? <Zap className="w-6 h-6" /> : <MapPin className="w-6 h-6" />}
-                        </div>
-                        <div>
-                            <h4 className="font-bold text-sm tracking-tight line-clamp-1">{ruta.end || ruta.destino}</h4>
-                            <div className="mt-1 flex items-center gap-1 text-[10px] font-black text-orange-500 uppercase">
-                                <Clock className="w-3 h-3" />
-                                <span>Recoger: {getPickupScheduleText(ruta)}</span>
+            {rFiltradas.length === 0 ? <div className="text-center py-20 text-slate-400 text-sm">Sin servicios {mainTab === 'Finalizados' ? 'completados' : 'asignados para este filtro'}</div> : rFiltradas.map(ruta => {
+                const directionLabel = getDriverRouteDirectionLabel(ruta);
+                const effectiveStatus = getDriverEffectiveStatus(ruta);
+                const pickupTimeLabel = formatPickupTime(getPickupTimeValue(ruta));
+                const pickupDateLabel = formatPickupDate(getPickupDateValue(ruta));
+                const isClosedRoute = ['Finalizado', 'Completado'].includes(effectiveStatus);
+
+                return (
+                    <div
+                        key={ruta.id}
+                        onClick={() => handleSelectRoute(ruta)}
+                        className={`p-4 rounded-[1.6rem] border transition-all active:scale-[0.99] shadow-sm cursor-pointer ${theme.card} ${ruta.serviceType === 'Prioritario' ? 'border-l-4 border-l-yellow-400' : ''}`}
+                    >
+                        <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                <span className={`px-2.5 py-1 rounded-full text-[9px] font-black tracking-widest ${directionLabel === 'SALIDA' ? 'bg-blue-100 text-blue-700' : directionLabel === 'ENTRADA' ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'}`}>
+                                    {directionLabel}
+                                </span>
+                                {ruta.serviceType === 'Prioritario' && (
+                                    <span className="px-2 py-1 rounded-full text-[8px] font-black bg-yellow-100 text-yellow-700">
+                                        PRIORITARIO
+                                    </span>
+                                )}
+                                <span className={`px-2 py-1 rounded-full text-[8px] font-black ${effectiveStatus === 'En Ruta' ? 'bg-green-100 text-green-700' : isClosedRoute ? 'bg-slate-100 text-slate-600' : 'bg-violet-100 text-violet-700'}`}>
+                                    {effectiveStatus || 'PENDIENTE'}
+                                </span>
                             </div>
-                            <p className="text-[10px] text-slate-400 font-bold uppercase mt-0.5">Cliente: {ruta.client}</p>
+                            <div className="text-right shrink-0">
+                                <p className="text-xl font-black text-orange-500 leading-none">{pickupTimeLabel}</p>
+                                <p className="text-[9px] font-bold text-slate-400 uppercase mt-1">{pickupDateLabel}</p>
+                            </div>
+                        </div>
+
+                        <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-stretch gap-2 rounded-2xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 p-3">
+                            <div className="min-w-0">
+                                <p className="text-[8px] font-black uppercase tracking-widest text-green-600">Origen</p>
+                                <p className="text-sm font-black text-slate-800 dark:text-white leading-snug mt-1 line-clamp-2">
+                                    {ruta.start || ruta.origin || 'Origen no registrado'}
+                                </p>
+                            </div>
+                            <div className="flex items-center justify-center text-orange-500 text-lg font-black">→</div>
+                            <div className="min-w-0 text-right">
+                                <p className="text-[8px] font-black uppercase tracking-widest text-red-500">Destino</p>
+                                <p className="text-sm font-black text-slate-800 dark:text-white leading-snug mt-1 line-clamp-2">
+                                    {ruta.end || ruta.destino || ruta.destination || 'Destino no registrado'}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="mt-3 flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                                <p className="text-[9px] font-black uppercase text-slate-400">Cliente</p>
+                                <p className="text-xs font-bold truncate">{ruta.client || 'Sin cliente'}</p>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                                {isClosedRoute && (
+                                    <button
+                                        type="button"
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            downloadTripLogixReceiptPdf(ruta);
+                                        }}
+                                        className="p-2.5 rounded-xl bg-orange-100 text-orange-600 border border-orange-200 active:scale-95 transition"
+                                        title="Descargar recibo PDF"
+                                    >
+                                        <FileText className="w-4 h-4" />
+                                    </button>
+                                )}
+                                <ChevronRight className="w-5 h-5 text-orange-500" />
+                            </div>
                         </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                        {ruta.status === 'Finalizado' && (
-                            <button
-                                type="button"
-                                onClick={(event) => {
-                                    event.stopPropagation();
-                                    downloadTripLogixReceiptPdf(ruta);
-                                }}
-                                className="p-2.5 rounded-xl bg-orange-100 text-orange-600 border border-orange-200 active:scale-95 transition"
-                                title="Descargar recibo PDF"
-                            >
-                                <FileText className="w-4 h-4" />
-                            </button>
-                        )}
-                        <ChevronRight className="w-4 h-4 text-orange-500" />
-                    </div>
-                </div>
-            ))}
+                );
+            })}
+
         </div>
       </div>
     );
