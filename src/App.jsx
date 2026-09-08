@@ -1932,6 +1932,7 @@ function App() {
   const [routeSyncing, setRouteSyncing] = useState(false);
   const routeSyncBusyRef = useRef(false);
   const routeSyncLastAtRef = useRef(0);
+  const lastRealtimeRoutesAtRef = useRef(0);
   const assignmentTrackerInitializedRef = useRef(false);
   const knownAssignedRouteIdsRef = useRef(new Set());
   const [driverNotice, setDriverNotice] = useState(null);
@@ -1955,6 +1956,7 @@ function App() {
   const lastIncomingOfferIdRef = useRef('');
   const [isSavingStop, setIsSavingStop] = useState(false);
   const stopSaveBusyRef = useRef(false);
+  const justificationBusyRef = useRef(false);
 
   const [showJustification, setShowJustification] = useState(false);
   const [justificationText, setJustificationText] = useState('');
@@ -2448,10 +2450,65 @@ function App() {
       if (!selectedRoute) return [];
 
       const targets = [];
+      const salida = isSalidaRoute(selectedRoute);
+      const normalizePassengerKey = (value) => String(value || '').trim().toLocaleLowerCase('es');
+
+      const officeManifestPassengers = salida && Array.isArray(selectedRoute?.startCoords?.passengersSchedule)
+          ? selectedRoute.startCoords.passengersSchedule
+          : [];
+
+      const officeManifestStatuses = new Map();
+      (Array.isArray(selectedRoute?.stopEvents) ? selectedRoute.stopEvents : [])
+          .filter(event => event?.sharedPassenger === true && Number(event?.stopIndex) === 0)
+          .forEach(event => {
+              const key = normalizePassengerKey(event?.passenger);
+              if (key) officeManifestStatuses.set(key, String(event?.status || ''));
+          });
+
+      Object.entries(sharedPassengerStatuses || {}).forEach(([key, status]) => {
+          const normalizedKey = normalizePassengerKey(key);
+          if (normalizedKey) officeManifestStatuses.set(normalizedKey, String(status || ''));
+      });
+
+      const officeManifestComplete = Boolean(
+          salida &&
+          officeManifestPassengers.length > 0 &&
+          officeManifestPassengers.every(passenger => {
+              const key = normalizePassengerKey(
+                  passenger?.passengerName || passenger?.name || passenger?.contact
+              );
+              return Boolean(key && officeManifestStatuses.get(key));
+          })
+      );
+
+      const shouldKeepSalidaTarget = (extraData = {}) => {
+          if (!officeManifestComplete || extraData?.label === 'Salida empresa') return true;
+
+          const names = [
+              extraData?.contact,
+              ...(Array.isArray(extraData?.passengersSchedule)
+                  ? extraData.passengersSchedule.map(passenger =>
+                      passenger?.passengerName || passenger?.name || passenger?.contact
+                  )
+                  : [])
+          ]
+              .map(normalizePassengerKey)
+              .filter(name => name && name !== 'oficina central');
+
+          if (names.length === 0) return true;
+
+          return names.some(name => {
+              const status = String(officeManifestStatuses.get(name) || '').toLocaleLowerCase('es');
+              // Si una ruta heredada no coincide exactamente con el manifiesto,
+              // conservamos el punto antes que eliminarlo por error.
+              if (!status) return true;
+              return status.includes('a bordo') || status.includes('en destino');
+          });
+      };
 
       const addTarget = (point, extraData = {}) => {
           const normalized = normalizePoint(point);
-          if (!normalized) return;
+          if (!normalized || !shouldKeepSalidaTarget(extraData)) return;
 
           targets.push({
               ...normalized,
@@ -2497,7 +2554,7 @@ function App() {
       }
 
       return targets;
-  }, [selectedRoute]);
+  }, [selectedRoute, sharedPassengerStatuses]);
 
   useEffect(() => {
       const geometry = downsamplePath(selectedRoute?.technicalData?.geometry, 220);
@@ -2695,7 +2752,7 @@ function App() {
 
   // Mantiene visible al conductor en la torre incluso después de finalizar una ruta.
   useEffect(() => {
-      if (!currentDriver?.id || !currentDriver?.isOnline) return undefined;
+      if (!currentDriver?.id || !currentDriver?.isOnline || selectedRoute?.status === 'En Ruta') return undefined;
       const publishIdleLocation = () => {
           const loc = normalizePoint(latestLocRef.current || driverLocationForMap);
           if (!loc) return;
@@ -2706,9 +2763,9 @@ function App() {
           }).catch(error => console.warn('No se pudo actualizar la ubicación del conductor:', error));
       };
       publishIdleLocation();
-      const interval = setInterval(publishIdleLocation, 10000);
+      const interval = setInterval(publishIdleLocation, 20000);
       return () => clearInterval(interval);
-  }, [currentDriver?.id, currentDriver?.isOnline]);
+  }, [currentDriver?.id, currentDriver?.isOnline, selectedRoute?.status]);
 
 
   // Envío por lotes de ubicación, ruta recalculada, rumbo, ETA y precio oficial.
@@ -2730,7 +2787,19 @@ function App() {
 
           const distanceToFlush = pendingDistanceKmRef.current;
           const gapDistanceToFlush = pendingGapDistanceKmRef.current;
-          const pointsToFlush = pendingRoutePointsRef.current.slice(-10);
+          const pendingTracePoints = pendingRoutePointsRef.current;
+          const pointsToFlush = pendingTracePoints.length <= 5
+              ? [...pendingTracePoints]
+              : [0, 0.25, 0.5, 0.75, 1]
+                  .map(ratio => pendingTracePoints[Math.round((pendingTracePoints.length - 1) * ratio)])
+                  .filter((point, index, list) =>
+                      point &&
+                      list.findIndex(other =>
+                          other?.recordedAt === point?.recordedAt &&
+                          Number(other?.lat) === Number(point?.lat) &&
+                          Number(other?.lng) === Number(point?.lng)
+                      ) === index
+                  );
           const shouldPublishGeometry =
               liveRoutePublishDirtyRef.current &&
               normalizePath(liveRouteGeometryRef.current).length > 1;
@@ -3042,7 +3111,11 @@ function App() {
               const normalizedGeometry = normalizePath(geometry);
               if (normalizedGeometry.length > 1) {
                   liveRouteGeometryRef.current = normalizedGeometry;
-                  liveRoutePublishDirtyRef.current = true;
+                  liveRoutePublishDirtyRef.current =
+                      liveRoutePublishDirtyRef.current ||
+                      stopChanged ||
+                      significantRouteDeviation ||
+                      normalizePath(selectedRoute?.liveRouteGeometry).length < 2;
               }
           }
 
@@ -3502,7 +3575,9 @@ function App() {
   };
 
   const submitJustification = async () => {
+      if (justificationBusyRef.current) return;
       if (justificationText.trim().length < 5) return alert("Por favor ingresa un motivo válido detallado.");
+      justificationBusyRef.current = true;
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       const logEntry = {
           evento: 'Llegada Fuera de Rango (Geocerca)',
@@ -3521,7 +3596,11 @@ function App() {
           setShowJustification(false);
           setJustificationText('');
           proceedToLlegada();
-      } catch(e) { alert("Error al guardar la justificación."); }
+      } catch(e) {
+          alert("Error al guardar la justificación.");
+      } finally {
+          justificationBusyRef.current = false;
+      }
   };
 
   const openTripCancellation = () => {
@@ -3553,6 +3632,16 @@ function App() {
       const distanceToNextStopMeters = Number.isFinite(rawDistance) ? Math.round(rawDistance) : null;
       const driverId = String(currentDriver?.id || selectedRoute?.driverId || '');
       const driverName = String(currentDriver?.name || selectedRoute?.driver || selectedRoute?.driverName || 'Conductor');
+      const plannedDistanceKm = Math.max(
+          0,
+          Number(selectedRoute?.originalPlan?.totalDistance) || 0,
+          Number(selectedRoute?.technicalData?.totalDistance) || 0
+      );
+      const executedDistanceKm = roundMoney(Math.max(
+          0,
+          Number(selectedRoute?.realDistanceDriven) || 0,
+          Number(committedDistanceKmRef.current) + Number(pendingDistanceKmRef.current || 0)
+      ));
       const cancellationData = {
           reason,
           detail,
@@ -3564,6 +3653,10 @@ function App() {
           nextStopIndex: Number(nextStopIdx) || 0,
           nextStopLabel: currentTarget?.label || currentTarget?.address || 'Destino',
           distanceToNextStopMeters,
+          executionStarted: true,
+          plannedDistanceKm: roundMoney(plannedDistanceKm),
+          executedDistanceKm,
+          distancePolicy: 'planned_kept_for_audit_executed_counts_operational',
           timestamp: nowIso,
           time: nowTime
       };
@@ -3596,6 +3689,10 @@ function App() {
               cancelledAt: nowIso,
               cancelledTime: nowTime,
               cancelledDate: getMexicoDate(),
+              cancelExecutionStarted: true,
+              cancelPlannedDistanceKm: roundMoney(plannedDistanceKm),
+              cancelExecutedDistanceKm: executedDistanceKm,
+              cancelDistancePolicy: 'planned_kept_for_audit_executed_counts_operational',
               'proximityAlert.active': false,
               lastUpdate: nowIso
           });
@@ -4080,6 +4177,12 @@ function App() {
           setSharedPassengerStatuses(prev => ({ ...prev, [key]: normalizedStatus }));
           setSelectedRoute(prev => prev ? {
               ...prev,
+              // Mantiene el manifiesto disponible localmente aunque Firestore tarde
+              // unos instantes en devolver el evento por el listener.
+              stopEvents: [
+                  ...(Array.isArray(prev.stopEvents) ? prev.stopEvents : []),
+                  eventData
+              ],
               ...(updates.firstStopAttendedTimestamp ? {
                   firstStopAttendedTime: updates.firstStopAttendedTime,
                   firstStopAttendedTimestamp: updates.firstStopAttendedTimestamp,
@@ -4399,9 +4502,13 @@ useEffect(() => {
 
           escucharRutas(driverData.id);
 
+          // El listener es la fuente principal. Sólo hacemos una lectura completa
+          // si no respondió después de unos segundos.
           setTimeout(() => {
-              refreshDriverRoutesRef.current?.(driverData.id, { force: true });
-          }, 50);
+              if (Date.now() - lastRealtimeRoutesAtRef.current > 2500) {
+                  refreshDriverRoutesRef.current?.(driverData.id, { force: true });
+              }
+          }, 3000);
       } catch (restoreError) {
           console.warn('No se pudo restaurar la sesión del conductor:', restoreError);
           localStorage.removeItem('driver_session');
@@ -4532,6 +4639,7 @@ useEffect(() => {
                     ...routeDoc.data()
                 }))
             );
+            lastRealtimeRoutesAtRef.current = Date.now();
             setMisRutas(nextRoutes);
             persistDriverRoutesCache(driverId, nextRoutes);
             setRouteSyncing(false);
@@ -4557,23 +4665,34 @@ useEffect(() => {
     const driverId = String(currentDriver?.id || '').trim();
     if (!driverId) return undefined;
 
-    const refreshWhenVisible = () => {
+    let pendingResumeTimer = null;
+
+    const refreshOnlyIfListenerIsStale = (staleAfterMs = 15000) => {
         if (document.visibilityState && document.visibilityState !== 'visible') return;
+        if (Date.now() - lastRealtimeRoutesAtRef.current < staleAfterMs) return;
         refreshDriverRoutesRef.current?.(driverId);
     };
 
-    const handleVisibilityRefresh = () => refreshWhenVisible();
+    const scheduleResumeFallback = () => {
+        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        if (pendingResumeTimer) clearTimeout(pendingResumeTimer);
+        pendingResumeTimer = setTimeout(() => {
+            refreshOnlyIfListenerIsStale(15000);
+        }, 1800);
+    };
 
-    document.addEventListener('visibilitychange', handleVisibilityRefresh);
-    window.addEventListener('pageshow', refreshWhenVisible);
-    window.addEventListener('focus', refreshWhenVisible);
+    document.addEventListener('visibilitychange', scheduleResumeFallback);
+    window.addEventListener('pageshow', scheduleResumeFallback);
+    window.addEventListener('focus', scheduleResumeFallback);
 
-    const interval = setInterval(refreshWhenVisible, 45000);
+    // Respaldo muy conservador: sólo si el listener lleva más de un minuto sin datos.
+    const interval = setInterval(() => refreshOnlyIfListenerIsStale(60000), 120000);
 
     return () => {
-        document.removeEventListener('visibilitychange', handleVisibilityRefresh);
-        window.removeEventListener('pageshow', refreshWhenVisible);
-        window.removeEventListener('focus', refreshWhenVisible);
+        if (pendingResumeTimer) clearTimeout(pendingResumeTimer);
+        document.removeEventListener('visibilitychange', scheduleResumeFallback);
+        window.removeEventListener('pageshow', scheduleResumeFallback);
+        window.removeEventListener('focus', scheduleResumeFallback);
         clearInterval(interval);
     };
 }, [currentDriver?.id]);
@@ -5062,9 +5181,17 @@ if (currentDriver?.id) {
       const currentPassengerPhoneRaw = getRoutePassengerPhone(selectedRoute, currentTarget, nextStopIdx);
       const travelledSegments = splitGpsTraceSegments(selectedRoute?.rutaReal);
       const sharedPassengers = Array.isArray(currentTarget?.passengersSchedule) ? currentTarget.passengersSchedule : [];
-      const isSharedPassengerStop = sharedPassengers.length > 1;
+      const isSalidaOfficeManifest =
+          isSalidaRoute(selectedRoute) &&
+          nextStopIdx === 0 &&
+          sharedPassengers.length > 0;
+      const isSharedPassengerStop = sharedPassengers.length > 1 || isSalidaOfficeManifest;
       const currentPassengerPhone = isSharedPassengerStop ? '' : currentPassengerPhoneRaw;
       const sharedCompletedCount = sharedPassengers.filter((passenger, index) => Boolean(getSharedPassengerStoredStatus(passenger, index))).length;
+      const sharedBoardedCount = sharedPassengers.filter((passenger, index) => {
+          const status = String(getSharedPassengerStoredStatus(passenger, index) || '').toLocaleLowerCase('es');
+          return status.includes('a bordo') || status.includes('en destino');
+      }).length;
 
       return (
           <div className={`h-screen w-full flex flex-col font-sans transition-colors ${theme.bg} ${theme.text} overflow-hidden relative`}>
@@ -5371,8 +5498,8 @@ if (currentDriver?.id) {
                                   <div className="rounded-xl bg-blue-50 border border-blue-200 p-3">
                                       <div className="flex items-center justify-between gap-2 mb-2">
                                           <div>
-                                              <p className="text-[10px] font-black uppercase tracking-widest text-blue-700">Punto compartido</p>
-                                              <p className="text-xs font-bold text-slate-600 mt-0.5">Registra a cada pasajero antes de continuar.</p>
+                                              <p className="text-[10px] font-black uppercase tracking-widest text-blue-700">{isSalidaOfficeManifest ? 'Manifiesto de salida' : 'Punto compartido'}</p>
+                                              <p className="text-xs font-bold text-slate-600 mt-0.5">{isSalidaOfficeManifest ? 'Confirma quién subió antes de iniciar el recorrido.' : 'Registra a cada pasajero antes de continuar.'}</p>
                                           </div>
                                           <span className="text-[10px] font-black bg-blue-600 text-white rounded-full px-2.5 py-1">{sharedCompletedCount}/{sharedPassengers.length}</span>
                                       </div>
@@ -5421,7 +5548,13 @@ if (currentDriver?.id) {
                                       disabled={sharedCompletedCount < sharedPassengers.length}
                                       className={`w-full p-3 rounded-xl font-black text-sm flex items-center justify-center gap-2 ${sharedCompletedCount === sharedPassengers.length ? 'bg-orange-500 text-white active:scale-95' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
                                   >
-                                      <CheckCircle className="w-5 h-5" /> {isHeadingToDestination ? 'FINALIZAR VIAJE' : 'CONTINUAR RUTA'}
+                                      <CheckCircle className="w-5 h-5" /> {
+                                          isSalidaOfficeManifest
+                                              ? (sharedCompletedCount === sharedPassengers.length && sharedBoardedCount === 0
+                                                  ? 'FINALIZAR SIN PASAJEROS'
+                                                  : 'INICIAR RECORRIDO')
+                                              : (isHeadingToDestination ? 'FINALIZAR VIAJE' : 'CONTINUAR RUTA')
+                                      }
                                   </button>
                               </div>
                           ) : (
