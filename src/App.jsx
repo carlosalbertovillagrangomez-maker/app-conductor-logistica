@@ -1667,7 +1667,7 @@ const hasDriverFinalEvidence = (route) => {
 };
 
 const getDriverEffectiveStatus = (route) => {
-    if (['Finalizado', 'Completado', 'Cancelado'].includes(route?.status)) return route.status;
+    if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(route?.status)) return route.status;
     return hasDriverFinalEvidence(route) ? 'Finalizado' : route?.status;
 };
 
@@ -2414,7 +2414,7 @@ function App() {
   useEffect(() => {
       if (!currentDriver?.id) return;
       const assignedActive = misRutas.filter(route =>
-          !['Finalizado', 'Completado', 'Cancelado'].includes(route?.status) &&
+          !['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(route?.status) &&
           (route?.driverId === currentDriver.id || route?.ofertaPara === currentDriver.id)
       );
       const currentIds = new Set(assignedActive.map(route => route.id));
@@ -2950,7 +2950,7 @@ function App() {
 
           const candidates = snapshot.docs
               .map(routeDoc => ({ id: routeDoc.id, ...routeDoc.data() }))
-              .filter(route => !['Finalizado', 'Completado', 'Cancelado'].includes(route?.status))
+              .filter(route => !['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(route?.status))
               .filter(route => !completedFingerprints.has(getDriverRouteFingerprint(route)))
               .sort((a, b) => getPickupSortableDateTime(a) - getPickupSortableDateTime(b));
 
@@ -2965,7 +2965,7 @@ function App() {
           const nextOfferMs = getPickupSortableDateTime(nextOffer).getTime();
           const hasEarlierCommittedTrip = misRutas.some(route => {
               if (route?.id === nextOffer.id) return false;
-              if (['Finalizado', 'Completado', 'Cancelado'].includes(route?.status)) return false;
+              if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(route?.status)) return false;
               if (!['Aceptada', 'En Ruta'].includes(route?.status)) return false;
               if (route?.ofertaEstado === 'Pendiente') return false;
               return getPickupSortableDateTime(route).getTime() <= nextOfferMs;
@@ -3179,8 +3179,22 @@ function App() {
           }
       };
 
-      // La interfaz recibe datos inmediatamente sin esperar a Google.
-      applyMetricsAndProximity(fallbackMetrics);
+      // Mantiene estable la última métrica Google del mismo punto mientras llega
+      // el siguiente recálculo. Evita alternar visualmente Google -> fallback -> Google.
+      const previousNavigation = liveNavigationRef.current || {};
+      const previousNavigationMs = getTimestampMs(previousNavigation?.updatedAt) || 0;
+      const previousSource = String(previousNavigation?.source || '');
+      const hasFreshGoogleMetric = Boolean(
+          previousSource === 'driver-google-directions' &&
+          Number(previousNavigation?.stopIndex ?? previousNavigation?.currentStopIndex ?? -1) === Number(nextStopIdx) &&
+          previousNavigationMs > 0 &&
+          Date.now() - previousNavigationMs < 45000 &&
+          Number(previousNavigation?.distanceMeters) > 0
+      );
+
+      if (!hasFreshGoogleMetric) {
+          applyMetricsAndProximity(fallbackMetrics);
+      }
 
       if (!isLoaded || !window.google?.maps?.DirectionsService || directionsBusyRef.current) {
           return;
@@ -4246,7 +4260,7 @@ const applyDriverLocalCompletionState = (driverId, routes) => {
             const guard = guards[route?.id];
             if (
                 guard &&
-                !['Finalizado', 'Completado', 'Cancelado'].includes(normalized?.status)
+                !['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(normalized?.status)
             ) {
                 normalized = {
                     ...normalized,
@@ -4268,7 +4282,7 @@ const persistDriverRoutesCache = (driverId, routes) => {
     const closed = [];
 
     (Array.isArray(routes) ? routes : []).forEach(route => {
-        if (['Finalizado', 'Completado', 'Cancelado'].includes(getDriverEffectiveStatus(route))) {
+        if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(getDriverEffectiveStatus(route))) {
             closed.push(route);
         } else {
             active.push(route);
@@ -4318,7 +4332,7 @@ const refreshDriverRoutes = async (driverId, options = {}) => {
                     };
                     activeRoute = applyDriverLocalCompletionState(cleanDriverId, [activeRoute])[0] || activeRoute;
 
-                    if (['Finalizado', 'Completado', 'Cancelado'].includes(activeRoute?.status)) {
+                    if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(activeRoute?.status)) {
                         localStorage.removeItem('active_trip_id');
                         localStorage.removeItem(`trip_idx_${activeTripId}`);
                         localStorage.removeItem(getDriverActiveCacheKey(cleanDriverId));
@@ -6035,7 +6049,7 @@ if (currentDriver?.id) {
                 return ['Finalizado', 'Completado'].includes(x.status);
             }
 
-            if (['Finalizado', 'Completado', 'Cancelado'].includes(x.status)) {
+            if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(x.status)) {
                 return false;
             }
 
