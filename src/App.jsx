@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { 
-  Truck, LogIn, ShieldCheck, Mail, Lock, Loader2, 
-  AlertCircle, LogOut, MapPin, User, Phone, 
+import {
+  Truck, LogIn, ShieldCheck, Mail, Lock, Loader2,
+  AlertCircle, LogOut, MapPin, User, Phone,
   FileText, ChevronLeft, Camera, CreditCard,
   Sun, Moon, Package, Clock, ChevronRight, CheckCircle2, Zap, Calendar, Navigation, MoreVertical, Play, Save,
   Heart, ShieldAlert, Hash, CheckCircle, LocateFixed, Navigation2, BellRing, MessageSquare, Send, Power, PowerOff, X, Volume2, VolumeX, Download, Share2, RefreshCw
@@ -1927,7 +1927,7 @@ function App() {
   const [error, setError] = useState('');
   const [currentDriver, setCurrentDriver] = useState(null);
   const [isReady, setIsReady] = useState(false);
-  
+
   const [misRutas, setMisRutas] = useState([]);
   const [routeSyncing, setRouteSyncing] = useState(false);
   const routeSyncBusyRef = useRef(false);
@@ -1942,7 +1942,7 @@ function App() {
 
   const [darkMode, setDarkMode] = useState(false);
   const [filterType, setFilterType] = useState('Próximo');
-  const [mainTab, setMainTab] = useState('Pendientes'); 
+  const [mainTab, setMainTab] = useState('Pendientes');
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [completedTripNotice, setCompletedTripNotice] = useState(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
@@ -2008,18 +2008,18 @@ function App() {
   const pushCleanupRef = useRef(null);
 
   const [userLocation, setUserLocation] = useState(null);
-  const [userHeading, setUserHeading] = useState(0); 
+  const [userHeading, setUserHeading] = useState(0);
   const [isTracking, setIsTracking] = useState(true);
-  
-  const isTrackingRef = useRef(true); 
+
+  const isTrackingRef = useRef(true);
   const latestLocRef = useRef(null);
-  const prevLocRef = useRef(null); 
+  const prevLocRef = useRef(null);
   const odometerLocRef = useRef(null);
   const odometerMetaRef = useRef({ timestamp: 0, accuracy: Infinity });
-  const lastIncomingChatRef = useRef({ routeId: '', key: '' }); 
-  
-  const [nextStopIdx, setNextStopIdx] = useState(0); 
-  const [routeUpdateTick, setRouteUpdateTick] = useState(0); 
+  const lastIncomingChatRef = useRef({ routeId: '', key: '' });
+
+  const [nextStopIdx, setNextStopIdx] = useState(0);
+  const [routeUpdateTick, setRouteUpdateTick] = useState(0);
   const [sharedPassengerStatuses, setSharedPassengerStatuses] = useState({});
 
   useEffect(() => {
@@ -2052,8 +2052,8 @@ function App() {
       nextStopIdx
   ]);
 
-  const [alertedStops, setAlertedStops] = useState([]); 
-  const [isApproaching, setIsApproaching] = useState(false); 
+  const [alertedStops, setAlertedStops] = useState([]);
+  const [isApproaching, setIsApproaching] = useState(false);
 
   const [liveRouteData, setLiveRouteData] = useState({ geometry: [], totalDuration: 0, totalDistance: 0, nextStopDuration: 0, nextStopDistance: 0 });
   const [resolvedNextStopLocation, setResolvedNextStopLocation] = useState(null);
@@ -2578,7 +2578,7 @@ function App() {
               }
           }
       }
-  }, [isLoaded, selectedRoute?.id, selectedRoute?.status]); 
+  }, [isLoaded, selectedRoute?.id, selectedRoute?.status]);
 
   // GPS EN SEGUNDO PLANO Y MODO EN LÍNEA
   useEffect(() => {
@@ -3553,14 +3553,14 @@ function App() {
       } catch (e) {}
   };
 
-  const marcarLlegada = async () => { 
+  const marcarLlegada = async () => {
       const currentTarget = allTargets[nextStopIdx] || allTargets[allTargets.length - 1];
       if (userLocation && currentTarget) {
           const dist = getDistanceMeters(userLocation, currentTarget);
           if (dist > 200) {
               setDistanceOff(Math.round(dist));
               setShowJustification(true);
-              return; 
+              return;
           }
       }
       proceedToLlegada();
@@ -3585,7 +3585,7 @@ function App() {
           }).catch(() => {});
       }
 
-      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){} 
+      try { await updateDoc(doc(db, "rutas", selectedRoute.id), { "proximityAlert.active": false }); } catch(e){}
   };
 
   const submitJustification = async () => {
@@ -3599,7 +3599,7 @@ function App() {
           distanciaMts: distanceOff,
           punto: currentTarget?.label || 'Destino',
           timestamp: new Date().toISOString(),
-          time: getMexicoTime() 
+          time: getMexicoTime()
       };
 
       try {
@@ -3760,11 +3760,12 @@ function App() {
           target?.contact ||
           ''
       ).trim();
+      const passengerFirstName = passengerName.split(/\s+/).filter(Boolean)[0] || '';
       const driverName = String(currentDriver?.name || route?.driver || route?.driverName || 'tu chofer').trim();
-      const greeting = passengerName ? `Hola ${passengerName},` : 'Hola,';
+      const greeting = passengerFirstName ? `Hola ${passengerFirstName},` : 'Hola,';
 
       const message = encodeURIComponent(
-          `${greeting} hoy soy tu chofer. Soy ${driverName} y me encuentro afuera de tu domicilio.`
+          `${greeting} Buen día, hoy soy ${driverName} tu chofer, y he llegado por ti`
       );
 
       const url = `https://wa.me/${phoneNumber}?text=${message}`;
@@ -3782,24 +3783,24 @@ function App() {
           reader.onload = (event) => {
               const img = new Image();
               img.onload = () => {
-                  const canvas = document.createElement('canvas'); 
-                  const scaleSize = 800 / img.width; 
-                  canvas.width = 800; 
-                  canvas.height = img.height * scaleSize; 
-                  const ctx = canvas.getContext('2d'); 
+                  const canvas = document.createElement('canvas');
+                  const scaleSize = 800 / img.width;
+                  canvas.width = 800;
+                  canvas.height = img.height * scaleSize;
+                  const ctx = canvas.getContext('2d');
                   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-                  const dateStr = getMexicoDate(); 
-                  const timeStr = getMexicoTime(); 
+                  const dateStr = getMexicoDate();
+                  const timeStr = getMexicoTime();
                   const latLngStr = userLocation ? `GPS: ${userLocation.lat.toFixed(6)}, ${userLocation.lng.toFixed(6)}` : 'GPS: No disponible';
 
                   ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
                   ctx.fillRect(0, canvas.height - 70, canvas.width, 70);
 
                   ctx.font = "bold 18px sans-serif";
-                  ctx.fillStyle = "#ef4444"; 
+                  ctx.fillStyle = "#ef4444";
                   ctx.fillText(`FECHA: ${dateStr}  HORA: ${timeStr}`, 20, canvas.height - 40);
-                  
+
                   ctx.font = "bold 16px sans-serif";
                   ctx.fillStyle = "#ffffff";
                   ctx.fillText(latLngStr, 20, canvas.height - 15);
@@ -3873,6 +3874,54 @@ function App() {
       }
 
       throw lastError || new Error('No fue posible actualizar el viaje.');
+  };
+
+  const hasResolvedAllSalidaPassengers = (extraResolvedNames = []) => {
+      if (!isSalidaRoute(selectedRoute)) return false;
+
+      const normalizePassenger = (value) =>
+          String(value || '').trim().toLocaleLowerCase('es');
+
+      const events = Array.isArray(selectedRoute?.stopEvents)
+          ? selectedRoute.stopEvents
+          : [];
+
+      const boarded = new Set();
+      const resolved = new Set();
+
+      events.forEach(event => {
+          const passengerKey = normalizePassenger(event?.passenger);
+          if (!passengerKey) return;
+
+          const status = String(event?.status || '').toLocaleLowerCase('es');
+          const stopIndex = Number(event?.stopIndex ?? -1);
+
+          if (
+              stopIndex === 0 &&
+              event?.sharedPassenger === true &&
+              status.includes('a bordo')
+          ) {
+              boarded.add(passengerKey);
+          }
+
+          if (
+              stopIndex > 0 &&
+              (
+                  event?.type === 'dropoff' ||
+                  status.includes('en destino') ||
+                  status.includes('no se entreg')
+              )
+          ) {
+              resolved.add(passengerKey);
+          }
+      });
+
+      extraResolvedNames.forEach(name => {
+          const key = normalizePassenger(name);
+          if (key) resolved.add(key);
+      });
+
+      return boarded.size > 0 && [...boarded].every(name => resolved.has(name));
   };
 
   const confirmarAbordaje = async (isFinalDestination) => {
@@ -3969,7 +4018,11 @@ function App() {
               } : {}),
               proximityAlert: { ...(prev.proximityAlert || {}), active: false }
           } : prev);
-          await advanceAfterStop(isFinalDestination);
+          const closeByManifest =
+              isDropoff &&
+              hasResolvedAllSalidaPassengers([llegadaData.passenger]);
+
+          await advanceAfterStop(isFinalDestination || closeByManifest);
       } catch (boardingError) {
           console.error('No se pudo registrar el abordaje:', boardingError);
           alert('No se pudo guardar el abordaje después de varios intentos. Revisa la conexión y vuelve a intentarlo.');
@@ -4076,7 +4129,12 @@ function App() {
               } : {}),
               proximityAlert: { ...(prev.proximityAlert || {}), active: false }
           } : prev);
-          await advanceAfterStop(isFinalDestination);
+          const closeByManifest =
+              isSalidaRoute(selectedRoute) &&
+              nextStopIdx > 0 &&
+              hasResolvedAllSalidaPassengers([passengerName]);
+
+          await advanceAfterStop(isFinalDestination || closeByManifest);
       } catch (absenceError) {
           console.error('No se pudo registrar la ausencia:', absenceError);
           alert('No se pudo guardar la ausencia. Revisa la conexión e inténtalo de nuevo.');
@@ -4217,12 +4275,37 @@ function App() {
   };
 
   const continuarPuntoCompartido = async (passengers, isFinalDestination) => {
-      const pendientes = passengers.filter((passenger, index) => !getSharedPassengerStoredStatus(passenger, index));
+      const pendientes = passengers.filter(
+          (passenger, index) => !getSharedPassengerStoredStatus(passenger, index)
+      );
+
       if (pendientes.length > 0) {
           alert(`Falta registrar ${pendientes.length} pasajero${pendientes.length === 1 ? '' : 's'} antes de continuar.`);
           return;
       }
-      await advanceAfterStop(isFinalDestination);
+
+      const resolvedHere = nextStopIdx > 0
+          ? passengers
+              .filter((passenger, index) => {
+                  const status = String(
+                      getSharedPassengerStoredStatus(passenger, index) || ''
+                  ).toLocaleLowerCase('es');
+
+                  return status.includes('en destino') || status.includes('no se entreg');
+              })
+              .map(passenger =>
+                  passenger?.passengerName ||
+                  passenger?.name ||
+                  passenger?.contact ||
+                  ''
+              )
+          : [];
+
+      const closeByManifest =
+          nextStopIdx > 0 &&
+          hasResolvedAllSalidaPassengers(resolvedHere);
+
+      await advanceAfterStop(isFinalDestination || closeByManifest);
   };
 
 const applyDriverLocalCompletionState = (driverId, routes) => {
@@ -5372,7 +5455,7 @@ if (currentDriver?.id) {
                       </div>
                   </div>
               )}
-              
+
               {/* --- CANCELACIÓN DEL VIAJE: DISPONIBLE EN CUALQUIER PUNTO DE LA RUTA --- */}
               {showTripCancellation && (
                   <div className="fixed inset-0 z-[10030] flex items-center justify-center p-5 bg-slate-950/85 backdrop-blur-md animate-in fade-in zoom-in duration-200">
@@ -5612,7 +5695,7 @@ if (currentDriver?.id) {
                               <p className="text-[11px] font-medium text-slate-300 leading-tight line-clamp-2">{translateNavigationInstruction(nextManeuver.instruction)}</p>
                           </div>
                       </div>
-                      <button 
+                      <button
                           onClick={async () => {
                               const nextValue = !voiceEnabled;
                               setVoiceEnabled(nextValue);
@@ -5622,7 +5705,7 @@ if (currentDriver?.id) {
                               } else {
                                   await speakNavigationText('Indicaciones por voz activadas');
                               }
-                          }} 
+                          }}
                           className="p-2 rounded-full bg-slate-800 text-slate-300 hover:text-white transition shrink-0"
                       >
                           {voiceEnabled ? <Volume2 className="w-5 h-5"/> : <VolumeX className="w-5 h-5 text-red-400"/>}
@@ -5899,7 +5982,7 @@ if (currentDriver?.id) {
                 </div>
             </div>
         )}
-        
+
         {/* Header */}
         <div className={`p-4 flex items-center gap-4 shadow-lg z-20 shrink-0 ${darkMode ? 'bg-slate-900 border-b border-slate-800' : 'bg-white'}`}>
           <button onClick={cerrarRuta} className={`p-2 rounded-full border ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'} transition`}><ChevronLeft className="w-5 h-5" /></button>
@@ -6171,7 +6254,7 @@ if (currentDriver?.id) {
                 <button onClick={() => setMainTab('Pendientes')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Pendientes' ? 'border-orange-500 text-orange-500' : 'border-transparent text-slate-400'}`}>En Curso</button>
                 <button onClick={() => setMainTab('Finalizados')} className={`text-sm font-black uppercase tracking-wider pb-2 border-b-2 transition-all ${mainTab === 'Finalizados' ? 'border-orange-500 text-orange-500' : 'border-transparent text-slate-400'}`}>Finalizados</button>
             </div>
-            
+
             {/* CAMBIO: Nuevos Botones de Filtro Intuitivos */}
             {mainTab === 'Pendientes' && (
                 <div className={`flex p-1 rounded-xl ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-100'}`}>
