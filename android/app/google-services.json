@@ -23,6 +23,44 @@
           "other_platform_oauth_client": []
         }
       }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779301031888:android:09b6a767b1dd87df27b3d5",
+        "android_client_info": {
+          "package_name": "com.triplogix.cliente"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCKcEUNE2pBOas52pUt1FvX3lt_CM7ClAU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779301031888:android:0ad1a9c160ea696d27b3d5",
+        "android_client_info": {
+          "package_name": "com.triplogix.conductor"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCKcEUNE2pBOas52pUt1FvX3lt_CM7ClAU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
     }
   ],
   "configuration_version": "1"

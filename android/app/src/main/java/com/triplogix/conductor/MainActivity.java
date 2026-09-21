@@ -1,4 +1,4 @@
-package com.example.app;
+package com.triplogix.conductor;
 
 import com.getcapacitor.BridgeActivity;
 

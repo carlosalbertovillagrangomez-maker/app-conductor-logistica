@@ -1,16 +1,16 @@
 {
-  "appId": "com.example.app",
-  "appName": "TripLogix",
-  "webDir": "dist",
-  "plugins": {
-    "PushNotifications": {
-      "presentationOptions": [
-        "badge",
-        "sound",
-        "alert",
-        "banner",
-        "list"
-      ]
-    }
-  }
+    "appId":  "com.triplogix.conductor",
+    "appName":  "TripLogix Conductor",
+    "webDir":  "dist",
+    "plugins":  {
+                    "PushNotifications":  {
+                                              "presentationOptions":  [
+                                                                          "badge",
+                                                                          "sound",
+                                                                          "alert",
+                                                                          "banner",
+                                                                          "list"
+                                                                      ]
+                                          }
+                }
 }
