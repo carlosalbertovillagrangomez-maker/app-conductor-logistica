@@ -2204,13 +2204,15 @@ function App() {
   }, [voiceEnabled]);
 
   // Avisos globales de Torre de Control.
-  // Se monitorean TODAS las rutas del conductor, no solamente la ruta abierta.
-  // De esta forma un mensaje sigue siendo visible y audible aunque el conductor
-  // se encuentre en otra pantalla. Guardamos la última clave en localStorage
-  // para recuperar mensajes nuevos al volver a abrir la app.
+  // IMPORTANTE: la primera hidratación REAL de Firestore sólo establece una línea base.
+  // Las rutas restauradas desde caché no contienen el chat completo y antes podían hacer
+  // que un mensaje histórico pareciera "nuevo" al abrir la app.
   useEffect(() => {
       const driverId = String(currentDriver?.id || '').trim();
       if (!driverId || !Array.isArray(misRutas) || misRutas.length === 0) return;
+
+      const realtimeRoutes = misRutas.filter(route => !route?._cacheOnly);
+      if (realtimeRoutes.length === 0) return;
 
       if (towerMessageTrackerDriverRef.current !== driverId) {
           towerMessageTrackerDriverRef.current = driverId;
@@ -2221,6 +2223,10 @@ function App() {
       const storageKey = 'triplogix_tower_message_keys_' + driverId;
 
       const getLatestTowerMessage = (route) => {
+          if (['Finalizado', 'Completado', 'Cancelado', 'No realizado'].includes(getDriverEffectiveStatus(route))) {
+              return null;
+          }
+
           const chat = Array.isArray(route?.chat) ? route.chat : [];
           for (let index = chat.length - 1; index >= 0; index -= 1) {
               if (chat[index]?.sender === 'Despacho') return chat[index];
@@ -2233,37 +2239,31 @@ function App() {
           : '';
 
       if (!towerMessageTrackerInitializedRef.current) {
-          let storedKeys = null;
+          const baseline = new Map();
+
+          realtimeRoutes.forEach(route => {
+              const routeId = String(route?.id || '').trim();
+              const message = getLatestTowerMessage(route);
+              const key = getTowerMessageKey(message);
+              if (routeId && key) baseline.set(routeId, key);
+          });
+
+          towerMessageKeysRef.current = baseline;
+          towerMessageTrackerInitializedRef.current = true;
+
           try {
-              const raw = localStorage.getItem(storageKey);
-              const parsed = raw ? JSON.parse(raw) : null;
-              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) storedKeys = parsed;
+              localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(baseline)));
           } catch (_) {}
 
-          if (storedKeys && Object.keys(storedKeys).length > 0) {
-              towerMessageKeysRef.current = new Map(Object.entries(storedKeys));
-              towerMessageTrackerInitializedRef.current = true;
-          } else {
-              const baseline = new Map();
-              misRutas.forEach(route => {
-                  const routeId = String(route?.id || '').trim();
-                  const message = getLatestTowerMessage(route);
-                  const key = getTowerMessageKey(message);
-                  if (routeId && key) baseline.set(routeId, key);
-              });
-              towerMessageKeysRef.current = baseline;
-              towerMessageTrackerInitializedRef.current = true;
-              try {
-                  localStorage.setItem(storageKey, JSON.stringify(Object.fromEntries(baseline)));
-              } catch (_) {}
-              return;
-          }
+          // Nunca notificamos mensajes que ya existían al momento de abrir la app.
+          // Sólo los cambios posteriores a esta línea base pueden generar una alerta.
+          return;
       }
 
       const nextKeys = new Map();
       const newMessages = [];
 
-      misRutas.forEach(route => {
+      realtimeRoutes.forEach(route => {
           const routeId = String(route?.id || '').trim();
           if (!routeId) return;
 
