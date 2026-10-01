@@ -3008,7 +3008,7 @@ function App() {
               model: 'TripLogix calculado por la app del conductor'
           };
 
-          await updateDoc(doc(db, "rutas", incomingOffer.id), {
+          const acceptedUpdate = {
               driver: currentDriver.name,
               driverId: currentDriver.id,
               driverPhone: currentDriver.phone || '',
@@ -3023,6 +3023,30 @@ function App() {
               acceptedAt,
               pricing: officialPricing,
               pricingStatus: 'Calculada por conductor'
+          };
+
+          await updateDoc(doc(db, "rutas", incomingOffer.id), acceptedUpdate);
+
+          // Persistimos inmediatamente el compromiso local. Antes dependíamos de que
+          // el listener de Firestore alcanzara a responder antes de cerrar/minimizar
+          // la app, dejando una ventana donde el viaje aceptado podía desaparecer.
+          const acceptedRoute = {
+              ...incomingOffer,
+              ...acceptedUpdate,
+              id: incomingOffer.id,
+              _cacheOnly: false
+          };
+
+          setMisRutas(prev => {
+              const exists = prev.some(route => route.id === acceptedRoute.id);
+              const nextRoutes = applyDriverLocalCompletionState(
+                  currentDriver.id,
+                  exists
+                      ? prev.map(route => route.id === acceptedRoute.id ? { ...route, ...acceptedRoute } : route)
+                      : [...prev, acceptedRoute]
+              );
+              persistDriverRoutesCache(currentDriver.id, nextRoutes);
+              return nextRoutes;
           });
 
           setIncomingOffer(null);
