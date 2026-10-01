@@ -1927,6 +1927,11 @@ function App() {
   const [error, setError] = useState('');
   const [currentDriver, setCurrentDriver] = useState(null);
   const [isReady, setIsReady] = useState(false);
+  const [showAccountRecovery, setShowAccountRecovery] = useState(false);
+  const [recoveryFeedback, setRecoveryFeedback] = useState('');
+  const [mustChangePassword, setMustChangePassword] = useState(false);
+  const [newRecoveryPassword, setNewRecoveryPassword] = useState('');
+  const [confirmRecoveryPassword, setConfirmRecoveryPassword] = useState('');
 
   const [misRutas, setMisRutas] = useState([]);
   const [routeSyncing, setRouteSyncing] = useState(false);
@@ -4583,6 +4588,7 @@ useEffect(() => {
       try {
           const driverData = JSON.parse(savedDriver);
           setCurrentDriver(driverData);
+          setMustChangePassword(Boolean(driverData?.passwordResetRequired));
           cargarDatosEnFormulario(driverData);
 
           const cachedRoutes = readDriverLocalJson(
@@ -5207,14 +5213,108 @@ if (currentDriver?.id) {
     } catch (e) { setError(e.message); } finally { setLoading(false); }
   };
 
+  const requestAccountRecovery = async () => {
+    const cleanPhone = phone.trim();
+    setError('');
+    setRecoveryFeedback('');
+
+    if (!cleanPhone) {
+      setError('Escribe tu número de teléfono para solicitar recuperación.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const q = query(collection(db, "conductores"), where("phone", "==", cleanPhone));
+      const snap = await getDocs(q);
+      if (snap.empty) throw new Error('Número de teléfono no encontrado');
+
+      const accountDoc = snap.docs[0];
+      const account = accountDoc.data();
+
+      await addDoc(collection(db, "recuperacionesCuenta"), {
+        accountType: 'Conductor',
+        accountCollection: 'conductores',
+        accountId: accountDoc.id,
+        phone: cleanPhone,
+        displayName: account?.name || 'Conductor',
+        status: 'Pendiente',
+        requestedAt: new Date().toISOString(),
+        source: 'com.triplogix.conductor'
+      });
+
+      setRecoveryFeedback('Solicitud enviada a Torre de Control. Por seguridad, validarán tu identidad antes de emitir una contraseña temporal.');
+      setShowAccountRecovery(false);
+    } catch (recoveryError) {
+      setError(recoveryError?.message || 'No fue posible enviar la solicitud de recuperación.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleForcedPasswordChange = async (e) => {
+    e.preventDefault();
+    setError('');
+
+    if (newRecoveryPassword.length < 8) {
+      setError('La nueva contraseña debe tener al menos 8 caracteres.');
+      return;
+    }
+    if (newRecoveryPassword !== confirmRecoveryPassword) {
+      setError('Las contraseñas no coinciden.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const changedAt = new Date().toISOString();
+      await updateDoc(doc(db, "conductores", currentDriver.id), {
+        password: newRecoveryPassword,
+        passwordResetRequired: false,
+        passwordChangedAt: changedAt
+      });
+
+      const updatedDriver = {
+        ...currentDriver,
+        password: newRecoveryPassword,
+        passwordResetRequired: false,
+        passwordChangedAt: changedAt
+      };
+      setCurrentDriver(updatedDriver);
+      localStorage.setItem('driver_session', JSON.stringify(updatedDriver));
+      setPassword(newRecoveryPassword);
+      setNewRecoveryPassword('');
+      setConfirmRecoveryPassword('');
+      setMustChangePassword(false);
+    } catch (changeError) {
+      setError(changeError?.message || 'No fue posible actualizar la contraseña.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleLogin = async (e) => {
-    e.preventDefault(); setLoading(true);
-    const q = query(collection(db, "conductores"), where("phone", "==", phone.trim()));
-    const snap = await getDocs(q);
-    if (snap.empty) { setError('Número de teléfono no encontrado'); setLoading(false); return; }
-    const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
-    if (data.password === password && data.status === 'Aprobado') { setCurrentDriver(data); localStorage.setItem('driver_session', JSON.stringify(data)); cargarDatosEnFormulario(data); escucharRutas(data.id); } else { setError('Contraseña inválida o cuenta no aprobada'); }
-    setLoading(false);
+    e.preventDefault(); setLoading(true); setError(''); setRecoveryFeedback('');
+    try {
+      const q = query(collection(db, "conductores"), where("phone", "==", phone.trim()));
+      const snap = await getDocs(q);
+      if (snap.empty) throw new Error('Número de teléfono no encontrado');
+      const data = { id: snap.docs[0].id, ...snap.docs[0].data() };
+
+      if (data.password === password && data.status === 'Aprobado') {
+        setCurrentDriver(data);
+        setMustChangePassword(Boolean(data?.passwordResetRequired));
+        localStorage.setItem('driver_session', JSON.stringify(data));
+        cargarDatosEnFormulario(data);
+        escucharRutas(data.id);
+      } else {
+        throw new Error('Contraseña inválida o cuenta no aprobada');
+      }
+    } catch (loginError) {
+      setError(loginError?.message || 'No fue posible iniciar sesión.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const driverMarkerIcon = useMemo(() => {
@@ -5277,6 +5377,26 @@ if (currentDriver?.id) {
   if (!isReady) return null;
 
   const theme = { bg: darkMode ? 'bg-slate-950' : 'bg-slate-50', text: darkMode ? 'text-white' : 'text-slate-900', card: darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200', input: darkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900', activeTab: darkMode ? 'bg-slate-800 text-white' : 'bg-white text-orange-500 shadow-sm' };
+
+  if (currentDriver && mustChangePassword) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 p-6 flex items-center justify-center">
+        <form onSubmit={handleForcedPasswordChange} className="w-full max-w-sm bg-white border border-slate-200 rounded-3xl p-6 shadow-xl space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center"><Lock className="w-6 h-6" /></div>
+          <div>
+            <h2 className="text-xl font-black text-slate-800">Crea una nueva contraseña</h2>
+            <p className="text-xs text-slate-500 mt-1">Ingresaste con una contraseña temporal emitida por Torre de Control. Debes cambiarla antes de continuar.</p>
+          </div>
+          <input type="password" autoComplete="new-password" placeholder="Nueva contraseña (mín. 8 caracteres)" className="w-full p-4 rounded-2xl border border-slate-200 outline-none focus:border-orange-500" value={newRecoveryPassword} onChange={e => setNewRecoveryPassword(e.target.value)} required />
+          <input type="password" autoComplete="new-password" placeholder="Confirmar nueva contraseña" className="w-full p-4 rounded-2xl border border-slate-200 outline-none focus:border-orange-500" value={confirmRecoveryPassword} onChange={e => setConfirmRecoveryPassword(e.target.value)} required />
+          {error && <p className="text-red-500 text-xs font-bold">{error}</p>}
+          <button type="submit" disabled={loading} className="w-full bg-slate-800 text-white font-black p-4 rounded-2xl flex items-center justify-center">
+            {loading ? <Loader2 className="animate-spin w-5 h-5" /> : 'GUARDAR NUEVA CONTRASEÑA'}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   // ==============================================================
   // VISTA 1: NAVEGACIÓN EN VIVO (ESTATUS: EN RUTA)
@@ -6422,7 +6542,18 @@ if (currentDriver?.id) {
         <input type="tel" placeholder="WhatsApp / Teléfono" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900 focus:border-orange-500 outline-none" value={phone} onChange={e => setPhone(e.target.value)} />
         <input type="password" placeholder="Contraseña" className="w-full p-5 rounded-[1.8rem] text-sm border bg-white border-slate-200 text-slate-900 focus:border-orange-500 outline-none" value={password} onChange={e => setPassword(e.target.value)} />
         {error && <p className="text-red-500 text-[10px] font-bold text-center">{error}</p>}
+        {recoveryFeedback && <p className="text-emerald-600 text-[10px] font-bold text-center leading-relaxed">{recoveryFeedback}</p>}
+        {showAccountRecovery && (
+          <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 text-left space-y-3">
+            <p className="text-[11px] font-black text-slate-700">Recuperación administrada</p>
+            <p className="text-[10px] text-slate-500 leading-relaxed">Torre de Control recibirá la solicitud y validará tu identidad antes de emitir una contraseña temporal. No se modifica tu cuenta hasta que un administrador autorice el restablecimiento.</p>
+            <button type="button" disabled={loading} onClick={requestAccountRecovery} className="w-full bg-orange-500 text-white font-black p-3 rounded-xl text-[10px] uppercase tracking-wider">
+              {loading ? 'Enviando...' : 'Enviar solicitud'}
+            </button>
+          </div>
+        )}
         <button type="submit" disabled={loading} className="w-full bg-slate-800 text-white font-black p-5 rounded-[1.8rem] shadow-xl flex items-center justify-center active:scale-95 transition-transform uppercase tracking-wider">{loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'INICIAR SESIÓN'}</button>
+        <button type="button" onClick={() => { setShowAccountRecovery(prev => !prev); setError(''); }} className="w-full text-slate-600 font-bold text-[10px] py-1">¿Olvidaste tu contraseña? <span className="text-orange-500">Recuperar cuenta</span></button>
         <button type="button" onClick={() => setIsRegistering(true)} className="w-full text-slate-500 font-bold text-[10px] py-4">¿Nuevo Operador? <span className="text-orange-500">Regístrate</span></button>
       </form>
     </div>
