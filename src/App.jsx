@@ -96,17 +96,65 @@ const getDriverMarkerIcon = () => {
 // + tiempo + cuota operativa + ajustes autorizados. Las tarifas son propias de
 // TripLogix y se concentran aquí para poder cambiarlas sin tocar el resto de la app.
 // =========================================================================
-const TRIPLOGIX_RECEIPT_CONFIG = Object.freeze({
-    brandName: 'TripLogix',
-    slogan: 'Movilidad inteligente, segura y regulada',
-    currency: 'MXN',
-    baseFare: 35,
-    perKm: 15,
-    perMinute: 1.5,
-    serviceFee: 12,
-    minimumFare: 75,
-    defaultDemandMultiplier: 1
+const TRIPLOGIX_PRICING_PROFILES = Object.freeze({
+    México: Object.freeze({
+        brandName: 'TripLogix',
+        slogan: 'Movilidad inteligente, segura y regulada',
+        currency: 'MXN',
+        locale: 'es-MX',
+        baseFare: 35,
+        perKm: 15,
+        perMinute: 1.5,
+        serviceFee: 12,
+        minimumFare: 75,
+        defaultDemandMultiplier: 1
+    }),
+    Colombia: Object.freeze({
+        brandName: 'TripLogix',
+        slogan: 'Movilidad inteligente, segura y regulada',
+        currency: 'COP',
+        locale: 'es-CO',
+        baseFare: 8000,
+        perKm: 3500,
+        perMinute: 350,
+        serviceFee: 3000,
+        minimumFare: 18000,
+        defaultDemandMultiplier: 1
+    })
 });
+
+const TRIPLOGIX_RECEIPT_CONFIG = TRIPLOGIX_PRICING_PROFILES.México;
+
+const getCountryFromTimezone = () => {
+    try {
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        if (/Bogota|Colombia/i.test(timezone)) return 'Colombia';
+        if (/Mexico|Monterrey|Chihuahua|Tijuana|Hermosillo|Mazatlan|Merida|Cancun/i.test(timezone)) return 'México';
+    } catch (_) {}
+    return 'México';
+};
+
+const getCountryFromPoint = (rawPoint) => {
+    const lat = Number(rawPoint?.lat);
+    const lng = Number(rawPoint?.lng ?? rawPoint?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return '';
+    if (lat >= 14 && lat <= 33.5 && lng >= -119 && lng <= -86) return 'México';
+    if (lat >= -5 && lat <= 13.8 && lng >= -82 && lng <= -66) return 'Colombia';
+    return '';
+};
+
+const getTripCountry = (route = {}) => (
+    route?.serviceCountry ||
+    route?.country ||
+    getCountryFromPoint(route?.startCoords) ||
+    getCountryFromPoint(route?.currentLocation) ||
+    getCountryFromTimezone()
+);
+
+const getTripLogixPricingProfile = (route = {}) => (
+    TRIPLOGIX_PRICING_PROFILES[getTripCountry(route)] ||
+    TRIPLOGIX_PRICING_PROFILES.México
+);
 
 const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
 
@@ -184,11 +232,12 @@ const calculateTripLogixFare = (route, overrides = {}) => {
         : getTripDurationMinutesForReceipt(route, overrides.actualEndTimestamp);
 
     const configuredPricing = route?.pricing || {};
+    const defaultPricing = getTripLogixPricingProfile(route);
     const pricingCurrency = String(
         configuredPricing.currency ||
         route?.currency ||
         route?.serviceCurrency ||
-        TRIPLOGIX_RECEIPT_CONFIG.currency
+        defaultPricing.currency
     ).toUpperCase();
 
     const quotedTotal = Number(
@@ -204,18 +253,18 @@ const calculateTripLogixFare = (route, overrides = {}) => {
         route?.pricingMode === 'fixed_quote'
     );
 
-    const baseFare = Number(configuredPricing.baseFare ?? TRIPLOGIX_RECEIPT_CONFIG.baseFare);
-    const perKm = Number(configuredPricing.perKm ?? TRIPLOGIX_RECEIPT_CONFIG.perKm);
-    const perMinute = Number(configuredPricing.perMinute ?? TRIPLOGIX_RECEIPT_CONFIG.perMinute);
-    const serviceFee = Number(configuredPricing.serviceFee ?? TRIPLOGIX_RECEIPT_CONFIG.serviceFee);
-    const minimumFare = Number(configuredPricing.minimumFare ?? TRIPLOGIX_RECEIPT_CONFIG.minimumFare);
+    const baseFare = Number(configuredPricing.baseFare ?? defaultPricing.baseFare);
+    const perKm = Number(configuredPricing.perKm ?? defaultPricing.perKm);
+    const perMinute = Number(configuredPricing.perMinute ?? defaultPricing.perMinute);
+    const serviceFee = Number(configuredPricing.serviceFee ?? defaultPricing.serviceFee);
+    const minimumFare = Number(configuredPricing.minimumFare ?? defaultPricing.minimumFare);
     const tolls = Math.max(0, Number(route?.tolls ?? configuredPricing.tolls ?? 0) || 0);
 
     const demandMultiplierRaw = Number(
         route?.demandMultiplier ??
         route?.surgeMultiplier ??
         configuredPricing.demandMultiplier ??
-        TRIPLOGIX_RECEIPT_CONFIG.defaultDemandMultiplier
+        defaultPricing.defaultDemandMultiplier
     );
     const demandMultiplier = Math.min(3, Math.max(1, Number.isFinite(demandMultiplierRaw) ? demandMultiplierRaw : 1));
 
@@ -397,14 +446,19 @@ const buildTripLogixReceipt = (route, overrides = {}) => {
 };
 
 const formatTripLogixMoney = (value, currency = 'MXN') => {
+    const normalizedCurrency = String(currency || 'MXN').toUpperCase();
+    const locale = normalizedCurrency === 'COP' ? 'es-CO' : 'es-MX';
+    const fractionDigits = normalizedCurrency === 'COP' ? 0 : 2;
+
     try {
-        return new Intl.NumberFormat('es-MX', {
+        return new Intl.NumberFormat(locale, {
             style: 'currency',
-            currency,
-            minimumFractionDigits: 2
+            currency: normalizedCurrency,
+            minimumFractionDigits: fractionDigits,
+            maximumFractionDigits: fractionDigits
         }).format(Number(value) || 0);
     } catch (e) {
-        return `$${(Number(value) || 0).toFixed(2)} ${currency}`;
+        return `${(Number(value) || 0).toFixed(fractionDigits)} ${normalizedCurrency}`;
     }
 };
 
@@ -595,7 +649,7 @@ const speakNavigationText = async (text) => {
 const getTripDisplayedPricing = (route) => {
     if (!route) {
         return {
-            currency: 'MXN',
+            currency: getTripLogixPricingProfile({}).currency,
             total: 0,
             distanceKm: 0,
             durationMinutes: 0,
